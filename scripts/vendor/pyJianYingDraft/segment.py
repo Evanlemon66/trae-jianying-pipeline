@@ -28,6 +28,15 @@ class BaseSegment:
         self.common_keyframes = []
         self.enable_color_correct_adjust = False
 
+        self.caption_info = None
+        self.cartoon = False
+        self.group_id = ""
+        self.intensifies_audio = False
+        self.is_placeholder = False
+        self.render_index = 0
+        self.template_id = ""
+        self.template_scene = "default"
+
     @property
     def start(self) -> int:
         """片段开始时间, 单位为微秒"""
@@ -68,13 +77,19 @@ class BaseSegment:
             "track_attribute": 0,
             "track_render_index": 0,
             "visible": True,
-            # 写入自定义字段
             "id": self.segment_id,
             "material_id": self.material_id,
             "target_timerange": self.target_timerange.export_json(),
-
             "common_keyframes": [kf_list.export_json() for kf_list in self.common_keyframes],
-            "keyframe_refs": [],  # 意义不明
+            "keyframe_refs": [],
+            "caption_info": self.caption_info,
+            "cartoon": self.cartoon,
+            "group_id": self.group_id,
+            "intensifies_audio": self.intensifies_audio,
+            "is_placeholder": self.is_placeholder,
+            "render_index": self.render_index,
+            "template_id": self.template_id,
+            "template_scene": self.template_scene,
         }
 
 class Speed:
@@ -250,6 +265,15 @@ class VisualSegment(MediaSegment):
         self.uniform_scale = True
         self.animations_instance = None
 
+        self.hdr_settings = {"intensity": 1.0, "mode": 1, "nits": 1000}
+        self.responsive_layout = {
+            "enable": False,
+            "horizontal_pos_layout": 0,
+            "size_layout": 0,
+            "target_follow": "",
+            "vertical_pos_layout": 0,
+        }
+
     def add_keyframe(self, _property: KeyframeProperty, time_offset: Union[int, str], value: float, *,
                      curve_type: str = "Line",
                      left_control: tuple = (0.0, 0.0),
@@ -297,5 +321,7 @@ class VisualSegment(MediaSegment):
         json_dict.update({
             "clip": self.clip_settings.export_json(),
             "uniform_scale": {"on": self.uniform_scale, "value": 1.0},
+            "hdr_settings": self.hdr_settings,
+            "responsive_layout": self.responsive_layout,
         })
         return json_dict
