@@ -1059,6 +1059,14 @@ def inject_videos_into_draft(draft, video_paths):
     materials_videos = []
 
     for vp in video_paths:
+        _norm = normalize_video_for_jianying(vp)
+        if _norm is None:
+            print(f"  ⚠️ 转封装失败，跳过: {os.path.basename(vp)}")
+            continue
+        if _norm != vp:
+            print(f"  🔧 自动转封装: {os.path.basename(vp)} → {os.path.basename(_norm)}")
+        vp = _norm
+
         dur_us = get_video_duration_us(vp)
         if dur_us is None:
             print(f"  ⚠️ 无法获取 {os.path.basename(vp)} 时长，跳过")
@@ -1249,21 +1257,27 @@ def get_main_video_duration(draft):
     return draft_duration(draft)
 
 
+DEFAULT_PRESETS = [
+    ("logo文字", None),
+    ("上新", None),
+    ("三连~", None),
+    ("滤镜+透明度", 0.03),
+]
+
+
 def run_pipeline(draft_name_or_path, video_paths=None,
                  cut_us=None, workdir=None,
                  skip_local_ai=False, do_export=True,
                  do_demucs=True, do_presets=True, do_ffmpeg=True,
-                 do_whisper=True, do_translate=True, do_hide_cn=True):
+                 do_whisper=True, do_translate=True, do_hide_cn=True,
+                 presets=None):
     if workdir is None:
         workdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_work")
     os.makedirs(workdir, exist_ok=True)
 
-    PRESETS = [
-        ("logo文字", None),
-        ("上新", None),
-        ("三连~", None),
-        ("滤镜+透明度", 0.03),
-    ]
+    if presets is None:
+        presets = DEFAULT_PRESETS
+    PRESETS = presets
 
     print(f"\n{'='*60}")
     print(f"  🎬 JianYing Full-Local Pipeline")
