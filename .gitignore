@@ -1,0 +1,42 @@
+# 临时检查/调试脚本
+_*.py
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 临时数据文件
+_*.txt
+_*.json
+_*.png
+_*.wav
+_*.jpg
+_*.csv
+
+# 运行产物
+*.wav
+*.mp3
+*.mp4
+analyze_result.txt
+run_result.txt
+jianying_coords.json
+audio_peak_results.json
+
+# 虚拟环境
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+.trae/
+_work/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 打包文件
+*.zip
+*.exe
