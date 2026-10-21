@@ -40,3 +40,7 @@ Thumbs.db
 # 打包文件
 *.zip
 *.exe
+
+# 剪映本地资源 (体积大，由 sync_jy_assets 自动同步)
+assets/
+covers/
