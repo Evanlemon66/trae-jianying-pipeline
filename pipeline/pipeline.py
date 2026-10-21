@@ -1,8 +1,21 @@
 import sys, os, json, uuid, shutil, subprocess, time, re, pathlib
 from copy import deepcopy
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_HERE)
+sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
+
+from utils.formatters import (
+    get_default_drafts_root as _upstream_get_default_drafts_root,
+    get_all_drafts as _upstream_get_all_drafts,
+    get_duration_ffprobe_cached as _upstream_get_duration,
+)
+from utils.media_normalizer import should_normalize_video_for_jianying, normalize_video_for_jianying
+from vendor.pyJianYingDraft.draft_folder import DraftFolder
+
 sys.stdout.reconfigure(encoding="utf-8")
 
-DRAFT_ROOT = os.path.join(os.environ["LOCALAPPDATA"], "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+DRAFT_ROOT = _upstream_get_default_drafts_root()
 PRESET_ROOT = os.path.join(os.environ["LOCALAPPDATA"], "JianyingPro", "User Data", "Presets", "Combination", "Presets")
 
 SEG_KEYS_WITH_ID = {"material_id", "group_id", "raw_segment_id", "render_index", "id"}
@@ -54,22 +67,18 @@ def _draft_json_locked(path):
 
 
 def find_draft_by_name(name):
-    for d in os.listdir(DRAFT_ROOT):
-        dp = os.path.join(DRAFT_ROOT, d)
-        if os.path.isdir(dp):
+    for d in _upstream_get_all_drafts():
+        dp = d["path"]
+        if d["name"] == name or os.path.basename(dp) == name:
             jp = os.path.join(dp, "draft_content.json")
+            meta = {}
             if os.path.exists(jp):
-                if d == name:
-                    with open(jp, "r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                    return dp, jp, meta
                 try:
                     with open(jp, "r", encoding="utf-8") as f:
                         meta = json.load(f)
-                    if meta.get("name") == name:
-                        return dp, jp, meta
                 except Exception:
                     pass
+            return dp, jp, meta
     return None, None, None
 
 
@@ -84,31 +93,42 @@ def create_empty_draft(draft_name, template_draft_name=None):
         os.makedirs(DRAFT_ROOT, exist_ok=True)
         return None, None, None
 
-    dp_root, jp, _ = find_draft_by_name(template_draft_name)
-    with open(jp, "r", encoding="utf-8") as f:
-        template = json.load(f)
+    try:
+        df = DraftFolder(DRAFT_ROOT)
+        df.duplicate_as_template(template_draft_name, draft_name, allow_replace=True)
+        new_dir = os.path.join(DRAFT_ROOT, draft_name)
+        jp_new = os.path.join(new_dir, "draft_content.json")
+        with open(jp_new, "r", encoding="utf-8") as f:
+            draft = json.load(f)
+    except Exception:
+        dp_root, jp, _ = find_draft_by_name(template_draft_name)
+        with open(jp, "r", encoding="utf-8") as f:
+            template = json.load(f)
+        import copy as _copy
+        draft = reset_draft_to_clean(_copy.deepcopy(template))
+        draft["id"] = gen_uuid()
+        draft["name"] = draft_name
+        draft["create_time"] = int(time.time() * 1_000_000)
+        draft["update_time"] = int(time.time() * 1_000_000)
+        new_dir = os.path.join(DRAFT_ROOT, draft_name)
+        if os.path.exists(new_dir):
+            shutil.rmtree(new_dir)
+        shutil.copytree(dp_root, new_dir)
+        jp_new = os.path.join(new_dir, "draft_content.json")
+        save_draft(draft, jp_new)
+        for bak in os.listdir(new_dir):
+            if bak.startswith("draft_content.json.bak") or bak.endswith(".tmp"):
+                try:
+                    os.remove(os.path.join(new_dir, bak))
+                except OSError:
+                    pass
 
-    import copy
-    draft = reset_draft_to_clean(copy.deepcopy(template))
+    draft = reset_draft_to_clean(draft)
     draft["id"] = gen_uuid()
     draft["name"] = draft_name
     draft["create_time"] = int(time.time() * 1_000_000)
     draft["update_time"] = int(time.time() * 1_000_000)
-
-    new_dir = os.path.join(DRAFT_ROOT, draft_name)
-    if os.path.exists(new_dir):
-        shutil.rmtree(new_dir)
-    shutil.copytree(dp_root, new_dir)
-
-    jp_new = os.path.join(new_dir, "draft_content.json")
     save_draft(draft, jp_new)
-
-    for bak in os.listdir(new_dir):
-        if bak.startswith("draft_content.json.bak") or bak.endswith(".tmp"):
-            try:
-                os.remove(os.path.join(new_dir, bak))
-            except OSError:
-                pass
 
     meta_path = os.path.join(new_dir, "draft_meta_info.json")
     if os.path.exists(meta_path):
@@ -820,12 +840,19 @@ def _is_video_path(p):
 
 
 def get_video_duration_us(video_path):
-    """返回视频时长（微秒）。优先 ffprobe，后备 struct 解析 MP4 moov box。"""
+    """返回视频时长（微秒）。优先上游缓存 ffprobe，后备本地 MP4 解析。"""
+    try:
+        secs = _upstream_get_duration(video_path)
+        if secs and secs > 0:
+            return int(secs * 1_000_000)
+    except Exception:
+        pass
+
     try:
         import shutil as _sh
+        import subprocess as _sp
         ffprobe_path = _sh.which("ffprobe")
         if ffprobe_path:
-            import subprocess as _sp
             result = _sp.run(
                 [ffprobe_path, "-v", "error", "-show_entries",
                  "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
@@ -833,8 +860,7 @@ def get_video_duration_us(video_path):
                 capture_output=True, text=True, encoding="utf-8", timeout=30,
             )
             if result.returncode == 0 and result.stdout.strip():
-                secs = float(result.stdout.strip())
-                return int(secs * 1_000_000)
+                return int(float(result.stdout.strip()) * 1_000_000)
     except Exception:
         pass
 
@@ -1457,21 +1483,21 @@ def run_pipeline(draft_name_or_path, video_paths=None,
 
     # ━━━━ Step 11: 导出 ━━━━
     if do_export:
-        print("━ [11] 导出 (robust_auto_export) ━━━━━━━━━━━━━━━━━━━━━━")
+        print("━ [11] 导出 (上游 auto_exporter) ━━━━━━━━━━━━━━━━━━━━━━")
         try:
             import re as _re
-            safe_draft_name = _re.sub(r'[\\/:*?"<>|]', '_', dp_root)
+            safe_draft_name = _re.sub(r'[\\/:*?"<>|]', '_', os.path.basename(dp_root or draft_name_or_path))
             out_path = os.path.join(workdir, f"{safe_draft_name}_export.mp4")
 
-            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                            ".trae", "skills", "jianying-editor", "examples"))
-            from robust_auto_export import run as export_run
+            from auto_exporter import auto_export
 
-            print(f"  🎯 草稿名: {dp_root}")
+            print(f"  🎯 草稿名: {draft_name_or_path}")
             print(f"  📁 输出路径: {out_path}")
-            print(f"  🔄 先确保剪映返回首页并重新打开草稿 (热加载 JSON 变更)...")
-            export_run(dp_root, out_path)
-            print(f"  ✅ 导出完成!")
+            ok, result = auto_export(draft_name_or_path, out_path)
+            if ok:
+                print(f"  ✅ 导出完成!")
+            else:
+                print(f"  ⚠️ 导出返回非零结果: {result}")
         except Exception as e:
             print(f"  ⚠️ 自动导出异常: {e}")
             import traceback
