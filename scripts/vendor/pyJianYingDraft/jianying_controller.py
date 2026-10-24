@@ -1,5 +1,6 @@
 """剪映自动化控制，主要与自动导出有关"""
 
+import os
 import time
 import shutil
 import uiautomation as uia

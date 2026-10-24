@@ -1,4 +1,4 @@
-import os, sys, glob, json, uuid, copy
+import os, sys, glob, json, uuid, copy, subprocess
 sys.stdout.reconfigure(encoding="utf-8")
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,12 +28,20 @@ project = JyProject(DRAFT_NAME, overwrite=True, width=1080, height=1920)
 episodes = sorted(glob.glob(os.path.join(BASE, "第*集.mp4")), key=lambda p: natural_sort_key(os.path.basename(p)))
 print(f"找到 {len(episodes)} 集 (自然排序)")
 
-from moviepy import VideoFileClip
+FFPROBE = r"D:\AI_Deps\tools\ffmpeg\bin\ffprobe.exe" if os.path.exists(r"D:\AI_Deps\tools\ffmpeg\bin\ffprobe.exe") else "ffprobe"
+
+
+def probe_duration(path):
+    out = subprocess.run(
+        [FFPROBE, "-v", "error", "-print_format", "json", "-show_format", path],
+        capture_output=True, timeout=60,
+    ).stdout
+    return float(json.loads(out)["format"]["duration"])
+
 
 for i, ep in enumerate(episodes):
     ep_name = os.path.basename(ep)
-    with VideoFileClip(ep) as vc:
-        total_dur = vc.duration
+    total_dur = probe_duration(ep)
 
     avail = max(0, total_dur - CLIP_START_SEC)
     if avail <= 1:

@@ -5,7 +5,32 @@ edge-tts==7.2.3
 pymediainfo==7.0.1
 opencv-python==4.11.0.86
 numpy==2.2.4
+pillow==13.0.0
 imageio==2.37.0
 psutil==7.0.0
 requests==2.32.5
 websockets==16.0
+
+# ── pipeline AI 链路 ──
+demucs==4.1.0
+faster-whisper==1.2.1
+funasr-onnx==0.4.3
+videocaptioner==1.4.2
+audio-separator==0.47.1
+
+# torch/torchaudio 必须装 CUDA 版（demucs GPU 加速，42x 实时速率）：
+#   pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+# 已验证版本：torch 2.14.1+cu126、torchaudio 2.11.0+cu126（RTX 4060 Laptop，驱动 616.56）
+# torchvision 0.29.1（CPU 版，audio-separator 传递依赖装入，pipeline 未使用，可不装）
+#
+# ⚠️ 版本硬约束（2026-10-23 全链路冒烟验证）：
+#   - numpy 必须保持 2.2.4：funasr-onnx 的 vad_bin.py 与 numpy>=2.5 不兼容
+#   - pillow 定版 13.0：videocaptioner 1.4.2 要求 pillow>=12（moviepy 已卸载，其过时的 <12 上界随之消失）
+#
+# ⚠️ 元数据补丁（pip 重装对应包后会被冲掉，需重打）：
+#   - funasr_onnx-0.4.3.dist-info：numpy<=1.26.4 → numpy (>=2.0,<2.5)（旧 pin 过时，运行时实测 2.2.4 正常）
+#   - ⚠️ 补丁方法必须用 Python 读写并显式 encoding='utf-8'，禁止 PowerShell Get-Content/Set-Content——
+#     其编码回环会把 UTF-8 BOM 变成 0x3F('?') 前缀，破坏 Metadata-Version 头 → pip show 直接崩、pip list 显示 None
+#
+# 已知无关冲突（不处理，与 pipeline 无关）：httpcore 1.0.5 要 h11<0.15（现 0.16.0）、
+# mitmproxy 12.2.3 要 typing-extensions<=4.14（现 4.16.0）——均属 mitmproxy 独立工具链

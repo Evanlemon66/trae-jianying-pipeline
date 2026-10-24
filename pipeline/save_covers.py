@@ -1,8 +1,7 @@
-import sys, os, json, time, re, glob
+import sys, os, json, time, re, glob, subprocess
 sys.stdout.reconfigure(encoding="utf-8")
-import numpy as np
-from PIL import Image
-from moviepy import VideoFileClip
+
+FFMPEG = r"D:\AI_Deps\tools\ffmpeg\bin\ffmpeg.exe" if os.path.exists(r"D:\AI_Deps\tools\ffmpeg\bin\ffmpeg.exe") else "ffmpeg"
 
 VIDEO_DIR = r"D:\短剧\10-六零糙汉：我靠打猎养全家"
 COVER_DIR = os.path.join(VIDEO_DIR, "covers")
@@ -26,12 +25,12 @@ def ep_num(f):
 
 def save_frame(video_path, t, out_path):
     try:
-        clip = VideoFileClip(video_path)
-        frame = clip.get_frame(max(0, min(t, clip.duration - 0.1)))
-        clip.close()
-        img = Image.fromarray(frame)
-        img.save(out_path, quality=95)
-        return True
+        r = subprocess.run(
+            [FFMPEG, "-y", "-v", "error", "-ss", f"{max(0, t):.2f}", "-i", video_path,
+             "-frames:v", "1", "-q:v", "2", out_path],
+            capture_output=True, timeout=60,
+        )
+        return r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0
     except Exception as e:
         print(f"    截图失败: {e}")
         return False

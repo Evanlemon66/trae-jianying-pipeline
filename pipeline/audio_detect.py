@@ -1,7 +1,8 @@
-import sys, time, os, re, glob, json
+import sys, time, os, re, glob, json, subprocess
 sys.stdout.reconfigure(encoding="utf-8")
 import numpy as np
-from moviepy import VideoFileClip
+
+FFMPEG = r"D:\AI_Deps\tools\ffmpeg\bin\ffmpeg.exe" if os.path.exists(r"D:\AI_Deps\tools\ffmpeg\bin\ffmpeg.exe") else "ffmpeg"
 
 VIDEO_DIR = r"D:\短剧\10-六零糙汉：我靠打猎养全家"
 
@@ -16,17 +17,16 @@ def ep_num(f):
 
 def find_audio_peak(video_path, scan_dur=60, chunk_dur=0.25):
     try:
-        clip = VideoFileClip(video_path)
-        dur = clip.duration
-        audio = clip.audio
-        if audio is None:
-            clip.close()
+        # ffmpeg 管道输出 16kHz 单声道 f32le 原始 PCM，numpy 直读（替代 moviepy）
+        r = subprocess.run(
+            [FFMPEG, "-v", "error", "-t", str(scan_dur), "-i", video_path,
+             "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1"],
+            capture_output=True, timeout=120,
+        )
+        audio_samples = np.frombuffer(r.stdout, dtype=np.float32)
+        if audio_samples.size == 0:
             return None, None
-
-        sr = audio.fps
-        audio_samples = audio.subclipped(0, min(scan_dur, dur)).to_soundarray()
-        if audio_samples.ndim == 2:
-            audio_samples = audio_samples.mean(axis=1)
+        sr = 16000
 
         chunk_size = int(sr * chunk_dur)
         energies = []
@@ -34,8 +34,6 @@ def find_audio_peak(video_path, scan_dur=60, chunk_dur=0.25):
             chunk = audio_samples[i:i + chunk_size]
             rms = np.sqrt(np.mean(chunk**2))
             energies.append((i / sr, float(rms)))
-
-        clip.close()
 
         if not energies:
             return None, None

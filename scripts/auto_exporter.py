@@ -9,6 +9,7 @@ from utils.logging_utils import setup_logger
 
 setup_env()
 logger = setup_logger("auto_exporter")
+from utils.notifier import toast  # noqa: E402
 
 import pyJianYingDraft as draft  # noqa: E402
 
@@ -117,6 +118,10 @@ def main() -> int:
             False, "invalid_input", str(e), {"draft": args.name, "output": args.output}
         )
         code = 2
+    if code == 0:
+        toast("📤 导出成功", args.output)
+    else:
+        toast("📤 导出失败", f"退出码 {code}: {summary.get('reason', '')}")
     emit_result(summary, args.json)
     return code
 

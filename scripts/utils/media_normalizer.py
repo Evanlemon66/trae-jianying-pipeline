@@ -45,12 +45,23 @@ def _probe_video(input_path: str) -> dict:
     return streams[0] if streams else {}
 
 
+_STANDARD_DIMS = {(1080, 1920), (1920, 1080)}
+
+
 def should_normalize_video_for_jianying(input_path: str) -> bool:
     info = _probe_video(input_path)
     if not info:
         return False
     width = int(info.get("width") or 0)
     height = int(info.get("height") or 0)
+    # 标准画布尺寸（1080x1920 / 1920x1080）虽然宽不是 16 的倍数，但剪映完全支持，
+    # 直接放行，避免对已规范化过的素材二次转码。
+    if (
+        info.get("codec_name") == "h264"
+        and info.get("pix_fmt") == "yuv420p"
+        and (width, height) in _STANDARD_DIMS
+    ):
+        return False
     return (
         info.get("codec_name") != "h264"
         or info.get("pix_fmt") != "yuv420p"
@@ -68,7 +79,7 @@ def normalize_video_for_jianying(input_path: str, force: bool = False) -> Option
     Output profile:
     - Video: H.264 (libx264), yuv420p
     - Audio: AAC (optional if source has audio)
-    - Geometry: 1920x1080 with padding when needed
+    - Geometry: 1920x1080 landscape OR 1080x1920 portrait (auto-detect)
     """
     src = os.path.abspath(input_path)
     if not os.path.exists(src):
@@ -79,6 +90,16 @@ def normalize_video_for_jianying(input_path: str, force: bool = False) -> Option
     dst = _norm_output_path(src)
     if _is_cache_fresh(src, dst):
         return dst
+
+    info = _probe_video(src)
+    w = int(info.get("width") or 0)
+    h = int(info.get("height") or 0)
+    if w > 0 and h > 0 and h > w:
+        tgt_w, tgt_h = 1080, 1920
+    else:
+        tgt_w, tgt_h = 1920, 1080
+
+    scale_pad = f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2"
 
     cmd = [
         "ffmpeg",
@@ -93,8 +114,7 @@ def normalize_video_for_jianying(input_path: str, force: bool = False) -> Option
         "-map",
         "0:a?",
         "-vf",
-        "scale=1920:1080:force_original_aspect_ratio=decrease,"
-        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+        scale_pad,
         "-r",
         "30",
         "-c:v",
