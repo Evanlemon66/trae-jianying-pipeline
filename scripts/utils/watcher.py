@@ -5,11 +5,16 @@
     python watcher.py --dir <workdir> --interval 5       # 轮询间隔 5s（默认 3s）
     python watcher.py --dir <workdir> --once             # 只轮询一次（供 Agent 定时调用）
     python watcher.py --dir <workdir> --heartbeat 60     # 60s 无新事件时弹心跳进度（默认开启）
+    python watcher.py --dir <workdir> --pid 12345        # 监控指定主进程：其死亡立即告警，
+                                                         # 且全部终态时主进程活着则静默退出（去重）
 
 设计:
     - 轻量（单线程单文件轮询，内存 <1MB），脚本崩了不影响 batch_runner 主流程
     - 只报增量变化：首次启动读快照，只通知新出现的事件
     - 终态自动退出：所有视频 status ∈ {done, failed, skipped} 时汇总通知后退出
+      （--pid 指定主进程时：主进程存活则收尾 toast 由主进程发，watcher 静默退出避免重复）
+    - 主进程监控：--pid 指定的进程中途死亡时立即告警（崩溃兜底核心路径）
+    - 自愈：单轮异常不退出（连续 5 轮异常才告警退出），未捕获异常临终 toast
     - 两个信号源: _batch_state.json（结构化状态） + *.log 文件（关键字正则）
     - 通知走 notifier.toast()，失败静默，不影响主循环
     - 事件限速聚合：同轮询 2s 窗口内多个状态变化合并为一条 toast（防 30 条轰炸）
@@ -58,6 +63,32 @@ _STATE_AGG_WINDOW = 2.0
 
 # 心跳间隔（秒）
 _DEFAULT_HEARTBEAT = 60.0
+
+# 主循环连续异常上限：超过则告警退出（防死循环刷异常）
+_MAX_CONSECUTIVE_ERRORS = 5
+
+
+def _pid_alive(pid: int) -> bool:
+    """判断进程是否存在且仍在运行（ctypes 实现，零依赖）。"""
+    if not pid or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        import ctypes
+        # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True  # 查不到退出码，按存活处理避免误报
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        return True  # 判断不了就当活着，避免误报死亡
 
 
 def _read_state(workdir: str) -> dict:
@@ -206,12 +237,14 @@ def _progress(state: dict) -> str:
 
 
 def run_watcher(workdir: str, interval: float = 3.0, once: bool = False,
-                heartbeat: float = _DEFAULT_HEARTBEAT) -> None:
+                heartbeat: float = _DEFAULT_HEARTBEAT, parent_pid: int = 0) -> None:
     """主循环。"""
     print(f"🔍 Watcher 启动: {workdir}")
     print(f"   轮询间隔 {interval}s, {'单次模式' if once else '常驻模式'}")
     if heartbeat and not once:
         print(f"   心跳间隔 {heartbeat}s")
+    if parent_pid:
+        print(f"   监控主进程 PID={parent_pid}（死亡立即告警；终态时其存活则静默退出）")
 
     # 首次读取快照（作为 prev_state，避免初始 done 集误报）
     prev_state = _read_state(workdir)
@@ -236,6 +269,12 @@ def run_watcher(workdir: str, interval: float = 3.0, once: bool = False,
     # 心跳计时
     last_event_time: float = time.time()
 
+    # 主进程死亡只告警一次
+    parent_dead_notified = False
+
+    # 自愈：连续异常计数
+    consecutive_errors = 0
+
     def _flush_agg_buffer():
         """刷新聚合缓冲器，把缓冲的事件合并后弹 toast。"""
         nonlocal agg_buffer, agg_buffer_start
@@ -250,42 +289,64 @@ def run_watcher(workdir: str, interval: float = 3.0, once: bool = False,
 
     try:
         while True:
-            now = time.time()
-            events_state, prev_state = _poll_state(workdir, prev_state)
-            events_log = _poll_logs(workdir, log_positions, last_log_fire)
+            try:
+                now = time.time()
+                events_state, prev_state = _poll_state(workdir, prev_state)
+                events_log = _poll_logs(workdir, log_positions, last_log_fire)
 
-            # 状态事件：进入聚合缓冲器（2s 窗口）
-            if events_state:
-                if not agg_buffer:
-                    agg_buffer_start = now
-                agg_buffer.extend(events_state)
-                last_event_time = now
-
-            # 聚合窗口到了就刷新
-            if agg_buffer and (now - agg_buffer_start) >= _STATE_AGG_WINDOW:
-                _flush_agg_buffer()
-
-            # 日志事件：逐条直接弹（日志告警本身频率不高）
-            for log_name, line in events_log:
-                toast(f"👁️ 日志告警: {log_name}", line, icon="warning")
-                print(f"   📢 日志告警 [{log_name}]: {line}")
-                last_event_time = now
-
-            # 心跳：常驻模式 + 长时间无新事件 + 有进度
-            if heartbeat and not once and (now - last_event_time) >= heartbeat and prev_state:
-                if not _all_terminal(prev_state):
-                    progress = _progress(prev_state)
-                    toast("👁️ 进度（仍在跑）", progress, icon="info")
-                    print(f"   💓 心跳: {progress}")
+                # 状态事件：进入聚合缓冲器（2s 窗口）
+                if events_state:
+                    if not agg_buffer:
+                        agg_buffer_start = now
+                    agg_buffer.extend(events_state)
                     last_event_time = now
 
-            # 检查是否全部终态
-            if _all_terminal(prev_state):
-                _flush_agg_buffer()  # 先刷新剩余缓冲
-                summary = _summary(prev_state)
-                toast("👁️ 全部终态", summary, icon="info")
-                print(f"\n✅ Watcher 检测到所有任务结束: {summary}")
-                break
+                # 聚合窗口到了就刷新
+                if agg_buffer and (now - agg_buffer_start) >= _STATE_AGG_WINDOW:
+                    _flush_agg_buffer()
+
+                # 日志事件：逐条直接弹（日志告警本身频率不高）
+                for log_name, line in events_log:
+                    toast(f"👁️ 日志告警: {log_name}", line, icon="warning")
+                    print(f"   📢 日志告警 [{log_name}]: {line}")
+                    last_event_time = now
+
+                # 心跳：常驻模式 + 长时间无新事件 + 有进度
+                if heartbeat and not once and (now - last_event_time) >= heartbeat and prev_state:
+                    if not _all_terminal(prev_state):
+                        progress = _progress(prev_state)
+                        toast("👁️ 进度（仍在跑）", progress, icon="info")
+                        print(f"   💓 心跳: {progress}")
+                        last_event_time = now
+
+                # 主进程死亡检测（崩溃兜底核心路径，只告警一次）
+                if parent_pid and not parent_dead_notified and not _pid_alive(parent_pid):
+                    parent_dead_notified = True
+                    toast("👁️ 主进程已退出", f"PID {parent_pid} 消失，当前进度: {_progress(prev_state)}",
+                          icon="warning")
+                    print(f"   ⚠️ 主进程 PID={parent_pid} 已退出（继续监控至终态）")
+                    last_event_time = now
+
+                # 检查是否全部终态
+                if _all_terminal(prev_state):
+                    _flush_agg_buffer()  # 先刷新剩余缓冲
+                    summary = _summary(prev_state)
+                    if parent_pid and _pid_alive(parent_pid):
+                        # 主进程活着：收尾通知由主进程（🎬）发出，watcher 静默退出避免重复
+                        print(f"\n✅ 所有任务结束: {summary}（主进程存活，收尾通知由主进程发出）")
+                    else:
+                        toast("👁️ 全部终态", summary, icon="info")
+                        print(f"\n✅ Watcher 检测到所有任务结束: {summary}")
+                    break
+
+                consecutive_errors = 0  # 本轮正常，清零
+
+            except Exception as e:
+                consecutive_errors += 1
+                print(f"   ⚠️ 轮询异常（第 {consecutive_errors} 次，不退出）: {e}")
+                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    toast("👁️ Watcher 异常退出", f"连续 {consecutive_errors} 轮异常: {e}", icon="error")
+                    return
 
             if once:
                 break
@@ -295,6 +356,13 @@ def run_watcher(workdir: str, interval: float = 3.0, once: bool = False,
     except KeyboardInterrupt:
         _flush_agg_buffer()
         print("\n⏹️  Watcher 手动退出")
+    except Exception as e:
+        # 临终兜底：任何未捕获异常都尽力通知一声
+        try:
+            toast("👁️ Watcher 崩溃", str(e)[:100], icon="error")
+        except Exception:
+            pass
+        print(f"\n❌ Watcher 未捕获异常退出: {e}")
 
 
 def main() -> int:
@@ -304,6 +372,8 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="只轮询一次就退出（供 Agent 定时调用）")
     parser.add_argument("--heartbeat", type=float, default=_DEFAULT_HEARTBEAT,
                         help=f"心跳通知间隔秒数（默认 {_DEFAULT_HEARTBEAT}, 0 关闭）")
+    parser.add_argument("--pid", type=int, default=0,
+                        help="主进程 PID：其死亡立即告警；全部终态时若主进程存活则静默退出（去重）")
     args = parser.parse_args()
 
     if not os.path.isdir(args.dir):
@@ -311,7 +381,8 @@ def main() -> int:
         return 1
 
     heartbeat_val = args.heartbeat if args.heartbeat > 0 else 0
-    run_watcher(args.dir, interval=args.interval, once=args.once, heartbeat=heartbeat_val)
+    run_watcher(args.dir, interval=args.interval, once=args.once,
+                heartbeat=heartbeat_val, parent_pid=args.pid)
     return 0
 
 
