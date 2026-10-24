@@ -2387,12 +2387,66 @@ def get_main_video_duration(draft):
     return draft_duration(draft)
 
 
-DEFAULT_PRESETS = [
-    ("logo文字", None),
-    ("上新", None),
-    ("三连~", None),
-    ("滤镜+透明度", 0.03),
-]
+# ---- 组合预设解析（分层，无硬编码个人配置） ----
+# 优先级: 显式传入/--presets > pipeline/presets.json(个人, gitignored) > 预设库 pipeline_* 前缀自动发现 > 不用预设
+# 预设本身在剪映「我的预设」库中创建；alpha 为可选滤镜透明度，仅对滤镜类生效
+PRESET_PREFIX = "pipeline_"
+PRESETS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
+
+
+def list_available_presets():
+    """扫描本机剪映组合预设库，返回可用预设名列表。"""
+    names = []
+    if os.path.isdir(PRESET_ROOT):
+        for name in sorted(os.listdir(PRESET_ROOT)):
+            if os.path.isdir(os.path.join(PRESET_ROOT, name, "preset_draft")):
+                names.append(name)
+    return names
+
+
+def parse_presets_arg(s):
+    """解析 '名字1,名字2:0.03' 为 [(name, alpha), ...]；alpha 为可选滤镜透明度。"""
+    out = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            name, alpha = part.rsplit(":", 1)
+            out.append((name.strip(), float(alpha)))
+        else:
+            out.append((part, None))
+    return out
+
+
+def resolve_presets():
+    """返回 (presets, 来源描述)。presets 为 [(name, alpha), ...]，可能为空列表。"""
+    if os.path.isfile(PRESETS_JSON):
+        try:
+            with open(PRESETS_JSON, encoding="utf-8") as f:
+                items = json.load(f).get("presets", [])
+            out = [(it["name"], it.get("alpha")) for it in items if it.get("name")]
+            if out:
+                return out, f"配置文件 {os.path.basename(PRESETS_JSON)}"
+        except Exception as e:
+            print(f"  ⚠️ presets.json 解析失败({e})，回退自动发现")
+    prefixed = [(n, None) for n in list_available_presets() if n.startswith(PRESET_PREFIX)]
+    if prefixed:
+        return prefixed, f"预设库前缀 {PRESET_PREFIX}* 自动发现"
+    return [], None
+
+
+def warn_missing_presets(presets):
+    """校验解析出的预设在预设库中真实存在，缺失项给出醒目告警。"""
+    avail = set(list_available_presets())
+    missing = [n for n, _ in presets if n not in avail]
+    for n in missing:
+        print(f"  ⚠️ 预设 '{n}' 在本机剪映预设库中不存在，合并时将被跳过")
+        print(f"     可用预设: {sorted(avail) or '(空)'}")
+    return not missing
+
+
+DEFAULT_PRESETS = []  # 兼容旧引用；实际解析走 resolve_presets()
 
 
 def default_workdir_for_draft(draft_name_or_path):
@@ -2426,7 +2480,13 @@ def run_pipeline(draft_name_or_path, video_paths=None,
     _TIMINGS.clear()  # 每次运行重新计时
 
     if presets is None:
-        presets = DEFAULT_PRESETS
+        presets, _preset_src = resolve_presets()
+        if _preset_src:
+            print(f"  🧩 预设来源: {_preset_src}")
+        if do_presets and not presets:
+            print("  ⚠️ 未解析到任何预设（无 presets.json 且无 pipeline_* 前缀预设），本次不使用预设")
+        elif do_presets:
+            warn_missing_presets(presets)
     PRESETS = presets
 
     print(f"\n{'='*60}")
@@ -3009,7 +3069,7 @@ def clean_workdir(workdir, protect_referenced=True):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="JianYing Full-Local Pipeline (方案B: 注入已有草稿)")
-    parser.add_argument("draft",
+    parser.add_argument("draft", nargs="?", default=None,
                         help="已有草稿名称或路径 (用剪映手动新建的草稿)")
     parser.add_argument("--video", action="append", default=None,
                         help="视频文件路径 (可多次指定, 注入到草稿主轨拼接)")
@@ -3021,12 +3081,38 @@ if __name__ == "__main__":
     parser.add_argument("--no-export", action="store_true", help="跳过导出")
     parser.add_argument("--no-demucs", action="store_true", help="跳过人声分离")
     parser.add_argument("--no-presets", action="store_true", help="跳过所有预设")
+    parser.add_argument("--presets", default=None, metavar="'名1,名2:0.03'",
+                        help="显式指定预设(逗号分隔, 名字后可带:滤镜透明度); 优先级高于 presets.json 与前缀自动发现")
+    parser.add_argument("--list-presets", action="store_true",
+                        help="列出本机剪映预设库及当前生效来源后退出")
     parser.add_argument("--no-asr", action="store_true", help="跳过字幕识别")
     parser.add_argument("--no-translate", action="store_true", help="跳过翻译")
     parser.add_argument("--no-hide-cn", action="store_true", help="不隐藏中文字幕")
     parser.add_argument("--skip-subtitle-check", action="store_true",
                         help="跳过发布前字幕终检（中文残留/超长/结构）")
     args = parser.parse_args()
+
+    if args.list_presets:
+        avail = list_available_presets()
+        resolved, src = resolve_presets()
+        resolved_names = {n for n, _ in resolved}
+        print("本机剪映组合预设库:")
+        for n in avail:
+            marks = []
+            if n in resolved_names:
+                marks.append("将生效")
+            if n.startswith(PRESET_PREFIX):
+                marks.append("前缀匹配")
+            print(f"  {'✅' if marks else '  '} {n}" + (f"  ({', '.join(marks)})" if marks else ""))
+        if not avail:
+            print("  (空) — 在剪映中框选元素 → 保存为我的预设 后此处可见")
+        print(f"\n当前解析来源: {src or '无（本次将不使用预设）'}")
+        print(f"生效预设: {[n for n, _ in resolved] or '无'}")
+        print("提示: --presets '名1,名2:0.03' 可临时覆盖; 个人固定配置写 pipeline/presets.json")
+        sys.exit(0)
+
+    if not args.draft:
+        parser.error("必须指定草稿名（或使用 --list-presets 查看预设库）")
 
     cut_us = int(args.cut * 1_000_000) if args.cut is not None else None
 
@@ -3039,6 +3125,7 @@ if __name__ == "__main__":
         do_export=not args.no_export,
         do_demucs=not args.no_demucs,
         do_presets=not args.no_presets,
+        presets=parse_presets_arg(args.presets) if args.presets else None,
         do_ffmpeg=True,
         do_whisper=not args.no_asr,
         do_translate=not args.no_translate,
