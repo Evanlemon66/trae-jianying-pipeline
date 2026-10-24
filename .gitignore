@@ -4,6 +4,9 @@ _*.py
 !__init__.py
 !.trae/skills/**/*.py
 
+# 个人配置（含个人预设名/密钥，不入库；参考 *.example.json）
+pipeline/presets.json
+
 # Python 缓存
 __pycache__/
 *.pyc

@@ -107,6 +107,10 @@ def main():
                     help="(默认) 单草稿串流模式：所有视频按文件名排序一次注入同一草稿（一条主轨）")
     ap.add_argument("--per-episode", dest="stream", action="store_false",
                     help="逐集独立草稿模式：每集一个草稿（可配合 --auto-merge 合并），仅在明确需要多草稿并合并时使用")
+    ap.add_argument("--cut", type=float, default=None,
+                    help="裁掉开头 N 秒之前的内容（透传 pipeline --cut，单位秒）")
+    ap.add_argument("--presets", default=None, metavar="'名1,名2:0.03'",
+                    help="显式指定组合预设（透传 pipeline；不指定则走 presets.json/前缀自动发现）")
     ap.add_argument("--watch", action="store_true",
                     help="同时启动 watcher 守护进程（后台监控状态变化，桌面通知，脚本崩溃也能告知）")
     ap.set_defaults(stream=True)
@@ -193,9 +197,11 @@ def main():
         pl.run_pipeline(
             draft_name_or_path=draft_name,
             video_paths=[v for _, v in sel],
+            cut_us=int(args.cut * 1_000_000) if args.cut is not None else None,
             do_export=False,
             skip_local_ai=False,
             workdir=args.workdir,
+            presets=pl.parse_presets_arg(args.presets) if args.presets else None,
             **cover_kw,
         )
 
@@ -256,11 +262,13 @@ def main():
                 pl.run_pipeline(
                     draft_name_or_path=draft_name,
                     video_paths=[video],
+                    cut_us=int(args.cut * 1_000_000) if args.cut is not None else None,
                     do_export=False,
                     skip_local_ai=False,
                     cover_image=args.cover_image or None,
                     cover_extract_from_video=None if args.cover_image else video,
                     workdir=wd_ep,
+                    presets=pl.parse_presets_arg(args.presets) if args.presets else None,
                 )
                 done = True
                 break

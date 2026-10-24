@@ -1,0 +1,14 @@
+{
+  "_说明": [
+    "复制本文件为 presets.json（同目录），把 name 改成你自己剪映「我的预设」里的组合预设名。",
+    "name 必须与剪映预设库中的名字完全一致（可用 pipeline.py --list-presets 查看本机已有预设）。",
+    "alpha 为可选的滤镜透明度（0~1），仅对滤镜类预设生效，普通贴纸/logo 预设不用填。",
+    "presets.json 为个人配置，已被 gitignore 不会提交；不配此文件时，预设库中 pipeline_ 开头的预设会被自动启用。",
+    "临时换预设可用命令行: python pipeline\\pipeline.py <草稿名> --presets \"名1,名2:0.03\""
+  ],
+  "presets": [
+    { "name": "我的logo" },
+    { "name": "我的角标贴纸" },
+    { "name": "我的滤镜", "alpha": 0.03 }
+  ]
+}
