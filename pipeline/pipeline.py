@@ -3116,19 +3116,32 @@ if __name__ == "__main__":
 
     cut_us = int(args.cut * 1_000_000) if args.cut is not None else None
 
-    run_pipeline(
-        draft_name_or_path=args.draft,
-        video_paths=args.video,
-        cut_us=cut_us,
-        workdir=args.workdir,
-        skip_local_ai=args.skip_ai,
-        do_export=not args.no_export,
-        do_demucs=not args.no_demucs,
-        do_presets=not args.no_presets,
-        presets=parse_presets_arg(args.presets) if args.presets else None,
-        do_ffmpeg=True,
-        do_whisper=not args.no_asr,
-        do_translate=not args.no_translate,
-        do_hide_cn=not args.no_hide_cn,
-        do_subtitle_check=not args.skip_subtitle_check,
-    )
+    # 单集直调 toast（batch_runner 进程内调用 run_pipeline 不经此处，不会重复通知）
+    try:
+        sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
+        from utils.notifier import toast as _toast
+    except Exception:
+        def _toast(*a, **k):  # noqa: ANN001
+            pass
+
+    try:
+        run_pipeline(
+            draft_name_or_path=args.draft,
+            video_paths=args.video,
+            cut_us=cut_us,
+            workdir=args.workdir,
+            skip_local_ai=args.skip_ai,
+            do_export=not args.no_export,
+            do_demucs=not args.no_demucs,
+            do_presets=not args.no_presets,
+            presets=parse_presets_arg(args.presets) if args.presets else None,
+            do_ffmpeg=True,
+            do_whisper=not args.no_asr,
+            do_translate=not args.no_translate,
+            do_hide_cn=not args.no_hide_cn,
+            do_subtitle_check=not args.skip_subtitle_check,
+        )
+        _toast("🎬 单集草稿完成", str(args.draft))
+    except Exception as e:
+        _toast("🎬 单集草稿失败", f"{args.draft}: {str(e)[:80]}", icon="error")
+        raise

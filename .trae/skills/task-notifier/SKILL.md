@@ -64,6 +64,7 @@ python scripts/utils/watcher.py --dir <workdir> --once
 | `--interval` | 轮询间隔秒数 | 3.0 |
 | `--once` | 只轮询一次就退出（Agent 定时调用用） | False |
 | `--heartbeat` | 心跳通知间隔秒数（0=关闭，常驻模式才生效） | 60.0 |
+| `--pid` | 主进程 PID：死亡立即告警；终态时其存活则静默退出（去重） | 0 |
 
 **Watcher 行为规则**：
 - 启动时读 `_batch_state.json` 快照，**初始 done 集不触发事件**（避免历史残留误报）
@@ -72,8 +73,13 @@ python scripts/utils/watcher.py --dir <workdir> --once
 - **日志正则 + 误匹配排除**：`\b(error\|traceback\|exception\|fail(ed)?\|export_failed)\b` + 排除词表（error_rate / no error / error handling）
 - **日志去重**：同一 log + 同一关键字 10s 内不重复弹
 - **60s 心跳**：长时间无新事件时弹进度（`已完成 5/78 集, 运行中 73 集`）
+- **主进程死亡检测**（`--pid` 时）：主进程中途退出立即弹 👁️ 主进程已退出
+- **终态去重**：全部终态时主进程（--pid）仍存活 → watcher **静默退出**（收尾 🎬 由主进程发）；主进程已死 → watcher 弹 👁️ 全部终态 兜底
+- **自愈**：单轮异常（文件锁/JSON 读一半）不退出，连续 5 轮异常才告警退出；未捕获异常前弹临终 toast
 - 所有集进入终态后弹汇总通知并 **自动退出**
 - 脚本崩溃也能通知（因为 watcher 是独立进程）
+
+**互监机制（2026-10-25）**：batch_runner 默认 `--watch`（`--no-watch` 关闭），启动时拉起 watcher 并传入自身 PID；主循环每集开跑前反查 watcher 存活、死了立即重启——watcher 盯主进程、主进程盯 watcher，双向互保。series_runner 通过调用 batch_runner 自动获得同款守护。
 
 ## 🎬 Toast 标题前缀规范
 

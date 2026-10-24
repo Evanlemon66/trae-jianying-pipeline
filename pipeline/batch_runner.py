@@ -109,10 +109,15 @@ def main():
                     help="逐集独立草稿模式：每集一个草稿（可配合 --auto-merge 合并），仅在明确需要多草稿并合并时使用")
     ap.add_argument("--cut", type=float, default=None,
                     help="裁掉开头 N 秒之前的内容（透传 pipeline --cut，单位秒）")
+    ap.add_argument("--no-export", dest="auto_export", action="store_false",
+                    help="串流草稿生成后不自动导出（默认自动导出到剧集目录）")
+    ap.set_defaults(auto_export=True)
     ap.add_argument("--presets", default=None, metavar="'名1,名2:0.03'",
                     help="显式指定组合预设（透传 pipeline；不指定则走 presets.json/前缀自动发现）")
-    ap.add_argument("--watch", action="store_true",
-                    help="同时启动 watcher 守护进程（后台监控状态变化，桌面通知，脚本崩溃也能告知）")
+    ap.add_argument("--watch", dest="watch", action="store_true", default=True,
+                    help="(默认) 启动 watcher 守护进程（后台监控状态变化，桌面通知，脚本崩溃也能告知）")
+    ap.add_argument("--no-watch", dest="watch", action="store_false",
+                    help="关闭 watcher 守护进程")
     ap.set_defaults(stream=True)
     args = ap.parse_args()
 
@@ -131,19 +136,32 @@ def main():
             _HERE, f"_work_{safe}_{hashlib.md5(base.encode('utf-8')).hexdigest()[:8]}")
     os.makedirs(args.workdir, exist_ok=True)  # 状态文件在首集开跑前就要写入
 
-    # 自动启动 watcher 守护进程（可选，不阻塞主流程）
-    if args.watch:
+    # 自动启动 watcher 守护进程（默认开启，不阻塞主流程；运行中会反查重启）
+    _watcher_proc = None
+
+    def _start_watcher():
+        nonlocal _watcher_proc
+        import subprocess as _sp
+        watcher_path = os.path.join(_SCRIPTS_DIR, "utils", "watcher.py")
+        _watcher_proc = _sp.Popen(
+            [sys.executable, watcher_path, "--dir", args.workdir, "--pid", str(os.getpid())],
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+        )
+        print(f"👁️  Watcher 已后台启动: {args.workdir}")
+
+    def _ensure_watcher():
+        """互监：watcher 死了就重启（watcher 盯主进程，主进程盯 watcher）。"""
+        if not args.watch:
+            return
         try:
-            import subprocess as _sp
-            watcher_path = os.path.join(_SCRIPTS_DIR, "utils", "watcher.py")
-            _sp.Popen(
-                [sys.executable, watcher_path, "--dir", args.workdir],
-                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
-                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-            )
-            print(f"👁️  Watcher 已后台启动: {args.workdir}")
+            if _watcher_proc is None or _watcher_proc.poll() is not None:
+                _start_watcher()
         except Exception as e:
             print(f"  ⚠️ Watcher 启动失败（不影响主流程）: {e}")
+
+    if args.watch:
+        _ensure_watcher()
 
     # 收集视频
     if args.pattern:
@@ -161,6 +179,24 @@ def main():
     if not videos:
         print(f"✗ 目录里没找到视频: {series_dir}")
         sys.exit(1)
+
+    # 封面自动探测（默认行为）：封面.png/jpg → 目录下任意图片兜底 → 都没有则抽帧
+    if not args.cover_image:
+        for name in ("封面.png", "封面.jpg", "封面.jpeg", "封面.webp"):
+            p = os.path.join(series_dir, name)
+            if os.path.isfile(p):
+                args.cover_image = p
+                break
+        else:
+            imgs = sorted(
+                f for f in os.listdir(series_dir)
+                if os.path.splitext(f)[1].lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+                and os.path.isfile(os.path.join(series_dir, f))
+            )
+            if imgs:
+                args.cover_image = os.path.join(series_dir, imgs[0])
+        if args.cover_image:
+            print(f"🖼️ 自动封面: {os.path.basename(args.cover_image)}")
 
     prefix = args.draft_prefix or os.path.basename(series_dir.rstrip("\\/"))
     state = {} if args.fresh else load_state(args.workdir)
@@ -194,6 +230,7 @@ def main():
 
         cover_kw = ({"cover_image": args.cover_image} if args.cover_image
                     else {"cover_extract_from_video": sel[0][1]})
+        _ensure_watcher()  # 串流主流程开跑前反查 watcher
         pl.run_pipeline(
             draft_name_or_path=draft_name,
             video_paths=[v for _, v in sel],
@@ -216,6 +253,27 @@ def main():
         save_state(args.workdir, state)
         print(f"\n🏁 串流草稿完成: {draft_name}")
         _toast("🎬 串流草稿已就绪", f"{draft_name}（{len(sel)} 集）")
+
+        # 默认行为：生成完自动导出到剧集目录（--no-export 可关）
+        if args.auto_export:
+            import subprocess as _sp
+            exporter = os.path.join(
+                _PROJECT_ROOT, ".trae", "skills", "jianying-editor",
+                "examples", "robust_auto_export.py")
+            out_mp4 = os.path.join(series_dir, f"{draft_name}.mp4")
+            print(f"\n📤 自动导出 → {out_mp4}")
+            _toast("📤 开始自动导出", draft_name)
+            rc = _sp.call(
+                [sys.executable, "-u", exporter, draft_name, out_mp4, "--move"],
+                cwd=_PROJECT_ROOT)
+            if rc == 0:
+                print(f"✅ 导出完成: {out_mp4}")
+                _toast("📤 导出完成", f"{draft_name} → {os.path.basename(series_dir)}")
+            else:
+                print(f"✗ 导出失败(rc={rc})，可手动重跑:")
+                print(f"   python \"{exporter}\" \"{draft_name}\" \"{out_mp4}\" --move")
+                _toast("📤 导出失败", f"{draft_name}（rc={rc}，详见日志）")
+
         if args.clean_workdir:
             pl.clean_workdir(args.workdir)
         return
@@ -240,6 +298,7 @@ def main():
     ok, fail = 0, 0
     t0 = time.time()
     for n, (ep, video) in enumerate(todo, 1):
+        _ensure_watcher()  # 每集开跑前反查 watcher
         draft_name = f"{prefix}_第{ep:02d}集"
         print(f"\n{'━'*60}")
         print(f"📺 [{n}/{len(todo)}] 第{ep}集  {os.path.basename(video)}")
