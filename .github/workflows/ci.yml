@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python syntax check (exclude vendored third-party)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = git ls-files '*.py' | Where-Object { $_ -notmatch 'vendor[/\\]' }
+          foreach ($f in $files) {
+            python -m py_compile $f
+            if ($LASTEXITCODE -ne 0) { Write-Host "SYNTAX FAIL: $f"; exit 1 }
+          }
+          Write-Host "Python syntax OK: $($files.Count) files"
+
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = git ls-files '*.ps1'
+          foreach ($f in $files) {
+            $errs = $null
+            [void][System.Management.Automation.PSParser]::Tokenize((Get-Content $f -Raw), [ref]$errs)
+            if ($errs.Count -gt 0) {
+              $errs | ForEach-Object { Write-Host "$f : $($_.Message)" }
+              exit 1
+            }
+          }
+          Write-Host "PowerShell syntax OK: $($files.Count) files"
+
+      - name: Leak guard (personal configs / secrets / logs must not be tracked)
+        shell: pwsh
+        run: |
+          $bad = git ls-files | Select-String -Pattern 'vc_config\.json$', 'pipeline/presets\.json$', '_work[/\\]', '\.log$', '_batch_state\.json', '_series_queue_state\.json'
+          if ($bad) { Write-Host "LEAKED FILES:"; $bad | ForEach-Object { Write-Host $_ }; exit 1 }
+          Write-Host "Leak guard OK"
