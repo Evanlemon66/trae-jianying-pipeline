@@ -13,6 +13,12 @@ _*.png
 _*.wav
 _*.jpg
 _*.csv
+_*.log
+_*.jsonl
+
+# 批量任务工作目录（含 _work 本体及各剧命名变体）
+_work*/
+_work/
 
 # 运行产物
 *.wav
@@ -26,6 +32,9 @@ audio_peak_results.json
 # 虚拟环境
 venv/
 .env
+
+# API 密钥配置（智谱等）
+pipeline/vc_config.json
 
 # IDE
 .vscode/
