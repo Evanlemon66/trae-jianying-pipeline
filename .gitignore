@@ -1,10 +1,15 @@
 # 临时检查/调试脚本
 _*.py
+# 但 Python 包标识与技能目录内脚本必须跟踪（_*.py 会误伤 __init__.py / _bootstrap.py）
+!__init__.py
+!.trae/skills/**/*.py
 
 # Python 缓存
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.ruff_cache/
 
 # 临时数据文件
 _*.txt
@@ -39,7 +44,14 @@ pipeline/vc_config.json
 # IDE
 .vscode/
 .idea/
-.trae/
+# Trae 技能入库（仓库核心交付物）；仅忽略本机规划文档与嵌套上游仓库备份
+.trae/documents/
+.trae/skills/jianying-editor/upstream.git.bak/
+.trae/skills/gemini-web-quicker-skill/upstream.git.bak/
+# 技能目录内的示例素材不受全局媒体忽略约束
+!.trae/skills/**/*.mp3
+!.trae/skills/**/*.mp4
+!.trae/skills/**/*.wav
 _work/
 
 # 系统文件
@@ -50,6 +62,6 @@ Thumbs.db
 *.zip
 *.exe
 
-# 剪映本地资源 (体积大，由 sync_jy_assets 自动同步)
-assets/
-covers/
+# 剪映本地资源 (体积大，由 sync_jy_assets 自动同步；仅根目录，技能内 assets 正常入库)
+/assets/
+/covers/
