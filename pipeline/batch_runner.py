@@ -110,8 +110,10 @@ def main():
     ap.add_argument("--cut", type=float, default=None,
                     help="裁掉开头 N 秒之前的内容（透传 pipeline --cut，单位秒）")
     ap.add_argument("--no-export", dest="auto_export", action="store_false",
-                    help="串流草稿生成后不自动导出（默认自动导出到剧集目录）")
+                    help="串流草稿生成后不自动导出（默认自动导出到默认目录）")
     ap.set_defaults(auto_export=True)
+    ap.add_argument("--export-dir", default=r"D:\油管打猎\L",
+                    help="自动导出落点目录（默认 D:\\油管打猎\\L）")
     ap.add_argument("--presets", default=None, metavar="'名1,名2:0.03'",
                     help="显式指定组合预设（透传 pipeline；不指定则走 presets.json/前缀自动发现）")
     ap.add_argument("--watch", dest="watch", action="store_true", default=True,
@@ -254,13 +256,14 @@ def main():
         print(f"\n🏁 串流草稿完成: {draft_name}")
         _toast("🎬 串流草稿已就绪", f"{draft_name}（{len(sel)} 集）")
 
-        # 默认行为：生成完自动导出到剧集目录（--no-export 可关）
+        # 默认行为：生成完自动导出到默认目录（--no-export 可关，--export-dir 可改）
         if args.auto_export:
             import subprocess as _sp
             exporter = os.path.join(
                 _PROJECT_ROOT, ".trae", "skills", "jianying-editor",
                 "examples", "robust_auto_export.py")
-            out_mp4 = os.path.join(series_dir, f"{draft_name}.mp4")
+            os.makedirs(args.export_dir, exist_ok=True)
+            out_mp4 = os.path.join(args.export_dir, f"{draft_name}.mp4")
             print(f"\n📤 自动导出 → {out_mp4}")
             _toast("📤 开始自动导出", draft_name)
             rc = _sp.call(
@@ -268,7 +271,7 @@ def main():
                 cwd=_PROJECT_ROOT)
             if rc == 0:
                 print(f"✅ 导出完成: {out_mp4}")
-                _toast("📤 导出完成", f"{draft_name} → {os.path.basename(series_dir)}")
+                _toast("📤 导出完成", draft_name)
             else:
                 print(f"✗ 导出失败(rc={rc})，可手动重跑:")
                 print(f"   python \"{exporter}\" \"{draft_name}\" \"{out_mp4}\" --move")

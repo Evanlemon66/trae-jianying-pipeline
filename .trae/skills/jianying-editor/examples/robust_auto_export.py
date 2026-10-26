@@ -63,6 +63,56 @@ def _mtime(path):
         return 0.0
 
 
+# ========== 进度可见性（进度文件 + 定时 toast） ==========
+_last_progress_write = [0.0]
+_last_progress_toast = [0.0]
+
+
+def _estimate_percent(real_export_file, expected_duration):
+    """体积估算百分比（封顶 99%）；无法估算时返回 None。"""
+    if not expected_duration or expected_duration <= 0:
+        return None
+    est_total = expected_duration * _EST_BYTES_PER_SEC
+    if est_total <= 0:
+        return None
+    cur = _export_progress_size(real_export_file)
+    return f"约 {min(99, int(cur / est_total * 100))}%"
+
+
+def _write_progress(output_path, real_export_file, expected_duration, start_time,
+                    done=False, final_file=None):
+    """进度文件：<output_path>.progress.json，每 30s 刷新；完成时 done:true。"""
+    import json
+    rec = {
+        "done": done,
+        "exported_mb": round(_export_progress_size(real_export_file) / 1048576, 1),
+        "elapsed_s": int(time.time() - start_time),
+        "percent": _estimate_percent(real_export_file, expected_duration),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if done and final_file:
+        rec["final_mb"] = round(os.path.getsize(final_file) / 1048576, 1)
+        rec["percent"] = "100%"
+    try:
+        with open(os.path.abspath(output_path) + ".progress.json", "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _toast_safe(title, msg):
+    """toast 通知（失败静默，不影响导出主流程）。"""
+    try:
+        _scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "..", "..", "scripts")
+        if _scripts not in sys.path:
+            sys.path.insert(0, os.path.abspath(_scripts))
+        from utils.notifier import toast
+        toast(title, msg)
+    except Exception:
+        pass
+
+
 def _export_progress_size(path):
     """导出中产物体积（字节）：文件=自身大小；文件夹=内含文件总大小；不存在=0。
     供看门狗判断导出是否仍在推进。path 可能无 .mp4 后缀，两种形态都试。
@@ -166,7 +216,11 @@ class Exporter:
             dprint("DPI: 基础感知已开启")
 
     def _find_jianying_path(self):
-        """通过注册表或常用路径查找剪映执行文件"""
+        """通过注册表或常用路径查找剪映执行文件（必须优先 5.9 版）"""
+        # 0. 硬编码 5.9 版路径优先（注册表指向的是另一套 11.x 安装，会找不到草稿）
+        exe_59 = r"D:\剪映5.9\剪映5.9版+jianying-skill\剪映5.9(win+mac)\剪映5.9Windows\JianyingPro\5.9.0.11632\JianyingPro.exe"
+        if os.path.exists(exe_59):
+            return exe_59
         # 1. 尝试从注册表查找卸载项
         try:
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
@@ -266,26 +320,40 @@ class Exporter:
         return "MainWindow" in self.window.ClassName
 
     def switch_to_home(self):
-        """从编辑页返回首页"""
+        """从编辑页返回首页。
+
+        2026-10-25 实测（剪映 5.9）：编辑页右上角"关闭"按钮（TitleBarButton foundIndex=3）
+        = 退出编辑页回首页——点击后窗口先 GONE、约 1s 内重建为 HomePage，进程保留不杀。
+        优选点关闭；失败（按钮不存在/超时未回首页）则重启剪映兜底。
+        """
         dprint("正在切换回首页...")
         if self.is_home_page():
             dprint("已在首页.")
             return
 
-        # 查找左上角关闭/返回按钮
-        # 策略：找 TitleBarButton 组中的第4个 (Index 3)，或者是特定的 Description
-        # 在 pyJianYingDraft 中是 ClassName="TitleBarButton", foundIndex=3
         close_btn = self.window.GroupControl(searchDepth=1, ClassName="TitleBarButton", foundIndex=3)
         if close_btn.Exists(1):
             close_btn.Click(simulateMove=False)
+            # 点击后窗口先消失再重建为首页，轮询等重建完成（最多 30s）
+            for _ in range(15):
+                time.sleep(2)
+                try:
+                    w = uia.WindowControl(searchDepth=1, SubName="剪映")
+                    if w.Exists(1) and "HomePage" in (w.ClassName or ""):
+                        self.connect()
+                        if self.is_home_page():
+                            dprint("✅ 已关闭编辑页回到首页")
+                            return
+                except Exception:
+                    pass
+            dprint("⚠️ 关闭编辑页后 30s 未回首页，转重启兜底...")
         else:
-            # 备选：按 ESC 尝试，或找 Name="关闭"
-            self.window.SendKeys('{Esc}')
-        
-        time.sleep(2)
-        self.connect() # 重新绑定
+            dprint("⚠️ 未找到关闭按钮，转重启兜底...")
+
+        _restart_jianying_to_home(self)
+        self.connect()  # 重启后窗口句柄已变，必须重新绑定
         if not self.is_home_page():
-            raise Exception("无法返回首页，请手动检查界面状态。")
+            raise Exception("重启后仍未回到首页，请手动检查剪映状态。")
 
     def open_draft(self, draft_name):
         """在首页查找并打开草稿"""
@@ -499,6 +567,18 @@ class Exporter:
                     raise Exception(f"导出卡死：产物体积 180s 无增长（{last_size/1048576:.1f}MB）: {real_export_file}")
             time.sleep(2)
 
+            # 进度可见性：每 30s 写进度文件（output_path.progress.json），每 5 分钟 toast 一次
+            now = time.time()
+            if now - _last_progress_write[0] >= 30:
+                _last_progress_write[0] = now
+                _write_progress(output_path, real_export_file, expected_duration,
+                                start_time, done=False)
+            if now - _last_progress_toast[0] >= 300:
+                _last_progress_toast[0] = now
+                pct = _estimate_percent(real_export_file, expected_duration)
+                _toast_safe("📤 导出进行中",
+                            f"{draft_name}  {pct}" if pct else f"{draft_name}（体积估算不可用）")
+
         if not completed:
             raise Exception("导出超时或未检测到完成状态。")
         time.sleep(2)  # 等剪映收尾写盘、释放文件句柄
@@ -551,6 +631,9 @@ class Exporter:
             raise Exception(f"未找到导出成品（UI路径={real_export_file}，扫描={output_dir}）")
 
         dprint(f"找到导出原始文件: {found_file}")
+        _write_progress(output_path, real_export_file, expected_duration,
+                        start_time, done=True, final_file=found_file)
+        _toast_safe("📤 导出成功", f"{draft_name}（{os.path.getsize(found_file)/1073741824:.2f}GB）")
 
         # 8. 校验：可读 + 有音轨 + 时长与草稿一致
         dur = _ffprobe_duration(found_file)
@@ -590,7 +673,84 @@ class Exporter:
         return True
 
 
-def run(draft_name, output_path, move_output=False, expected_duration=None):
+# 移植自老脚本 auto_exporter.py（2026-10-25）
+_UI_RETRY_KEYWORDS = ("剪映窗口未找到", "导出按钮", "编辑窗口", "草稿", "未找到", "卡死", "超时")
+_EST_BYTES_PER_SEC = 1.05 * 1024 * 1024  # 1080P 导出码率经验估值（字节/秒）
+
+
+def _check_disk_space(output_path, expected_duration):
+    """磁盘余量预检：目标盘剩余不足预估成品 1.2 倍时直接拒绝启动（不占用重试）。"""
+    if not expected_duration or expected_duration <= 0:
+        return
+    est_bytes = expected_duration * _EST_BYTES_PER_SEC * 1.2
+    drive = os.path.splitdrive(os.path.abspath(output_path))[0] + "\\"
+    free = shutil.disk_usage(drive).free
+    if free < est_bytes:
+        raise Exception(
+            f"磁盘空间不足: {drive} 剩余 {free / 2**30:.1f}GB，预估需 {est_bytes / 2**30:.1f}GB"
+        )
+    dprint(f"磁盘预检通过: {drive} 剩余 {free / 2**30:.1f}GB，预估需 {est_bytes / 2**30:.1f}GB")
+
+
+def _salvage_existing_output(draft_name, output_path, expected_duration, min_mtime=None):
+    """导出报错后的成品抢救：剪映可能在报错前已写出成品（含同名文件夹形态）。
+    在目标目录与剪映默认导出目录中搜索，校验（时长+音轨）通过则归位为最终文件并视为成功。"""
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    search_dirs = [out_dir, r"D:\油管打猎\L"]
+    for search_dir in search_dirs:
+        cand = _find_export_in_dir(search_dir, draft_name, min_mtime=min_mtime)
+        if not cand:
+            continue
+        # 校验：时长（提供时）+ 音轨
+        if expected_duration:
+            dur = _ffprobe_duration(cand)
+            if dur is None or abs(dur - expected_duration) > 2:
+                continue
+        if not _ffprobe_has_audio(cand):
+            continue
+        try:
+            stem = os.path.splitext(os.path.basename(output_path))[0]
+            if os.path.abspath(cand) != os.path.abspath(output_path):
+                shutil.move(cand, output_path)
+            cover_src = os.path.join(
+                os.path.dirname(output_path) if os.path.dirname(cand) == out_dir else os.path.dirname(cand),
+                draft_name + "-封面.jpg")
+            if os.path.isfile(cover_src):
+                shutil.move(cover_src, os.path.join(out_dir, stem + "-封面.jpg"))
+            leftover = os.path.dirname(cand)
+            if leftover != out_dir and os.path.isdir(leftover) and not os.listdir(leftover):
+                os.rmdir(leftover)
+        except OSError:
+            continue
+        dprint(f"✅ 抢救到已完成成品: {cand}（校验通过）")
+        return True
+    return False
+
+
+def _restart_jianying_to_home(exporter):
+    """导出成功后重启剪映回首页（兜底手段，优选是 switch_to_home 点关闭按钮）。
+
+    仅在关闭按钮失效时使用：导出已完成落盘或导出任务未开始，杀进程安全。
+    """
+    dprint("重启剪映以回到首页...")
+    jy_path = exporter._find_jianying_path()
+    subprocess.run(["taskkill", "/F", "/IM", "JianyingPro.exe"], capture_output=True)
+    time.sleep(2)
+    subprocess.Popen([jy_path])
+    for _ in range(30):  # 最多等 60s 首页出现
+        time.sleep(2)
+        try:
+            win = uia.WindowControl(searchDepth=1, SubName="剪映")
+            if win.Exists(1) and "HomePage" in (win.ClassName or ""):
+                dprint("✅ 剪映已重启并回到首页")
+                return
+        except Exception:
+            pass
+    dprint("⚠️ 剪映已重启，但未检测到首页（可能仍在启动中，不影响导出结果）")
+
+
+def run(draft_name, output_path, move_output=False, expected_duration=None,
+        keep_open=False):
     dprint(f"任务: 导出【{draft_name}】 -> {output_path}（搬运={'开' if move_output else '关'}）")
     exporter = Exporter()
 
@@ -603,10 +763,31 @@ def run(draft_name, output_path, move_output=False, expected_duration=None):
     # 2. 打开草稿
     exporter.open_draft(draft_name)
 
+    # 2.5 磁盘预检（移植自老脚本）：目标盘余量不足预估成品 1.2 倍时直接拒绝启动
+    _check_disk_space(output_path, expected_duration)
+
     # 3. 导出（剪映导出到它自己记住的路径，脚本负责定位与校验；
     #    move_output=True 时再把成品+封面搬到 output_path）
-    exporter.export(output_path, draft_name,
-                    expected_duration=expected_duration, move_output=move_output)
+    export_started = time.time()
+    try:
+        exporter.export(output_path, draft_name,
+                        expected_duration=expected_duration, move_output=move_output)
+    except Exception as e:
+        # 异常抢救（移植自老脚本）：剪映可能在报错前已写出完整成品，校验通过则视为成功
+        dprint(f"⚠️ 导出流程异常: {e}，尝试抢救成品...")
+        if _salvage_existing_output(draft_name, output_path, expected_duration,
+                                    min_mtime=export_started - 5):
+            dprint("✅ 成品已抢救归位，本次导出视为成功")
+        else:
+            raise
+
+    # 4. 收尾：回首页（优选关闭编辑页，失败自动重启兜底）。导出成功后界面停在编辑页/导出视图，
+    #    看起来像"卡死在导出界面"；失败不影响导出结果（成品已落盘校验）。
+    if not keep_open:
+        try:
+            exporter.switch_to_home()
+        except Exception as e:
+            dprint(f"⚠️ 导出后回首页失败（不影响导出结果）: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="剪映自动化导出工具")
@@ -616,17 +797,36 @@ if __name__ == "__main__":
                         help="导出后把成品+封面搬运到目标路径（默认关闭，保留剪映原生目录结构）")
     parser.add_argument("--expect-duration", type=float, default=None, metavar="秒",
                         help="草稿预期时长（秒），提供时校验成品时长误差<2s，不符则判失败")
+    parser.add_argument("--keep-open", action="store_true",
+                        help="导出成功后保持剪映当前页面（默认重启剪映回首页）")
+    parser.add_argument("--retries", type=int, default=2,
+                        help="UI 类失败重试次数（默认 2，即共 3 次尝试；非 UI 错误不重试）")
 
     args = parser.parse_args()
 
-    try:
-        run(args.draft_name, args.output_path,
-            move_output=args.move, expected_duration=args.expect_duration)
-    except Exception as e:
-        dprint(f"❌ 错误: {str(e)}")
-        dprint("-" * 40)
-        dprint("💡 建议：如果脚本无法定位窗口或草稿，请尝试【手动重启剪映程序】后再运行。")
-        dprint("-" * 40)
-        dprint(traceback.format_exc())
-        input("按回车键退出...")
-        sys.exit(1)
+    # 重试循环（移植自老脚本）：UI 类失败 → 回首页（内含关闭按钮/重启兜底）→ 重试
+    attempts = 1 + max(0, args.retries)
+    for attempt in range(1, attempts + 1):
+        try:
+            run(args.draft_name, args.output_path,
+                move_output=args.move, expected_duration=args.expect_duration,
+                keep_open=args.keep_open)
+            sys.exit(0)
+        except Exception as e:
+            reason = str(e)
+            ui_fail = any(k in reason for k in _UI_RETRY_KEYWORDS)
+            if not ui_fail or attempt >= attempts:
+                dprint(f"❌ 错误: {reason}")
+                dprint("-" * 40)
+                dprint("💡 建议：如果脚本无法定位窗口或草稿，请尝试【手动重启剪映程序】后再运行。")
+                dprint("-" * 40)
+                dprint(traceback.format_exc())
+                if sys.stdin.isatty():
+                    input("按回车键退出...")
+                sys.exit(1)
+            dprint(f"⚠️ 导出 UI 失败（{reason}），回首页后重试（{attempt}/{attempts - 1}）...")
+            try:
+                Exporter().switch_to_home()  # 新实例重绑窗口；内部失败自动重启剪映兜底
+            except Exception as e2:
+                dprint(f"⚠️ 回首页恢复失败（仍将继续重试）: {e2}")
+            time.sleep(5)

@@ -251,11 +251,16 @@ def audit(draft):
     }
 
 
-def has_blocking(rep):
+def blocking_keys(rep):
+    """返回实际非空的阻断项类别列表（如 ["missing"]）。"""
     def _bad(v):
         return v > 0 if isinstance(v, int) else bool(v)
 
-    return any(_bad(rep["issues"][k]) for k in BLOCKING_KEYS)
+    return [k for k in BLOCKING_KEYS if _bad(rep["issues"][k])]
+
+
+def has_blocking(rep):
+    return bool(blocking_keys(rep))
 
 
 def brief(rep):

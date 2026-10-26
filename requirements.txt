@@ -17,6 +17,8 @@ faster-whisper==1.2.1
 funasr-onnx==0.4.3
 videocaptioner==1.4.2
 audio-separator==0.47.1
+pyloudnorm==0.2.0      # ITU-R BS.1770-4 LUFS 响度计量（环境声泄漏检测）
+silero-vad==6.2.3      # 语音活动检测（VAD，模型文件随包自带；备份在 D:\AI_Deps\models\silero-vad\）
 
 # torch/torchaudio 必须装 CUDA 版（demucs GPU 加速，42x 实时速率）：
 #   pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu126

@@ -22,6 +22,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -38,7 +39,7 @@ from utils.notifier import toast  # noqa: E402
 STATE_PATH = os.path.join(_HERE, "_series_queue_state.json")
 BATCH_RUNNER = os.path.join(_HERE, "batch_runner.py")
 AUTO_EXPORTER = os.path.join(
-    _ROOT, ".trae", "skills", "jianying-editor", "scripts", "auto_exporter.py"
+    _ROOT, ".trae", "skills", "jianying-editor", "examples", "robust_auto_export.py"
 )
 JY_DRAFT_ROOT = os.path.join(
     os.environ.get("LOCALAPPDATA", ""), "JianyingPro", "User Data", "Projects", "com.lveditor.draft"
@@ -89,12 +90,33 @@ def _output_exists(draft_name: str) -> bool:
     return os.path.isfile(out) and os.path.getsize(out) > 1 * 1024 * 1024
 
 
-def _run_pipeline(series_dir: str, slug: str) -> bool:
+def _parse_target(raw: str) -> tuple[str, dict]:
+    """targets 元素支持 KV 覆盖语法：路径:cut=52（供 agent 一部剧一个参数串传参）。
+    返回 (剧集目录, 覆盖参数 dict)。"""
+    parts = raw.split(":")
+    if len(parts) >= 3 and re.fullmatch(r"[A-Za-z]", parts[0]):
+        path = ":".join(parts[:2])
+        kvs = parts[2:]
+    else:
+        path, kvs = raw, []
+    overrides = {}
+    for kv in kvs:
+        m = re.fullmatch(r"(cut)=(.+)", kv.strip())
+        if m:
+            overrides[m.group(1)] = float(m.group(2))
+    return path, overrides
+
+
+def _run_pipeline(series_dir: str, slug: str, overrides: dict | None = None) -> bool:
     cover = os.path.join(series_dir, "封面.png")
     cmd = [sys.executable, "-u", BATCH_RUNNER, series_dir,
-           "--workdir", os.path.join("pipeline", f"_work_{slug}"), "--fresh"]
+           "--workdir", os.path.join("pipeline", f"_work_{slug}"), "--fresh",
+           "--no-export"]  # 导出由 series_runner 统一编排，batch_runner 不自动导出
     if os.path.isfile(cover):
         cmd += ["--cover-image", cover]
+    overrides = overrides or {}
+    if overrides.get("cut"):
+        cmd += ["--cut", str(overrides["cut"])]
     log_path = os.path.join(_HERE, f"_stream_{slug}.log")
     err_path = os.path.join(_HERE, f"_stream_{slug}.err.log")
     with open(log_path, "ab") as out, open(err_path, "ab") as err:
@@ -103,7 +125,9 @@ def _run_pipeline(series_dir: str, slug: str) -> bool:
 
 
 def _run_export(draft_name: str, timeout: float) -> bool:
-    cmd = [sys.executable, "-u", AUTO_EXPORTER, draft_name, "--timeout", str(timeout)]
+    """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录。"""
+    out_mp4 = os.path.join(DEFAULT_OUTPUT_DIR, f"{draft_name}.mp4")
+    cmd = [sys.executable, "-u", AUTO_EXPORTER, draft_name, out_mp4, "--move"]
     proc = subprocess.run(cmd, cwd=_ROOT)
     return proc.returncode == 0
 
@@ -136,12 +160,29 @@ def main() -> int:
             ap.error("必须提供剧集目录/草稿名，或使用 --all-stream")
         targets = [t.rstrip("\\/") for t in args.targets]
 
+    # 解析 KV 覆盖语法（路径:cut=52），draft 名与 --all-stream 结果不做 KV 解析
+    parsed = []  # [(target, overrides)]
+    for t in targets:
+        if os.path.isdir(t):
+            # 真实存在的剧集目录（绝对路径），走 KV 覆盖解析
+            path, ov = _parse_target(t)
+            parsed.append((path, ov))
+        elif os.path.isdir(os.path.join(JY_DRAFT_ROOT, t)) or args.all_stream:
+            parsed.append((t, {}))
+        else:
+            path, ov = _parse_target(t)
+            parsed.append((path, ov))
+    overrides_of = {t: ov for t, ov in parsed}
+    targets = [t for t, _ in parsed]
+
     reset = args.reset if args.reset is not None else _MODE_DEFAULT_RESET[args.mode]
     state = _load_state()
     failed = []
 
     for i, target in enumerate(targets):
-        is_draft = os.path.isdir(os.path.join(JY_DRAFT_ROOT, target))
+        # 输入本身是磁盘上的真实目录时视为剧集目录，而非草稿名
+        # （os.path.join 遇到绝对路径会丢弃 JY_DRAFT_ROOT，需先排除）
+        is_draft = not os.path.isdir(target) and os.path.isdir(os.path.join(JY_DRAFT_ROOT, target))
         name = os.path.basename(target)
         st = _state_of(state, target)
 
@@ -163,7 +204,7 @@ def main() -> int:
                 started = time.time()
                 st.update({"status": "pipelining", "started": started})
                 _save_state(state)
-                ok = _run_pipeline(target, _slug(name))
+                ok = _run_pipeline(target, _slug(name), overrides_of.get(target))
                 draft = _find_draft(name, started) if ok else None
                 if not draft:
                     st["status"] = "pipeline_failed"
