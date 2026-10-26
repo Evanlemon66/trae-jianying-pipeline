@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import json
+import time
 import shutil
 import subprocess
 import urllib.request
@@ -95,6 +96,66 @@ def load_config():
 
 def llm_configured():
     return any(p.get("api_key") for p in load_config()["providers"])
+
+
+# ────────────────────────── Ollama 可用性探针 ──────────────────────────
+# 背景：demucs 等本地任务常抢占显存，Ollama 生成层会产出空/乱码（软失败），
+# 白烧一轮 600s 超时。翻译前先用轻量请求确认服务存活、模型已拉取、
+# 且能真实生成非空内容，任一不满足则直接跳过该层并记录原因。
+
+_OLLAMA_PROBE = {"ts": 0.0, "ok": False, "why": "未探测"}
+
+
+def ollama_available(host=None, model=None, ttl=300):
+    """轻量探测本地 Ollama 可用性，结果按 ttl 秒缓存（避免每集重复探测）。
+    返回 (ok, why)。"""
+    cfg = (load_config().get("ollama") or {})
+    host = (host or cfg.get("host") or "http://127.0.0.1:11434").rstrip("/")
+    model = model or cfg.get("model") or "qwen3:8b"
+
+    now = time.time()
+    if now - _OLLAMA_PROBE["ts"] < ttl:
+        return _OLLAMA_PROBE["ok"], _OLLAMA_PROBE["why"]
+    ok, why = _probe_ollama(host, model)
+    _OLLAMA_PROBE.update({"ts": now, "ok": ok, "why": why})
+    if not ok:
+        print(f"  [ollama] 探针不可用: {why}（{ttl}s 内跳过本层）")
+    return ok, why
+
+
+def _probe_ollama(host, model):
+    """两级探测：①服务+模型列表 ②真实生成非空内容。返回 (ok, why)。"""
+    try:
+        with urllib.request.urlopen(host + "/api/tags", timeout=8) as resp:
+            tags = json.loads(resp.read().decode("utf-8"))
+        names = {m.get("name") for m in tags.get("models", [])}
+        if model not in names and f"{model}:latest" not in names:
+            return False, f"模型未拉取: {model}"
+    except Exception as e:
+        return False, f"服务不可达: {str(e)[:80]}"
+
+    payload = {
+        "model": model,
+        "prompt": "Reply with the single word: OK",
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0, "num_predict": 8},
+    }
+    req = urllib.request.Request(
+        host + "/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return False, f"生成探测失败: {str(e)[:80]}"
+    if data.get("error"):
+        return False, f"生成探测错误: {str(data['error'])[:80]}"
+    if not (data.get("response") or "").strip():
+        return False, "生成探测返回空（疑显存被抢占）"
+    return True, "ok"
 
 
 # ────────────────────────── SRT 解析/生成 ──────────────────────────
@@ -280,6 +341,39 @@ def _rewrite_prompt(texts, idxs):
     )
 
 
+def _cjk_to_pinyin(text):
+    """把文本中残留的 CJK 连续片段本地转拼音（空格分隔、首字母大写）。
+    LLM 回译偶发保留个别汉字（如地名"靠山屯"→"Kaoshan屯"）时的确定性兜底，
+    保证返回值零中文。缺 pypinyin 时返回 None（交上层原有兜底）。"""
+    try:
+        from pypinyin import lazy_pinyin
+    except ImportError:
+        return None
+
+    def _rep(m):
+        return " " + " ".join(w.capitalize() for w in lazy_pinyin(m.group(0))) + " "
+
+    out = re.sub(r"[一-鿿]+", _rep, text)
+    out = re.sub(r"\s+", " ", out).strip()
+    out = re.sub(r"\s+([.,!?;:])", r"\1", out)  # 收紧标点前的空格（"Tun ." → "Tun."）
+    return out if out and not has_cjk(out) else None
+
+
+def _pinyin_fallback(out):
+    """回译结果列表逐行兜底：仍含中文的行本地转拼音，保证零中文。"""
+    if not out:
+        return out
+    fixed = []
+    for t in out:
+        if t and has_cjk(t):
+            py = _cjk_to_pinyin(t)
+            if py:
+                print(f"  [pinyin兜底] {t[:40]} → {py[:60]}")
+                t = py
+        fixed.append(t)
+    return fixed
+
+
 def _apply_rewrites(texts, idxs, out):
     """把回译结果并回原列表（仍含中文的保留原文，交给上层兜底）。"""
     if not out:
@@ -398,7 +492,7 @@ def _rewrite_cjk_openai(provider, texts, idxs, timeout=90):
     except Exception as e:
         print(f"  [llm:{provider['name']}] 回译失败: {str(e)[:100]}")
         return []
-    return _parse_numbered(content, len(idxs))
+    return _pinyin_fallback(_parse_numbered(content, len(idxs)))
 
 
 def translate_texts_via_vc(cn_texts, workdir=None, tag="batch"):
@@ -430,6 +524,11 @@ def translate_texts_via_ollama(cn_texts, timeout=600):
         return None
     host = (cfg.get("host") or "http://127.0.0.1:11434").rstrip("/")
     model = cfg.get("model") or "qwen3:8b"
+
+    ok, why = ollama_available(host, model)
+    if not ok:
+        print(f"  [ollama] 探针不可用，跳过本层: {why}")
+        return None
 
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(cn_texts))
     prompt = (
@@ -483,6 +582,10 @@ def translate_texts_via_ollama(cn_texts, timeout=600):
 
 def _rewrite_cjk_ollama(host, model, texts, idxs, timeout=600):
     """Ollama 定向回译：修掉残留中文（强制音译人名）。"""
+    ok, why = ollama_available(host, model)
+    if not ok:
+        print(f"  [ollama] 探针不可用，跳过回译: {why}")
+        return []
     payload = {
         "model": model,
         "prompt": _rewrite_prompt(texts, idxs),
@@ -504,7 +607,7 @@ def _rewrite_cjk_ollama(host, model, texts, idxs, timeout=600):
     if data.get("error"):
         print(f"  [ollama] 回译错误: {data['error']}")
         return []
-    return _parse_numbered(data.get("response") or "", len(idxs))
+    return _pinyin_fallback(_parse_numbered(data.get("response") or "", len(idxs)))
 
 
 # ────────────────────────── CLI 自检 ──────────────────────────

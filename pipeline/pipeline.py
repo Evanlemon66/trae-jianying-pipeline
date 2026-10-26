@@ -2184,6 +2184,48 @@ def translate_texts(cn_texts, workdir):
     return en_texts
 
 
+_MIN_CUT_FRAG_US = 250_000  # 被裁点切断的残片不足 0.25s 只剩闪字，丢弃
+
+
+def _repair_translation_round(gaps, en_all, workdir):
+    """翻译修复轮：对留空集重跑全链一次，成功补入 en_all，返回仍失败的集列表。"""
+    still_gap = []
+    for g in gaps:
+        with timed_step(f"翻译修复/ep{g['idx']}"):
+            en_texts = translate_texts([s["text"] for s in g["cn_subs"]], workdir)
+        if not en_texts:
+            print(f"  ✗ {g['tag']}修复仍失败，保留空位")
+            still_gap.append(g)
+            continue
+        added = 0
+        for s, t in zip(g["cn_subs"], en_texts):
+            if not str(t).strip():
+                continue
+            rel_start = s["start_us"] - g["src_off"]
+            rel_end = s["end_us"] - g["src_off"]
+            if rel_end <= 0 or (rel_start < 0 and rel_end < _MIN_CUT_FRAG_US):
+                continue
+            en_all.append({
+                "start_us": max(0, rel_start) + g["ep_start_us"],
+                "end_us": rel_end + g["ep_start_us"],
+                "text": str(t),
+                "_refined": s.get("_refined", False),
+            })
+            added += 1
+        print(f"  ✅ {g['tag']}修复成功，补入 {added} 条英文字幕")
+    return still_gap
+
+
+def _toast_safe(title, msg, icon="info"):
+    """桌面通知（可选依赖，任何失败都静默）。"""
+    try:
+        sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
+        from utils.notifier import toast
+        toast(title, msg, icon=icon)
+    except Exception:
+        pass
+
+
 def run_demucs(input_path, output_dir, model=None, fallback=None):
     """人声分离。优先 fine-tuned 模型（分离更干净），失败时回退标准模型。
 
@@ -2471,6 +2513,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                  do_demucs=True, do_presets=True, do_ffmpeg=True,
                  do_whisper=True, do_translate=True, do_hide_cn=True,
                  do_subtitle_check=True,
+                 do_vad_gate=True, vad_min_speech_ratio=None,
                  presets=None,
                  cover_image=None, cover_extract_from_video=None, cover_extract_time_s=3.0,
                  vocal_mode="audio_track"):
@@ -2498,6 +2541,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
     print(f"  🛑 Skip AI    : {skip_local_ai}")
     print(f"  📤 Export     : {do_export}")
     print(f"  📁 Workdir    : {workdir}")
+    print(f"  🎚️ VAD Gate   : {'on' if do_vad_gate else 'off'}"
+          f"{' (需 demucs 干声)' if do_vad_gate else ''}")
     print(f"{'='*60}\n")
 
     if not draft_name_or_path:
@@ -2559,6 +2604,9 @@ def run_pipeline(draft_name_or_path, video_paths=None,
     print()
 
     # ━━━━ Step 1: 人声分离 ━━━━
+    # 收集待门控的干声；门控延后到字幕写完（见 Step 10.2），
+    # 因为字幕尾裁的静音检测必须在未门控的干声上做。
+    vocal_paths = []
     if do_demucs:
         print("━ [1] 人声分离 (demucs) ━━━━━━━━━━━━━━━━━━━━━━━━━━")
         if skip_local_ai:
@@ -2598,6 +2646,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                         print("  ✗ demucs 输出缺失")
                         continue
                     if vocal_mode == "audio_track":
+                        vocal_paths.append((i, vocal))
                         # A 方案：按集偏移；所有集复用同一条 vocals 轨 / no_vocals 轨
                         offset = ep["segment"]["target_timerange"]["start"]
                         _, vocal_track_id, _ = attach_vocal_as_audio_track(
@@ -2637,6 +2686,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                     if vocal:
                         try:
                             if vocal_mode == "audio_track":
+                                vocal_paths.append((1, vocal))
                                 # A 方案：视频静音 + 独立 vocals 音轨；no_vocals 静音对照
                                 attach_vocal_as_audio_track(draft, vocal)
                                 if bgm:
@@ -2828,34 +2878,19 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                         "_refined": s.get("_refined", False),
                     })
 
-        # 翻译空位修复轮：主循环结束后对留空集立即再跑一轮全链
-        # （此时距首次失败已过去若干集，GLM 限流多半已恢复）
+        # 翻译空位修复轮：主循环结束后对留空集重跑全链，最多 3 轮、轮间退避
+        # 120s/300s —— GLM 夜间抖动常持续数分钟，单轮立即重试大概率仍撞墙；
+        # Ollama 层有探针把关，不可用时自动跳过，不会白烧 600s 超时
         if translation_gaps and do_translate and not skip_local_ai:
-            print(f"━ 翻译修复轮：{len(translation_gaps)} 集待补 ━━━━━━━━━━━━━━━━━")
-            still_gap = []
-            for g in translation_gaps:
-                with timed_step(f"翻译修复/ep{g['idx']}"):
-                    en_texts = translate_texts([s["text"] for s in g["cn_subs"]], workdir)
-                if not en_texts:
-                    print(f"  ✗ {g['tag']}修复仍失败，保留空位")
-                    still_gap.append(g)
-                    continue
-                added = 0
-                for s, t in zip(g["cn_subs"], en_texts):
-                    if not str(t).strip():
-                        continue
-                    rel_start = s["start_us"] - g["src_off"]
-                    rel_end = s["end_us"] - g["src_off"]
-                    if rel_end <= 0 or (rel_start < 0 and rel_end < MIN_CUT_FRAG_US):
-                        continue
-                    en_all.append({
-                        "start_us": max(0, rel_start) + g["ep_start_us"],
-                        "end_us": rel_end + g["ep_start_us"],
-                        "text": str(t),
-                        "_refined": s.get("_refined", False),
-                    })
-                    added += 1
-                print(f"  ✅ {g['tag']}修复成功，补入 {added} 条英文字幕")
+            still_gap = list(translation_gaps)
+            for rnd, wait in enumerate((0, 120, 300), 1):
+                if not still_gap:
+                    break
+                if wait:
+                    print(f"  ⏳ {len(still_gap)} 集仍未补翻，{wait}s 后进入第 {rnd} 轮...")
+                    time.sleep(wait)
+                print(f"━ 翻译修复轮(第{rnd}轮)：{len(still_gap)} 集待补 ━━━━━━━━━━━━━━━━━")
+                still_gap = _repair_translation_round(still_gap, en_all, workdir)
             translation_gaps = still_gap
             if still_gap:
                 gaps_file = os.path.join(workdir, "_translation_gaps.json")
@@ -2887,6 +2922,34 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         print(f"  🙈 隐藏了 {hidden} 个 text material")
         print()
 
+    # ━━━━ Step 10.2: VAD 门控（人声干声非语音段压制 -40 dB）━━━━
+    # 放在字幕写完之后：字幕尾裁的静音检测已在未门控干声上完成（Step 3），
+    # 门控只影响最终播放/导出的音频，不改变字幕时间轴。
+    if do_vad_gate and vocal_paths:
+        _min_ratio = vad_min_speech_ratio
+        if _min_ratio is None:
+            _min_ratio = float((_ENV_PROFILE.get("vad_gate") or {})
+                               .get("min_speech_ratio", 0.2))
+        print("━ [10.2] VAD 门控（非语音段 -40 dB）━━━━━━━━━━━━━━━━━")
+        try:
+            import audio_gate as _ag
+            with timed_step("VAD门控"):
+                _grep = _ag.gate_files([p for _, p in vocal_paths],
+                                       min_speech_ratio=_min_ratio)
+            _ag.write_report(workdir, _grep)
+            print(f"  ✅ 门控 {_grep['gated']}/{_grep['total']} 集"
+                  f"（低语音跳过 {_grep['skipped_low_speech']}，异常 {_grep['err']}），"
+                  f"累计 {_grep['total_reduction_db']} dB，耗时 {_grep['elapsed_s']}s")
+            print(f"  📄 报告: {os.path.join(workdir, _ag.REPORT_NAME)}")
+        except FileNotFoundError as e:
+            print(f"  ⚠️ 跳过 VAD 门控: {e}")
+        except Exception as e:
+            print(f"  ⚠️ VAD 门控失败（保留原干声）: {type(e).__name__}: {e}")
+        print()
+    elif do_vad_gate and do_demucs and not skip_local_ai and vocal_mode != "audio_track":
+        print("  ⚠️ vocal_mode=native_prefab：干声已转为剪映内部格式，跳过 VAD 门控")
+        print()
+
     # ━━━━ 保存 ━━━━
     main_dur = get_main_video_duration(draft)
     if main_dur > 0:
@@ -2896,6 +2959,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             print(f"📏 duration 更新: {old_dur/1_000_000:.2f}s → {main_dur/1_000_000:.2f}s")
 
     # ━━━━ Step 10.5: 字幕/音频终检（发布前 gate）━━━━
+    _missing_eps_pending = []  # 残缺集软阻断：非空时发布后自动补翻+复验门控导出
     if do_subtitle_check:
         print("━ [10.5] 字幕/音频终检（中文残留 / 超长 / 结构 / 音频素材）━━")
         import verify_draft as _vd
@@ -2904,9 +2968,20 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         _vd.write_report(workdir, os.path.basename(draft_name_or_path), _rep, _hist)
         if _vd.has_blocking(_rep):
             print(_vd.format_report(_rep))
-            print("  ✗ 终检未通过，已阻断发布（草稿未保存、未导出）")
-            return None
-        print("  ✅ 终检通过")
+            _blk = _vd.blocking_keys(_rep)
+            if _blk == ["missing"]:
+                # 软阻断：唯一阻断项是「残缺集」（翻译全链失败留下的空位）时
+                # 照常保存发布草稿，发布后自动补翻复验，通过才导出（Step 10.8）
+                _missing_eps_pending = sorted({x["ep"] for x in _rep["issues"]["missing"]})
+                print(f"  ⚠️ 仅剩残缺集 {len(_missing_eps_pending)} 集 "
+                      f"(eps={_missing_eps_pending})，草稿照常保存发布，"
+                      f"随后自动补翻复验，通过才导出")
+            else:
+                print("  ✗ 终检未通过，已阻断发布（草稿未保存、未导出）")
+                raise RuntimeError(
+                    "字幕/音频终检未通过，发布已阻断（详见上方报告与 workdir 终检报告）")
+        else:
+            print("  ✅ 终检通过")
         print()
 
     # 封面必须在所有处理完成后、保存前写入——否则封面 mtime 早于草稿 update_time，
@@ -2943,26 +3018,73 @@ def run_pipeline(draft_name_or_path, video_paths=None,
     print(f"   Post-state:\n{summarize_draft(draft)}")
     print()
 
+    # ━━━━ Step 10.8: 残缺集自动补翻 + 复验（软阻断出口，通过才导出）━━━━
+    if _missing_eps_pending:
+        print("━ [10.8] 残缺集自动补翻 + 复验 ━━━━━━━━━━━━━━━━━━━━━━━━━")
+        _pub_root = os.path.dirname(draft_path)
+        _pub_name = os.path.basename(_pub_root)
+        if os.path.normcase(os.path.dirname(_pub_root)) != os.path.normcase(DRAFT_ROOT):
+            # 草稿不在剪映草稿目录（外部路径直改场景），repair_translation 按名加载不到
+            print(f"  ⚠️ 草稿不在剪映草稿目录（{_pub_root}），无法自动补翻，不导出")
+            _toast_safe("🎬 草稿待人工修复",
+                        f"{draft_name_or_path}: 残缺集 {len(_missing_eps_pending)} 集，"
+                        f"草稿已保存但未导出", icon="error")
+            raise RuntimeError(
+                "残缺集未修复且草稿不在剪映草稿目录，无法自动补翻：草稿已保存未导出")
+        _repair = os.path.join(_HERE, "repair_translation.py")
+        _eps_arg = ",".join(str(e) for e in _missing_eps_pending)
+        with timed_step("残缺集补翻"):
+            _rc = subprocess.call(
+                [sys.executable, "-u", _repair, _pub_name, "--eps", _eps_arg])
+        if _rc != 0:
+            print(f"  ✗ 自动补翻脚本退出码 {_rc}")
+        # 复验：repair 直接改的是已发布草稿文件，需从磁盘重读
+        import verify_draft as _vd2
+        try:
+            with open(draft_path, encoding="utf-8") as _f:
+                _re_draft = json.load(_f)
+            _rep2, _hist2 = _vd2.verify_and_fix(_re_draft, workdir, rounds=1)
+            _vd2.write_report(workdir, os.path.basename(draft_name_or_path),
+                              _rep2, _hist2)
+        except Exception as e:
+            print(f"  ⚠️ 复验异常（按未通过处理，不导出）: {type(e).__name__}: {e}")
+            _toast_safe("🎬 草稿待人工修复",
+                        f"{draft_name_or_path}: 补翻复验异常 {str(e)[:60]}", icon="error")
+            raise RuntimeError(f"残缺集补翻复验异常: {e}")
+        if _vd2.has_blocking(_rep2):
+            print(_vd2.format_report(_rep2))
+            print("  ✗ 自动补翻后仍未过终检，不导出（草稿已保存，可稍后手动 "
+                  "repair_translation.py 补翻）")
+            _toast_safe("🎬 草稿待人工修复",
+                        f"{draft_name_or_path}: 自动补翻后仍未过终检，草稿已保存未导出",
+                        icon="error")
+            raise RuntimeError(
+                "残缺集自动补翻后仍未通过终检：草稿已保存发布但未导出，"
+                "可稍后手动执行 repair_translation.py 补翻")
+        print("  ✅ 补翻复验通过，继续导出")
+        print()
+
     print()
 
     # ━━━━ Step 11: 导出 ━━━━
     if do_export:
-        print("━ [11] 导出 (上游 auto_exporter) ━━━━━━━━━━━━━━━━━━━━━━")
+        print("━ [11] 导出 (robust_auto_export) ━━━━━━━━━━━━━━━━━━━━━")
         try:
-            import re as _re
-            safe_draft_name = _re.sub(r'[\\/:*?"<>|]', '_', os.path.basename(dp_root or draft_name_or_path))
+            safe_draft_name = re.sub(r'[\\/:*?"<>|]', '_', os.path.basename(dp_root or draft_name_or_path))
             out_path = os.path.join(workdir, f"{safe_draft_name}_export.mp4")
-
-            from auto_exporter import auto_export
+            exporter = os.path.join(
+                os.path.dirname(_HERE), ".trae", "skills", "jianying-editor",
+                "examples", "robust_auto_export.py")
 
             print(f"  🎯 草稿名: {draft_name_or_path}")
             print(f"  📁 输出路径: {out_path}")
             with timed_step("导出"):
-                ok, result = auto_export(draft_name_or_path, out_path)
-            if ok:
+                rc = subprocess.call(
+                    [sys.executable, "-u", exporter, draft_name_or_path, out_path, "--move"])
+            if rc == 0:
                 print(f"  ✅ 导出完成!")
             else:
-                print(f"  ⚠️ 导出返回非零结果: {result}")
+                print(f"  ⚠️ 导出返回非零退出码: {rc}")
         except Exception as e:
             print(f"  ⚠️ 自动导出异常: {e}")
             import traceback
@@ -3090,6 +3212,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-hide-cn", action="store_true", help="不隐藏中文字幕")
     parser.add_argument("--skip-subtitle-check", action="store_true",
                         help="跳过发布前字幕终检（中文残留/超长/结构）")
+    parser.add_argument("--no-vad-gate", action="store_true",
+                        help="跳过 VAD 门控（默认开启：干声非语音段压 -40 dB）")
     args = parser.parse_args()
 
     if args.list_presets:
@@ -3133,6 +3257,7 @@ if __name__ == "__main__":
             skip_local_ai=args.skip_ai,
             do_export=not args.no_export,
             do_demucs=not args.no_demucs,
+            do_vad_gate=not args.no_vad_gate,
             do_presets=not args.no_presets,
             presets=parse_presets_arg(args.presets) if args.presets else None,
             do_ffmpeg=True,
