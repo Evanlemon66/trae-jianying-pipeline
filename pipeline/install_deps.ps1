@@ -355,21 +355,22 @@ if ($SkipOllama -or $OllamaModel -eq "none") {
             & $ollama.Source pull $OllamaModel
             if ($LASTEXITCODE -eq 0) { Ok "模型就绪: $OllamaModel" } else { Fail "模型拉取失败: $OllamaModel" }
         }
-        # 同步 vc_config.json 的 ollama.model（Python utf-8 读写，保留 api_key 等其它字段）
-        $vcCfg = Join-Path $PSScriptRoot "vc_config.json"
+        # 同步 presets.json 的 translate.ollama.model（Python utf-8 读写，保留 api_key 等其它字段）
+        $vcCfg = Join-Path $PSScriptRoot "presets.json"
         if (Test-Path $vcCfg) {
             @'
 import json, sys
 cfg_path, model = sys.argv[1], sys.argv[2]
 cfg = json.load(open(cfg_path, encoding="utf-8"))
-old = cfg.setdefault("ollama", {}).get("model")
-cfg["ollama"]["enabled"] = True
-cfg["ollama"]["model"] = model
+tr = cfg.setdefault("translate", {})
+old = tr.setdefault("ollama", {}).get("model")
+tr["ollama"]["enabled"] = True
+tr["ollama"]["model"] = model
 json.dump(cfg, open(cfg_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-print(f"  vc_config.json ollama.model: {old} -> {model}")
+print(f"  presets.json translate.ollama.model: {old} -> {model}")
 '@ | & $Py @PyPre - $vcCfg $OllamaModel
         } else {
-            Warn "vc_config.json 不存在（gitignore 文件），请参照仓库示例创建并填 GLM API key，ollama.model 设为 $OllamaModel"
+            Warn "presets.json 不存在（gitignore 文件），请参照 presets.example.json 创建并填 GLM API key，translate.ollama.model 设为 $OllamaModel"
         }
     }
 }
@@ -509,8 +510,8 @@ if ($badCount -gt 0) {
 }
 Write-Host ""
 Info "后续手工事项："
-Write-Host "  1. pipeline\vc_config.json 填入智谱 GLM-4-Flash API key（翻译主链路，免费）: https://open.bigmodel.cn/"
-Write-Host "  2. 确认 vc_config.json 的 ollama.model 与本机已拉取模型一致（当前选择: $OllamaModel）"
+Write-Host "  1. pipeline\presets.json 填入智谱 GLM-4-Flash API key（translate.providers，翻译主链路，免费）: https://open.bigmodel.cn/"
+Write-Host "  2. 确认 presets.json 的 translate.ollama.model 与本机已拉取模型一致（当前选择: $OllamaModel）"
 Write-Host "  3. 剪映 5.9 需位于 skill 约定路径；导出 UI 自动化使用 5.9 版 JianyingPro.exe"
 Write-Host ""
 Ok "Done!"

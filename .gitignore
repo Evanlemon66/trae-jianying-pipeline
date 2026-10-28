@@ -4,7 +4,7 @@ _*.py
 !__init__.py
 !.trae/skills/**/*.py
 
-# 个人配置（含个人预设名/密钥，不入库；参考 *.example.json）
+# 个人配置（含个人预设名/密钥/导出目录，不入库；参考 *.example.json）
 pipeline/presets.json
 
 # Python 缓存
@@ -41,8 +41,8 @@ audio_peak_results.json
 venv/
 .env
 
-# API 密钥配置（智谱等）
-pipeline/vc_config.json
+# 串流产物清单（本机运行态记录，不入库）
+pipeline/_stream_manifests/
 
 # IDE
 .vscode/

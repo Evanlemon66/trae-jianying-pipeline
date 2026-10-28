@@ -33,8 +33,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 _SCRIPTS = os.path.join(_ROOT, "scripts")
 sys.path.insert(0, _SCRIPTS)
+sys.path.insert(0, _HERE)
 
 from utils.notifier import toast  # noqa: E402
+from export_config import export_mp4_path, get_export_dir  # noqa: E402
 
 STATE_PATH = os.path.join(_HERE, "_series_queue_state.json")
 BATCH_RUNNER = os.path.join(_HERE, "batch_runner.py")
@@ -44,7 +46,6 @@ AUTO_EXPORTER = os.path.join(
 JY_DRAFT_ROOT = os.path.join(
     os.environ.get("LOCALAPPDATA", ""), "JianyingPro", "User Data", "Projects", "com.lveditor.draft"
 )
-DEFAULT_OUTPUT_DIR = r"D:\油管打猎\L"
 # 各模式部间默认间隔（秒）：generate 不碰剪映零等待；export 留 60s 回首页；full 120s
 _MODE_DEFAULT_RESET = {"full": 120, "generate": 0, "export": 60}
 
@@ -85,8 +86,8 @@ def _all_stream_drafts() -> list[str]:
 
 
 def _output_exists(draft_name: str) -> bool:
-    """成品已存在且 >1MB 视为已导出，跳过"""
-    out = os.path.join(DEFAULT_OUTPUT_DIR, f"{draft_name}.mp4")
+    """成品已存在且 >1MB 视为已导出，跳过（成品按剧名子目录归置）"""
+    out = export_mp4_path(draft_name)
     return os.path.isfile(out) and os.path.getsize(out) > 1 * 1024 * 1024
 
 
@@ -125,9 +126,11 @@ def _run_pipeline(series_dir: str, slug: str, overrides: dict | None = None) -> 
 
 
 def _run_export(draft_name: str, timeout: float) -> bool:
-    """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录。"""
-    out_mp4 = os.path.join(DEFAULT_OUTPUT_DIR, f"{draft_name}.mp4")
-    cmd = [sys.executable, "-u", AUTO_EXPORTER, draft_name, out_mp4, "--move"]
+    """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。"""
+    out_mp4 = export_mp4_path(draft_name)
+    os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
+    cmd = [sys.executable, "-u", AUTO_EXPORTER, draft_name, out_mp4, "--move",
+           "--fallback-dir", get_export_dir()]
     proc = subprocess.run(cmd, cwd=_ROOT)
     return proc.returncode == 0
 

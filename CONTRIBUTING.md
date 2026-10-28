@@ -24,7 +24,7 @@ powershell -File pipeline\install_deps.ps1 -DetectOnly
 
 ## 硬性规则
 
-- **禁止提交个人配置/密钥**：`pipeline/vc_config.json`、`pipeline/presets.json`（已 gitignore，CI 会做泄漏检查）
+- **禁止提交个人配置/密钥**：`pipeline/presets.json`（已 gitignore，CI 会做泄漏检查）
 - **禁止手搓剪映草稿 JSON**：草稿相关逻辑必须从模板复制生成（见使用指南「剪映草稿的坑」）
 - commit message 前缀约定：`feat:` / `fix:` / `docs:` / `refactor:` / `test:`
 - 改动依赖或安装逻辑时，同步更新 `使用指南.md` 对应章节

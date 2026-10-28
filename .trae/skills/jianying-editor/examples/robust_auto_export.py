@@ -10,6 +10,13 @@ import psutil
 import subprocess
 import winreg
 
+# 输出流统一 UTF-8：重定向到文件/GBK 控制台时，打印 emoji 不再抛 UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ========== 1. 环境与依赖修复 (打包关键) ==========
 def _init_frozen_env():
     """修复 PyInstaller 打包后的环境问题"""
@@ -641,8 +648,14 @@ class Exporter:
             raise Exception(f"成品无法读取（ffprobe 失败）: {found_file}")
         if not _ffprobe_has_audio(found_file):
             raise Exception(f"成品无音轨: {found_file}")
-        if expected_duration is not None and abs(dur - expected_duration) > 2.0:
-            raise Exception(f"成品时长 {dur:.1f}s 与草稿 {expected_duration:.1f}s 不符，疑似截断")
+        if expected_duration is not None:
+            # 截断判定只认「短」：成品比草稿短 >2s 才算截断；
+            # 偏长是编码器 GOP 对齐填充（常见 +2~5s），属正常成品
+            if dur < expected_duration - 2.0:
+                raise Exception(f"成品时长 {dur:.1f}s 短于草稿 {expected_duration:.1f}s，疑似截断")
+            if dur > expected_duration + 10.0:
+                raise Exception(f"成品时长 {dur:.1f}s 异常偏长（草稿 {expected_duration:.1f}s），"
+                                f"疑似草稿/导出内容不符")
 
         # 9. 搬运开关：默认保留剪映原生结构（同名文件夹内含 mp4+封面），开启后才搬到目标路径
         if move_output:
@@ -665,17 +678,34 @@ class Exporter:
                         and not os.listdir(src_dir)):
                     os.rmdir(src_dir)
             dprint(f"🎉 导出完成（已搬运）: {output_path} 时长 {dur:.1f}s 音轨=有")
+            _record_export_manifest(draft_name, output_path)
         else:
             src_dir = os.path.dirname(found_file)
             cover = os.path.join(src_dir, safe_name + "-封面.jpg")
             cover_note = f"，封面: {cover}" if os.path.isfile(cover) else ""
             dprint(f"🎉 导出完成（未搬运，保留剪映原生结构）: {found_file}{cover_note} 时长 {dur:.1f}s 音轨=有")
+            _record_export_manifest(draft_name, found_file)
         return True
 
 
 # 移植自老脚本 auto_exporter.py（2026-10-25）
 _UI_RETRY_KEYWORDS = ("剪映窗口未找到", "导出按钮", "编辑窗口", "草稿", "未找到", "卡死", "超时")
 _EST_BYTES_PER_SEC = 1.05 * 1024 * 1024  # 1080P 导出码率经验估值（字节/秒）
+
+
+def _record_export_manifest(draft_name, export_file):
+    """导出成功后把成品路径补进串流产物清单（失败不影响导出流程）。"""
+    try:
+        _pipeline_dir = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "..", "..", "..", "pipeline"))
+        if os.path.isdir(_pipeline_dir):
+            if _pipeline_dir not in sys.path:
+                sys.path.insert(0, _pipeline_dir)
+            import stream_manifest
+            stream_manifest.record(draft_name, export_file=export_file)
+    except Exception as _e:
+        dprint(f"[warn] 记录成品到串流清单失败: {_e}")
 
 
 def _check_disk_space(output_path, expected_duration):
@@ -692,12 +722,20 @@ def _check_disk_space(output_path, expected_duration):
     dprint(f"磁盘预检通过: {drive} 剩余 {free / 2**30:.1f}GB，预估需 {est_bytes / 2**30:.1f}GB")
 
 
-def _salvage_existing_output(draft_name, output_path, expected_duration, min_mtime=None):
+def _salvage_existing_output(draft_name, output_path, expected_duration, min_mtime=None, extra_dirs=None):
     """导出报错后的成品抢救：剪映可能在报错前已写出成品（含同名文件夹形态）。
-    在目标目录与剪映默认导出目录中搜索，校验（时长+音轨）通过则归位为最终文件并视为成功。"""
+    搜索范围：目标目录、目标目录的父目录（兼容「导出根目录/剧名子目录」与平铺两种布局）、
+    以及调用方通过 extra_dirs 指定的额外目录；校验（时长+音轨）通过则归位为最终文件并视为成功。"""
     out_dir = os.path.dirname(os.path.abspath(output_path))
-    search_dirs = [out_dir, r"D:\油管打猎\L"]
-    for search_dir in search_dirs:
+    search_dirs = [out_dir, os.path.dirname(out_dir)]
+    for d in (extra_dirs or []):
+        search_dirs.append(os.path.abspath(d))
+    seen, uniq_dirs = set(), []
+    for d in search_dirs:
+        if d not in seen:
+            seen.add(d)
+            uniq_dirs.append(d)
+    for search_dir in uniq_dirs:
         cand = _find_export_in_dir(search_dir, draft_name, min_mtime=min_mtime)
         if not cand:
             continue
@@ -749,8 +787,102 @@ def _restart_jianying_to_home(exporter):
     dprint("⚠️ 剪映已重启，但未检测到首页（可能仍在启动中，不影响导出结果）")
 
 
+def _find_draft_dir(draft_name):
+    """定位剪映草稿目录。"""
+    root = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                        "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+    candidate = os.path.join(root, draft_name)
+    if os.path.isdir(candidate):
+        return candidate
+    return None
+
+
+def _restore_streams_from_backup(draft_name):
+    """导出前检查草稿是否被剪映合并了串流 segments，有的话用 pipeline 备份恢复。
+
+    剪映 5.9 打开草稿时会自动把同轨首尾相连的 video segments 合并成 1 个大段
+    （"串流视频"优化），合并时丢失 crop 后的 source_timerange.duration，
+    导致音画不同步。pipeline 发布时会在草稿目录写一份 _pipeline_backup.json，
+    本函数在打开草稿前比对，如果发现 video/audio 轨段数骤降则恢复。
+    """
+    import json
+    draft_dir = _find_draft_dir(draft_name)
+    if not draft_dir:
+        return False
+    content_path = os.path.join(draft_dir, "draft_content.json")
+    backup_path = os.path.join(draft_dir, "_pipeline_backup.json")
+    if not os.path.exists(backup_path):
+        return False
+
+    try:
+        with open(content_path, "r", encoding="utf-8") as f:
+            cur = json.load(f)
+        with open(backup_path, "r", encoding="utf-8") as f:
+            bak = json.load(f)
+    except Exception as e:
+        dprint(f"⚠️ 读取草稿/备份失败: {e}")
+        return False
+
+    def _seg_counts(d):
+        cnts = {}
+        for t in d.get("tracks", []):
+            if t.get("type") in ("video", "audio"):
+                cnts[t["type"]] = cnts.get(t["type"], 0) + len(t.get("segments") or [])
+        return cnts
+
+    cur_cnt = _seg_counts(cur)
+    bak_cnt = _seg_counts(bak)
+    needs_restore = False
+    for k in bak_cnt:
+        if cur_cnt.get(k, 0) < bak_cnt[k] / 2:  # 骤降 >50% 认为被合并
+            needs_restore = True
+            break
+
+    if not needs_restore:
+        dprint(f"🛡️ 草稿轨道正常: 当前 {cur_cnt} vs 备份 {bak_cnt}，无需恢复")
+        return False
+
+    # 恢复 video + audio tracks（字幕轨/贴纸轨/材质等保持当前版本）
+    # 把当前 draft 里所有 video/audio tracks 整体替换成备份里的对应 tracks
+    restore_types = {"video", "audio"}
+    bak_tracks_by_type = {t.get("type", ""): [] for t in bak.get("tracks", [])
+                          if t.get("type") in restore_types}
+    for t in bak.get("tracks", []):
+        if t.get("type") in restore_types:
+            bak_tracks_by_type[t["type"]].append(t)
+
+    cur_tracks = cur.get("tracks", [])
+    new_tracks = []
+    restored = 0
+    bak_idx = {t: 0 for t in bak_tracks_by_type}
+    for t in cur_tracks:
+        ttype = t.get("type", "")
+        if ttype in restore_types and bak_tracks_by_type.get(ttype):
+            bi = bak_idx[ttype]
+            if bi < len(bak_tracks_by_type[ttype]):
+                cur_n = len(t.get("segments") or [])
+                bak_n = len(bak_tracks_by_type[ttype][bi].get("segments") or [])
+                if cur_n < bak_n / 2:
+                    new_tracks.append(bak_tracks_by_type[ttype][bi])
+                    restored += 1
+                else:
+                    new_tracks.append(t)
+                bak_idx[ttype] = bi + 1
+            else:
+                new_tracks.append(t)
+        else:
+            new_tracks.append(t)
+    cur["tracks"] = new_tracks
+
+    with open(content_path, "w", encoding="utf-8") as f:
+        json.dump(cur, f, ensure_ascii=False)
+    dprint(f"🛡️ 草稿轨道已恢复: {restored} 条轨 从备份还原，"
+           f"当前 video/audio segments: {_seg_counts(cur)}")
+    return True
+
+
 def run(draft_name, output_path, move_output=False, expected_duration=None,
-        keep_open=False):
+        keep_open=False, fallback_dir=None):
     dprint(f"任务: 导出【{draft_name}】 -> {output_path}（搬运={'开' if move_output else '关'}）")
     exporter = Exporter()
 
@@ -759,6 +891,13 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
         dprint("检测到在编辑页，将尝试先导出当前草稿（如果名字匹配）或切回首页")
         # 这里简单处理：切回首页重来，确保状态一致
         exporter.switch_to_home()
+
+    # 1.5 导出前修复：剪映可能在 pipeline 发布后打开过草稿，
+    # 自动合并串流 video segments 导致 crop 元数据丢失 → 音画不同步
+    try:
+        _restore_streams_from_backup(draft_name)
+    except Exception as e:
+        dprint(f"⚠️ 恢复检查失败（继续导出）: {e}")
 
     # 2. 打开草稿
     exporter.open_draft(draft_name)
@@ -776,7 +915,8 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
         # 异常抢救（移植自老脚本）：剪映可能在报错前已写出完整成品，校验通过则视为成功
         dprint(f"⚠️ 导出流程异常: {e}，尝试抢救成品...")
         if _salvage_existing_output(draft_name, output_path, expected_duration,
-                                    min_mtime=export_started - 5):
+                                    min_mtime=export_started - 5,
+                                    extra_dirs=[fallback_dir] if fallback_dir else None):
             dprint("✅ 成品已抢救归位，本次导出视为成功")
         else:
             raise
@@ -799,6 +939,8 @@ if __name__ == "__main__":
                         help="草稿预期时长（秒），提供时校验成品时长误差<2s，不符则判失败")
     parser.add_argument("--keep-open", action="store_true",
                         help="导出成功后保持剪映当前页面（默认重启剪映回首页）")
+    parser.add_argument("--fallback-dir", default=None, metavar="目录",
+                        help="成品抢救时的额外搜索目录（默认自动包含目标目录的父目录）")
     parser.add_argument("--retries", type=int, default=2,
                         help="UI 类失败重试次数（默认 2，即共 3 次尝试；非 UI 错误不重试）")
 
@@ -810,7 +952,7 @@ if __name__ == "__main__":
         try:
             run(args.draft_name, args.output_path,
                 move_output=args.move, expected_duration=args.expect_duration,
-                keep_open=args.keep_open)
+                keep_open=args.keep_open, fallback_dir=args.fallback_dir)
             sys.exit(0)
         except Exception as e:
             reason = str(e)

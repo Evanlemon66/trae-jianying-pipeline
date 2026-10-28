@@ -34,6 +34,7 @@ sys.path.insert(0, _SCRIPTS_DIR)
 
 import pipeline as pl  # noqa: E402
 from utils.notifier import toast as _toast  # noqa: E402
+from export_config import export_mp4_path  # noqa: E402
 
 
 def _ep_number(path, idx):
@@ -112,8 +113,14 @@ def main():
     ap.add_argument("--no-export", dest="auto_export", action="store_false",
                     help="串流草稿生成后不自动导出（默认自动导出到默认目录）")
     ap.set_defaults(auto_export=True)
-    ap.add_argument("--export-dir", default=r"D:\油管打猎\L",
-                    help="自动导出落点目录（默认 D:\\油管打猎\\L）")
+    ap.add_argument("--export-dir", default=None,
+                    help="自动导出落点根目录（默认读 pipeline/presets.json 的 export_dir）")
+    ap.add_argument("--wait-export", action="store_true",
+                    help="后台导出启动后轮询 progress.json 等待完成（默认立即 return）")
+    ap.add_argument("--verify", action="store_true",
+                    help="导出完成后自动跑 verify_export.py（隐含 --wait-export）")
+    ap.add_argument("--export-timeout", type=float, default=60.0,
+                    help="导出等待上限分钟数（默认 60；超时视为异常，不阻塞继续）")
     ap.add_argument("--presets", default=None, metavar="'名1,名2:0.03'",
                     help="显式指定组合预设（透传 pipeline；不指定则走 presets.json/前缀自动发现）")
     ap.add_argument("--watch", dest="watch", action="store_true", default=True,
@@ -254,28 +261,123 @@ def main():
             })
         save_state(args.workdir, state)
         print(f"\n🏁 串流草稿完成: {draft_name}")
+
+        # ---- 帧对齐修复（必须在剪映关着的时候改磁盘草稿；pipeline 内部已关剪映）----
+        try:
+            import _framefix_draft as _ff
+            ff_result = _ff.fix_draft(draft_name, run_tests=True)
+            if ff_result["test_passed"] is False:
+                print(f"  ⚠️ 帧对齐字幕测试失败（不阻塞导出）: {ff_result['test_details']}")
+            print(f"  📐 帧对齐: {ff_result['ep_count']}集, 总长 {ff_result['old_total']:.1f}s → {ff_result['new_total']:.1f}s")
+        except Exception as e:
+            print(f"  ⚠️ 帧对齐跳过（不阻塞导出）: {e}")
+            ff_result = None
+
         _toast("🎬 串流草稿已就绪", f"{draft_name}（{len(sel)} 集）")
 
-        # 默认行为：生成完自动导出到默认目录（--no-export 可关，--export-dir 可改）
+        # ---- 导出（后台 WMI + pythonw + CREATE_NO_WINDOW，零弹窗、不阻塞）----
         if args.auto_export:
             import subprocess as _sp
+            import tempfile as _tf
             exporter = os.path.join(
                 _PROJECT_ROOT, ".trae", "skills", "jianying-editor",
                 "examples", "robust_auto_export.py")
-            os.makedirs(args.export_dir, exist_ok=True)
-            out_mp4 = os.path.join(args.export_dir, f"{draft_name}.mp4")
-            print(f"\n📤 自动导出 → {out_mp4}")
-            _toast("📤 开始自动导出", draft_name)
-            rc = _sp.call(
-                [sys.executable, "-u", exporter, draft_name, out_mp4, "--move"],
-                cwd=_PROJECT_ROOT)
-            if rc == 0:
-                print(f"✅ 导出完成: {out_mp4}")
-                _toast("📤 导出完成", draft_name)
-            else:
-                print(f"✗ 导出失败(rc={rc})，可手动重跑:")
-                print(f"   python \"{exporter}\" \"{draft_name}\" \"{out_mp4}\" --move")
-                _toast("📤 导出失败", f"{draft_name}（rc={rc}，详见日志）")
+            # 成品按「一部剧一个文件夹」归置：<export_dir>/<草稿名>/<草稿名>.mp4
+            out_mp4 = export_mp4_path(draft_name, args.export_dir)
+            export_root = os.path.dirname(os.path.dirname(out_mp4))
+            os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
+            print(f"\n📤 后台导出 → {out_mp4}")
+
+            # 构造临时 pythonw 启动器（写一次，复用）
+            launcher_dir = os.path.join(_tf.gettempdir(), "jy_logs")
+            os.makedirs(launcher_dir, exist_ok=True)
+            launcher_path = os.path.join(launcher_dir, f"_launch_export_{os.getpid()}.py")
+            log_out = os.path.join(launcher_dir, f"export_{os.getpid()}.out.log")
+            log_err = os.path.join(launcher_dir, f"export_{os.getpid()}.err.log")
+            with open(launcher_path, "w", encoding="utf-8") as lf:
+                lf.write(f'''"""WMI 启动器：后台导出 {draft_name}，零弹窗随即退出。"""
+import os, subprocess, sys
+LOG_DIR = r"{launcher_dir}"
+PY = r"{sys.executable}"
+os.makedirs(LOG_DIR, exist_ok=True)
+env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+out = open(r"{log_out}", "w", encoding="utf-8", errors="replace")
+err = open(r"{log_err}", "w", encoding="utf-8", errors="replace")
+subprocess.Popen(
+    [PY, "-u", r"{exporter}", r"{draft_name}", r"{out_mp4}", "--move",
+     "--fallback-dir", r"{export_root}"],
+    cwd=r"{_PROJECT_ROOT}", stdout=out, stderr=err, env=env,
+    creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+    close_fds=True,
+)
+''')
+            # WMI 方式启动（父进程 WmiPrvSE，脱离 job object；用 PowerShell Invoke-CimMethod 不依赖 pywin32）
+            ps_cmd = (
+                f'Invoke-CimMethod -ClassName Win32_Process -MethodName Create '
+                f'-Arguments @{{ CommandLine = \'"{sys.executable.replace("python.exe", "pythonw.exe")}" "{launcher_path}"\' }} '
+                f'| Out-Null'
+            )
+            try:
+                rc = _sp.run(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    capture_output=True, timeout=30)
+                if rc.returncode == 0:
+                    print(f"  WMI 后台启动完成（pythonw，零弹窗）")
+                else:
+                    raise RuntimeError(f"CIM rc={rc.returncode}")
+            except Exception:
+                _sp.Popen(
+                    [sys.executable, "-u", launcher_path],
+                    creationflags=_sp.CREATE_NO_WINDOW | _sp.CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True,
+                )
+                print(f"  回退启动完成（CREATE_NO_WINDOW）")
+            print(f"  进度文件: {out_mp4}.progress.json")
+            print(f"  日志: {log_out}")
+            _toast("📤 后台导出中", draft_name)
+
+            # ---- 等待导出 + 自动验证 ----
+            wait = args.wait_export or args.verify
+            if wait:
+                import time as _time, json as _json
+                pjson = out_mp4 + ".progress.json"
+                deadline = _time.time() + args.export_timeout * 60
+                print(f"\n  ⏳ 等待导出完成（上限 {args.export_timeout}min，每 25s 轮询一次）...")
+                last_pct = -1
+                while _time.time() < deadline:
+                    if os.path.exists(pjson):
+                        try:
+                            with open(pjson, encoding="utf-8") as f:
+                                rec = _json.load(f)
+                            cur_pct = rec.get("percent", "")
+                            if cur_pct and cur_pct != last_pct:
+                                print(f"    {rec.get('updated_at','')}  {cur_pct}  "
+                                      f"{rec.get('exported_mb',0):.0f}MB  已跑 {rec.get('elapsed_s',0)/60:.1f}min")
+                                last_pct = cur_pct
+                            if rec.get("done"):
+                                print(f"    ✅ 导出完成（耗时 {rec.get('elapsed_s',0)/60:.1f}min，"
+                                      f"最终 {rec.get('final_mb',0):.0f}MB）")
+                                break
+                        except Exception:
+                            pass
+                    _time.sleep(25)
+                else:
+                    print(f"    ⚠️ 导出超时（>{args.export_timeout}min），不阻塞继续")
+                    _toast("📤 导出超时", draft_name)
+
+                if args.verify:
+                    print(f"\n  🔍 自动验证帧级漂移 + 字幕帧位...")
+                    verify_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                  "verify_export.py")
+                    if os.path.exists(verify_script):
+                        rc = _sp.call([sys.executable, verify_script, draft_name, out_mp4],
+                                      cwd=os.path.dirname(verify_script))
+                        if rc == 0:
+                            _toast("✅ 验证全部通过", draft_name)
+                        else:
+                            _toast("❌ 验证未通过", draft_name)
+                    else:
+                        print(f"    verify_export.py 不存在，跳过")
 
         if args.clean_workdir:
             pl.clean_workdir(args.workdir)

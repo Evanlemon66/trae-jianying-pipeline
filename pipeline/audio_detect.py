@@ -2,7 +2,9 @@ import sys, time, os, re, glob, json, subprocess
 sys.stdout.reconfigure(encoding="utf-8")
 import numpy as np
 
-FFMPEG = r"D:\AI_Deps\tools\ffmpeg\bin\ffmpeg.exe" if os.path.exists(r"D:\AI_Deps\tools\ffmpeg\bin\ffmpeg.exe") else "ffmpeg"
+from export_config import get_ffmpeg
+_ffmpeg = get_ffmpeg()
+FFMPEG = _ffmpeg if os.path.exists(_ffmpeg) else "ffmpeg"
 
 VIDEO_DIR = r"D:\短剧\10-六零糙汉：我靠打猎养全家"
 

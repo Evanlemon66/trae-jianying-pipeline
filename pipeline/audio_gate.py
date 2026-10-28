@@ -53,7 +53,8 @@ def _deps_root():
             return root
     except Exception:
         pass
-    return r"D:\AI_Deps"
+    from export_config import get_deps_root
+    return get_deps_root()
 
 
 def find_vad_model():

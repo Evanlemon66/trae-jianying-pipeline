@@ -28,7 +28,9 @@ project = JyProject(DRAFT_NAME, overwrite=True, width=1080, height=1920)
 episodes = sorted(glob.glob(os.path.join(BASE, "第*集.mp4")), key=lambda p: natural_sort_key(os.path.basename(p)))
 print(f"找到 {len(episodes)} 集 (自然排序)")
 
-FFPROBE = r"D:\AI_Deps\tools\ffmpeg\bin\ffprobe.exe" if os.path.exists(r"D:\AI_Deps\tools\ffmpeg\bin\ffprobe.exe") else "ffprobe"
+from export_config import get_ffprobe
+_ffprobe = get_ffprobe()
+FFPROBE = _ffprobe if os.path.exists(_ffprobe) else "ffprobe"
 
 
 def probe_duration(path):

@@ -20,7 +20,8 @@ import urllib.error
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
-CONFIG_PATH = os.path.join(_HERE, "vc_config.json")
+CONFIG_PATH = os.path.join(_HERE, "presets.json")
+_LEGACY_CONFIG_PATH = os.path.join(_HERE, "vc_config.json")  # 旧版翻译配置文件（兼容读取）
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -61,18 +62,22 @@ def _ensure_ffmpeg_path():
 
 
 def load_config():
-    """读取 vc_config.json。
+    """读取翻译配置：presets.json 的 translate 段（优先）→ 旧 vc_config.json（兼容）。
 
     providers 为按顺序尝试的 OpenAI 兼容端点列表；
     兼容旧的单端点字段（api_key/api_base/model），自动包装成一项。
     """
     cfg = {}
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception:
-            cfg = {}
+    for path, key in ((CONFIG_PATH, "translate"), (_LEGACY_CONFIG_PATH, None)):
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                cfg = (d.get(key) or {}) if key else d
+            except Exception:
+                cfg = {}
+            if cfg:
+                break
 
     providers = cfg.get("providers")
     if not providers:
@@ -273,7 +278,7 @@ def vc_translate(srt_path, out_srt, translator="llm", target_language="en", time
     cfg = load_config()
     if translator == "llm":
         if not provider or not provider.get("api_key"):
-            print("  [vc-tr] llm 未配置 api_key (vc_config.json providers)")
+            print("  [vc-tr] llm 未配置 api_key (presets.json translate.providers)")
             return None
         args += ["--api-key", provider["api_key"],
                  "--api-base", provider["api_base"], "--model", provider["model"],
@@ -412,6 +417,7 @@ def _translate_batch_openai(provider, cn_texts, timeout=90):
         "Translate everything, including names of people and places — render Chinese "
         "names in pinyin (e.g. 建国 → Jianguo). Never leave Chinese characters in the "
         "output. Keep the numbering exactly, one translated line per source line. "
+        "Do not merge or split lines. "
         "Output only the numbered translations, no explanations.\n\n" + numbered
     )
     body = {
@@ -422,6 +428,9 @@ def _translate_batch_openai(provider, cn_texts, timeout=90):
         ],
         "temperature": 0.2,
         "stream": False,
+        # GLM-4-Flash 默认 max_tokens 偏小，长批次（如 36 行对话）会被截断成
+        # 半截输出 → 条数校验不过 → 误判软失败。按行数给足输出预算。
+        "max_tokens": max(2048, len(cn_texts) * 120),
     }
     req = urllib.request.Request(
         provider["api_base"].rstrip("/") + "/chat/completions",
@@ -495,6 +504,28 @@ def _rewrite_cjk_openai(provider, texts, idxs, timeout=90):
     return _pinyin_fallback(_parse_numbered(content, len(idxs)))
 
 
+def _translate_chunked(batch_fn, cn_texts, chunk_size=12):
+    """整批翻译失败时按 chunk_size 分批重试。
+
+    长批次（如 36 行对话密集集）模型会截断输出或擅自并行，条数对不上被判软失败；
+    小批次指令遵循度高得多。分批间无共享上下文，仅作为整批失败后的兜底。
+    """
+    out = batch_fn(cn_texts)
+    if out:
+        return out
+    if len(cn_texts) <= chunk_size:
+        return None
+    print(f"  [chunk] 整批失败，按 {chunk_size} 行分批重试（共 {len(cn_texts)} 行）")
+    merged = []
+    for off in range(0, len(cn_texts), chunk_size):
+        chunk = cn_texts[off:off + chunk_size]
+        r = batch_fn(chunk)
+        if not r or len(r) != len(chunk):
+            return None
+        merged += r
+    return merged
+
+
 def translate_texts_via_vc(cn_texts, workdir=None, tag="batch"):
     """中文 → 英文：按 providers 顺序直连 OpenAI 兼容接口（GLM → 讯飞）。
 
@@ -506,7 +537,7 @@ def translate_texts_via_vc(cn_texts, workdir=None, tag="batch"):
     for provider in load_config()["providers"]:
         if not provider.get("api_key"):
             continue
-        texts = _translate_batch_openai(provider, cn_texts)
+        texts = _translate_chunked(lambda t: _translate_batch_openai(provider, t), cn_texts)
         if texts and _validate_translation(texts, cn_texts):
             print(f"  [llm] {provider['name']}({provider['model']}) 翻译 {len(texts)} 条")
             return texts
@@ -515,21 +546,8 @@ def translate_texts_via_vc(cn_texts, workdir=None, tag="batch"):
     return None
 
 
-def translate_texts_via_ollama(cn_texts, timeout=600):
-    """本地 Ollama 兜底：整批一次请求，保留上下文，返回与输入等长的英文列表。"""
-    if not cn_texts:
-        return None
-    cfg = (load_config().get("ollama") or {})
-    if cfg.get("enabled", True) is False:
-        return None
-    host = (cfg.get("host") or "http://127.0.0.1:11434").rstrip("/")
-    model = cfg.get("model") or "qwen3:8b"
-
-    ok, why = ollama_available(host, model)
-    if not ok:
-        print(f"  [ollama] 探针不可用，跳过本层: {why}")
-        return None
-
+def _ollama_batch(host, model, cn_texts, timeout=600):
+    """Ollama 单批翻译：返回与输入等长的英文列表，失败返回 None。"""
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(cn_texts))
     prompt = (
         "You are a professional subtitle translator. Translate the following Chinese "
@@ -537,6 +555,7 @@ def translate_texts_via_ollama(cn_texts, timeout=600):
         "Translate everything, including names of people and places — render Chinese "
         "names in pinyin (e.g. 建国 → Jianguo). Never leave Chinese characters in the "
         "output. Keep the numbering exactly, one translated line per source line. "
+        "Do not merge or split lines. "
         "Output only the numbered translations, no explanations.\n\n" + numbered
     )
     payload = {
@@ -545,7 +564,7 @@ def translate_texts_via_ollama(cn_texts, timeout=600):
         "stream": False,
         # qwen3 是推理模型：显式关思考链，避免 reasoning 混进译文或拖慢速度
         "think": False,
-        "options": {"temperature": 0.2, "num_predict": max(512, len(cn_texts) * 40)},
+        "options": {"temperature": 0.2, "num_predict": max(1024, len(cn_texts) * 80)},
     }
     req = urllib.request.Request(
         host + "/api/generate",
@@ -570,6 +589,25 @@ def translate_texts_via_ollama(cn_texts, timeout=600):
             out.append(m.group(1).strip())
     if len(out) != len(cn_texts):
         out = lines if len(lines) == len(cn_texts) else []
+    return out or None
+
+
+def translate_texts_via_ollama(cn_texts, timeout=600):
+    """本地 Ollama 兜底：整批一次请求，保留上下文，返回与输入等长的英文列表。"""
+    if not cn_texts:
+        return None
+    cfg = (load_config().get("ollama") or {})
+    if cfg.get("enabled", True) is False:
+        return None
+    host = (cfg.get("host") or "http://127.0.0.1:11434").rstrip("/")
+    model = cfg.get("model") or "qwen3:8b"
+
+    ok, why = ollama_available(host, model)
+    if not ok:
+        print(f"  [ollama] 探针不可用，跳过本层: {why}")
+        return None
+
+    out = _translate_chunked(lambda t: _ollama_batch(host, model, t, timeout), cn_texts)
     if not out or not _validate_translation(out, cn_texts):
         print(f"  [ollama] 输出无效(软失败校验未通过)")
         return None

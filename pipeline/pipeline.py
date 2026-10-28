@@ -4,6 +4,9 @@ from copy import deepcopy
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
+sys.path.insert(0, _HERE)
+
+from export_config import get_deps_root, get_font_path
 
 from utils.formatters import (
     get_default_drafts_root as _upstream_get_default_drafts_root,
@@ -69,7 +72,7 @@ def _find_ffmpeg():
         return shutil.which("ffmpeg")
     import glob as _g
     candidates = [
-        os.path.join(r"D:\AI_Deps", "tools", "ffmpeg", "bin", "ffmpeg.exe"),
+        os.path.join(get_deps_root(), "tools", "ffmpeg", "bin", "ffmpeg.exe"),
         * _g.glob(os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet",
                                "Packages", "*ffmpeg*", "ffmpeg-*", "bin", "ffmpeg.exe")),
     ]
@@ -90,9 +93,9 @@ def _ensure_ffmpeg_on_path():
 
 _ensure_ffmpeg_on_path()
 
-# 模型统一存放在 D:\AI_Deps\models（用户级环境变量 HF_HUB_CACHE/TORCH_HOME 已设置，此处兜底）
-os.environ.setdefault("HF_HUB_CACHE", r"D:\AI_Deps\models\huggingface\hub")
-os.environ.setdefault("TORCH_HOME", r"D:\AI_Deps\models\torch")
+# 模型统一存放在 deps_root/models（用户级环境变量 HF_HUB_CACHE/TORCH_HOME 已设置，此处兜底）
+os.environ.setdefault("HF_HUB_CACHE", os.path.join(get_deps_root(), "models", "huggingface", "hub"))
+os.environ.setdefault("TORCH_HOME", os.path.join(get_deps_root(), "models", "torch"))
 
 
 def _load_env_profile():
@@ -248,6 +251,30 @@ def publish_staged_draft(stage_dir, draft_name, duration_us=0):
     if os.path.isdir(stage_dir):
         shutil.rmtree(stage_dir, ignore_errors=True)
     return target, content_path
+
+
+def _pipeline_backup_summary(draft):
+    """备份摘要：video/audio 各轨 segment 数，供导出前快速比对是否被剪映合并。"""
+    parts = []
+    for t in draft.get("tracks", []):
+        if t.get("type") in ("video", "audio"):
+            n = len(t.get("segments") or [])
+            parts.append(f"{t['type']}={n}")
+    return ", ".join(parts[:4])
+
+
+def _write_pipeline_backup(draft_path, draft):
+    """写 _pipeline_backup.json：防止剪映打开草稿时自动合并串流 video segments
+    （把 117 个首尾相连的集合成 1 段大段，丢失 crop 后的 source_timerange.duration）。
+
+    新建草稿（staged）与注入已有草稿（直接 save）两条发布路径都要走这里。
+    """
+    try:
+        _bk = os.path.join(os.path.dirname(draft_path), "_pipeline_backup.json")
+        shutil.copy2(draft_path, _bk)
+        print(f"  🛡️ 草稿已备份: {_pipeline_backup_summary(draft)}")
+    except Exception as _be:
+        print(f"  [warn] 备份 _pipeline_backup.json 失败: {_be}")
 
 
 def load_draft(name_or_path):
@@ -1121,7 +1148,7 @@ def _cover_start_for_cut(video_path, cut_us):
         import subprocess as _sp
         ffprobe = shutil.which("ffprobe")
         if not ffprobe:
-            ffprobe = os.path.join(r"D:\AI_Deps\tools\ffmpeg\bin", "ffprobe.exe")
+            ffprobe = os.path.join(get_deps_root(), "tools", "ffmpeg", "bin", "ffprobe.exe")
         out = _sp.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", video_path],
@@ -1376,7 +1403,7 @@ def attach_native_vocal_separation(draft, draft_dir, vocals_wav, duration_us,
 
 def _build_subtitle_content(text, font_path=None, style_size=16.0):
     if font_path is None:
-        font_path = "D:/剪映5.9/剪映5.9版+jianying-skill/剪映5.9(win+mac)/剪映5.9Windows/JianyingPro/5.9.0.11632/Resources/Font/SystemFont/zh-hans.ttf"
+        font_path = get_font_path()
     return json.dumps({
         "styles": [{
             "fill": {
@@ -1550,7 +1577,7 @@ def add_text_segments(draft, sub_segments, offset_us=0, font="HarmonyOS Sans SC"
             "font_category_name": "",
             "font_id": "",
             "font_name": "",
-            "font_path": "D:/剪映5.9/剪映5.9版+jianying-skill/剪映5.9(win+mac)/剪映5.9Windows/JianyingPro/5.9.0.11632/Resources/Font/SystemFont/zh-hans.ttf",
+            "font_path": get_font_path(),
             "font_resource_id": "",
             "font_size": 8.0,
             "font_source_platform": 0,
@@ -2295,8 +2322,8 @@ def run_whisper(input_path, model_size=None, device=None, compute_type=None):
 
 
 _pp = (_ENV_PROFILE.get("paraformer") or {})
-PARAFORMER_DIR = _pp.get("model_dir") or r"D:\AI_Deps\models\paraformer\iic_onnx"
-PARAFORMER_VAD_DIR = _pp.get("vad_dir") or r"D:\AI_Deps\models\paraformer\vad_onnx"
+PARAFORMER_DIR = _pp.get("model_dir") or os.path.join(get_deps_root(), "models", "paraformer", "iic_onnx")
+PARAFORMER_VAD_DIR = _pp.get("vad_dir") or os.path.join(get_deps_root(), "models", "paraformer", "vad_onnx")
 PARAFORMER_QUANTIZE = bool(_pp.get("quantize", True))  # int8；fp32 实测验证后才在画像开放
 
 
@@ -2969,9 +2996,11 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         if _vd.has_blocking(_rep):
             print(_vd.format_report(_rep))
             _blk = _vd.blocking_keys(_rep)
-            if _blk == ["missing"]:
-                # 软阻断：唯一阻断项是「残缺集」（翻译全链失败留下的空位）时
-                # 照常保存发布草稿，发布后自动补翻复验，通过才导出（Step 10.8）
+            _missing = {x["ep"] for x in _rep["issues"]["missing"]}
+            _uncov = {x["ep"] for x in _rep["issues"]["uncovered"]}
+            # 软阻断：阻断项只含「残缺集」及其派生的「未覆盖」（同一根因：
+            # 翻译全链失败留下的空位）时照常保存发布，随后自动补翻复验
+            if set(_blk) <= {"missing", "uncovered"} and _missing and _uncov <= _missing:
                 _missing_eps_pending = sorted({x["ep"] for x in _rep["issues"]["missing"]})
                 print(f"  ⚠️ 仅剩残缺集 {len(_missing_eps_pending)} 集 "
                       f"(eps={_missing_eps_pending})，草稿照常保存发布，"
@@ -3014,6 +3043,21 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         if staged:
             dp_root, draft_path = publish_staged_draft(
                 dp_root, draft_name_or_path, draft.get("duration", 0))
+        _write_pipeline_backup(draft_path, draft)
+        # 记录串流产物清单（供 stream_manifest.py 一键清理）
+        try:
+            import stream_manifest as _sm
+            _src_dir = (os.path.dirname(os.path.abspath(video_paths[0]))
+                        if video_paths else None)
+            _sm.record(
+                os.path.basename(os.path.dirname(draft_path)),
+                source_dir=_src_dir,
+                draft_dir=os.path.dirname(draft_path),
+                jycache_dir=os.path.join(_src_dir, "__jycache__") if _src_dir else None,
+                workdir=workdir,
+            )
+        except Exception as _me:
+            print(f"  [warn] 记录串流清单失败: {_me}")
     print(f"💾 Draft saved! 备份: {bak}")
     print(f"   Post-state:\n{summarize_draft(draft)}")
     print()
@@ -3070,8 +3114,9 @@ def run_pipeline(draft_name_or_path, video_paths=None,
     if do_export:
         print("━ [11] 导出 (robust_auto_export) ━━━━━━━━━━━━━━━━━━━━━")
         try:
-            safe_draft_name = re.sub(r'[\\/:*?"<>|]', '_', os.path.basename(dp_root or draft_name_or_path))
-            out_path = os.path.join(workdir, f"{safe_draft_name}_export.mp4")
+            from export_config import export_mp4_path, get_export_dir
+            out_path = export_mp4_path(os.path.basename(dp_root or draft_name_or_path))
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
             exporter = os.path.join(
                 os.path.dirname(_HERE), ".trae", "skills", "jianying-editor",
                 "examples", "robust_auto_export.py")
@@ -3080,7 +3125,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             print(f"  📁 输出路径: {out_path}")
             with timed_step("导出"):
                 rc = subprocess.call(
-                    [sys.executable, "-u", exporter, draft_name_or_path, out_path, "--move"])
+                    [sys.executable, "-u", exporter, draft_name_or_path, out_path, "--move",
+                     "--fallback-dir", get_export_dir()])
             if rc == 0:
                 print(f"  ✅ 导出完成!")
             else:
