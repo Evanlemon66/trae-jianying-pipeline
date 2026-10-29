@@ -12,7 +12,7 @@ Use this SOP for simple editing requests to minimize noisy exploration.
 
 ```powershell
 python --version
-Test-Path "C:\Users\Administrator\AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft"
+Test-Path "$env:LOCALAPPDATA\JianyingPro\User Data\Projects\com.lveditor.draft"
 ```
 
 If draft path differs, set `JY_PROJECTS_ROOT` and continue.

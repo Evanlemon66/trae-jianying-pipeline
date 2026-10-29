@@ -89,7 +89,6 @@ class CloudManager:
         log_files = [
             os.path.join(WORKSPACE_ROOT, "mitmdump_assets_capture.log"),
             os.path.join(WORKSPACE_ROOT, "mitmdump_media_full.log"),
-            r"d:\jianying\网页剪辑\mitmdump_assets_capture.log",
         ]
 
         for log_path in log_files:

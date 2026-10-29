@@ -14,43 +14,62 @@ from pathlib import Path
 # 内部辅助
 # ──────────────────────────────────────────────────────────────────
 
-def _guess_ffmpeg():
-    """三重查找 ffmpeg 路径（which → AI_Deps → WinGet）。"""
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        return ffmpeg
-    # AI_Deps 硬编码路径
-    p = r"D:\AI_Deps\tools\ffmpeg\bin\ffmpeg.exe"
-    if os.path.isfile(p):
-        return p
-    # WinGet 路径
+def _presets_deps_root():
+    """向上查找 pipeline/presets.json 的 deps_root（可选配置，读不到返回空串）。"""
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(6):
+        d = os.path.dirname(d)
+        if not d:
+            break
+        preset = os.path.join(d, "pipeline", "presets.json")
+        if os.path.isfile(preset):
+            try:
+                with open(preset, encoding="utf-8") as f:
+                    return (json.load(f).get("deps_root") or "").strip()
+            except (OSError, ValueError):
+                return ""
+    return ""
+
+
+def _find_tool(name):
+    """定位 ffmpeg/ffprobe：JY_DEPS_ROOT → presets.json deps_root → PATH → WinGet。"""
+    exe = name + (".exe" if os.name == "nt" else "")
+    for base in (os.environ.get("JY_DEPS_ROOT", "").strip(), _presets_deps_root()):
+        if not base:
+            continue
+        for rel in (os.path.join("tools", "ffmpeg", "bin", exe), os.path.join("bin", exe), exe):
+            candidate = os.path.join(base, rel)
+            if os.path.isfile(candidate):
+                return candidate
+    found = shutil.which(name)
+    if found:
+        return found
     for w in glob.glob(os.path.join(
             os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet",
             "Packages", "*ffmpeg*", "ffmpeg-*", "bin",
     )):
-        fp = os.path.join(w, "ffmpeg.exe")
+        fp = os.path.join(w, exe)
         if os.path.isfile(fp):
             return fp
     return None
 
 
+def _guess_ffmpeg():
+    return _find_tool("ffmpeg")
+
+
 def _guess_ffprobe():
-    fp = shutil.which("ffprobe")
-    if fp:
-        return fp
-    p = r"D:\AI_Deps\tools\ffmpeg\bin\ffprobe.exe"
-    if os.path.isfile(p):
-        return p
-    return None
+    return _find_tool("ffprobe")
 
 
 def _guess_font():
-    """候选中文字体（Windows 系统自带）。"""
+    """候选中文字体（Windows 系统自带，字体目录取 %WINDIR%）。"""
+    font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
     candidates = [
-        r"C:\Windows\Fonts\msyhbd.ttc",
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
+        os.path.join(font_dir, "msyhbd.ttc"),
+        os.path.join(font_dir, "msyh.ttc"),
+        os.path.join(font_dir, "simhei.ttf"),
+        os.path.join(font_dir, "simsun.ttc"),
     ]
     for c in candidates:
         if os.path.isfile(c):

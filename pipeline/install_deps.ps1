@@ -103,7 +103,7 @@ if ($DepsRoot -like "D:\*" -and -not (Test-Path "D:\")) {
     $DepsRoot = "C:\AI_Deps"
 }
 if ($DepsRoot -ne "D:\AI_Deps") {
-    Warn "DepsRoot=$DepsRoot 不是 D:\AI_Deps：pipeline.py 中 PARAFORMER_DIR 等常量硬编码 D:\AI_Deps，装完需同步修改或建目录联接"
+    Warn "DepsRoot=$DepsRoot 不是 D:\AI_Deps：请同步写入 pipeline\presets.json 的 deps_root（或设置 JY_DEPS_ROOT），否则脚本仍按 D:\AI_Deps 找工具"
 }
 Ok "DepsRoot: $DepsRoot"
 $summary += "DepsRoot: $DepsRoot"
