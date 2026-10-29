@@ -1,188 +1,196 @@
 # Drama Cover Builder 短剧封面生成 Skill 使用手册
 
-> 版本：Phase 2 最终版 · 2026-10-22  
-> 路径：`c:\Users\唐唐\.trae-cn\skills\drama-cover-builder\`  
-> 适用：Trae CN（全局 Skill，跨所有项目可用）
+> 版本：v1.0 · 2026-10-27  
+> 路径：`<项目根>/.trae/skills/drama-cover-builder/`  
+> 适用：Trae CN / Trae International（项目内 Skill，可被 pipeline / batch_runner / 任意脚本独立消费）
 
 ---
 
 ## 目录
 
-- [1. 功能概览](#1-功能概览)
+- [1. 架构概览](#1-架构概览)
 - [2. 系统要求](#2-系统要求)
 - [3. 文件结构](#3-文件结构)
-- [4. 核心概念](#4-核心概念)
-- [5. 快速上手](#5-快速上手)
-- [6. 子命令详解](#6-子命令详解)
-- [7. 底图三档方案](#7-底图三档方案)
-- [8. 标题生成三方案](#8-标题生成三方案)
-- [9. Pillow 四样式](#9-pillow-四样式)
-- [10. 批量处理](#10-批量处理)
-- [11. 常见问题](#11-常见问题)
+- [4. 快速上手](#4-快速上手)
+- [5. 子命令详解](#5-子命令详解)
+- [6. 阶段 1：标题生成](#6-阶段-1标题生成)
+- [7. 阶段 2：Pillow 封面合成](#7-阶段-2pillow-封面合成)
+- [8. 阶段 3：剪映草稿写入](#8-阶段-3剪映草稿写入)
+- [9. 与 pipeline 集成](#9-与-pipeline-集成)
+- [10. 常见问题](#10-常见问题)
 
 ---
 
-## 1. 功能概览
+## 1. 架构概览
 
-一条命令生成短剧封面，覆盖从标题到剪映草稿的完整链路：
+Skill 是**三阶段独立模块**：
 
 ```
-简介文字 ──→ 三套标题（各 5 条）
-                    ↓
-         底图（抽帧 / 本地图 / AI 生图）
-                    ↓
-         排版合成（4 种 Pillow 样式 + HTML 可选）
-                    ↓
-         写入剪映草稿 draft_cover.jpg
+                drama-cover-builder skill
+           ┌────────────────────────────────┐
+           │                                │
+  ┌────────▼────────┐  ┌────────────────────▼──────────────┐  ┌──────────────────▼────────┐
+  │ 阶段 1 标题生成   │  │ 阶段 2 Pillow 合成                   │  │ 阶段 3 剪映草稿写入          │
+  │ (Agent 调 LLM)   │  │ (compose_cover / compose_full_set) │  │ (set_draft_cover + ...)     │
+  │                  │  │                                    │  │                            │
+  │ 核心能力：       │  │ 核心能力：                           │  │ 辅助能力（主要 pipeline 消费）│
+  │ • 读 title-spec.md│ │ • 底图裁切 + 蒙版 + 标题排版          │  │ • 写 draft_cover.jpg        │
+  │ • Agent 在线生成 │  │ • 2 尺寸族：竖 1080×1920 / 横 2848×1600│  │ • 写原生 composition 结构    │
+  │ • Ollama 兜底    │  │ • 4 样式 × 可选标题                  │  │ • ffmpeg select+thumbnail   │
+  │                  │  │ • 一键出 3 横 + 1 竖                 │  │ • 自动探测 / 冲突点抽帧      │
+  └──────────────────┘  └────────────────────────────────────┘  └───────────────────────────┘
 ```
+
+**消费方**：谁都能独立调——Trae 对话直接用、任意脚本 `import drama_cover`、CLI 单独跑。pipeline.py 和 batch_runner.py 是阶段 3 的主要消费者，但阶段 1 和阶段 2 完全不依赖 pipeline。
 
 ---
 
 ## 2. 系统要求
 
-### 必需（已安装）
+### 必需
 
 | 组件 | 版本 | 位置 |
 |------|------|------|
-| Python | 3.12 | `%LOCALAPPDATA%\Programs\Python\Python312\python.exe` |
-| Pillow | 13.0 | pip 包 |
-| ffmpeg | 9.0.2 | WinGet `D:\AI_Deps\tools\ffmpeg\bin` |
-| Ollama qwen2.5:7b-instruct | Q4_K_M 4.7GB | `D:\AI_Deps\Ollama\models`，服务在 11434 端口 |
-| 中文字体 | msyhbd | `C:\Windows\Fonts\msyhbd.ttc` |
-| torch (CUDA) | 2.14.1+cu126 | pip 包，demucs GPU 加速专用；安装：`pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu126` |
-| audio-separator | 0.47.1 | pip 包，RoFormer SOTA 人声分离备用方案，模型权重放 `D:\AI_Deps\models\` |
+| Python | 3.12+ | 任意 |
+| Pillow | 10+ | `pip install pillow` |
+| ffmpeg | 任意 | 三重查找：PATH → `D:\AI_Deps\tools\ffmpeg\bin` → WinGet 路径 |
+| 中文字体 | msyhbd | `C:\Windows\Fonts\msyhbd.ttc`（Windows 自带） |
 
 ### 可选
 
-| 组件 | 用途 | 安装 |
-|------|------|------|
-| Playwright + Chromium | HTML+CSS 排版方案 | `pip install playwright && playwright install chromium`（~245MB）|
-| volcengine-python-sdk | 付费 AI 生图（豆包 Seedream）| `pip install volcengine-python-sdk` + ARK_API_KEY |
-
-### Windows 上不可用
-
-| 组件 | 原因 |
+| 组件 | 用途 |
 |------|------|
-| Ollama stable-diffusion | Ollama 图像生成仅 macOS MLX，Windows Coming Soon |
-| Ollama x/z-image-turbo | 同上，报 `MLX runtime is not available` |
+| Ollama qwen2.5:7b | 离线标题生成兜底（Agent 在线生成优先） |
+
+> **纯封面场景不需要 torch、demucs、faster-whisper、funasr-onnx、videocaptioner 等大型 AI 包。**
 
 ---
 
 ## 3. 文件结构
 
 ```
-drama-cover-builder/
-├── SKILL.md                              ← Skill 触发描述（Trae 路由用）
+.trae/skills/drama-cover-builder/
+├── SKILL.md                              ← Skill 入口（能力边界 / 路由 / 契约 / 门禁）
 ├── scripts/
-│   └── drama_cover.py                    ← 主脚本（~580 行，argparse CLI）
-└── assets/
-    ├── title_prompts/
-    │   ├── s1_taiyo.md                   ← 标题方案 1：12 公式（5 类各 1 条）
-    │   ├── s2_coppie.md                  ← 标题方案 2：CoppieGPT 风格
-    │   └── s3_viral.md                   ← 标题方案 3：22 心理学
-    └── compose_styles/
-        └── pillow_styles.json            ← 4 样式参数（改这里调视觉，无需改代码）
+│   └── drama_cover.py                    ← 主脚本（argparse CLI + Python API）
+├── assets/
+│   └── compose_styles/
+│       └── pillow_styles.json            ← 阶段 2b：4 样式 + 画布参数
+└── references/
+    ├── title-spec.md                     ← 阶段 1：标题生成唯一执行标准（v4）
+    ├── cover-spec.md                     ← 阶段 2：出图硬约束与构图规范
+    ├── scorecard.md                      ← 七维评分与矩阵推荐规则
+    ├── failure-cases.md                  ← 翻车案例库 + 已验证标题台账
+    ├── platform-rules.md                 ← 审核红线 / 平台规格 / 烧字字数档位
+    ├── ab-testing.md                     ← 发布侧 A/B 设计（预留，未启用）
+    └── archive/v3-spec.md                ← v3 历史规范（仅追溯）
 ```
 
-Python 调用入口：
-```
-%LOCALAPPDATA%\Programs\Python\Python312\python.exe "c:\Users\唐唐\.trae-cn\skills\drama-cover-builder\scripts\drama_cover.py" <command> [args]
-```
+### CLI 调用
 
-可设置别名简化（PowerShell profile）：
 ```powershell
-Set-Alias dc "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe c:\Users\唐唐\.trae-cn\skills\drama-cover-builder\scripts\drama_cover.py"
+$skillScripts = "<项目根>\.trae\skills\drama-cover-builder\scripts\drama_cover.py"
+python $skillScripts --help
+```
+
+### Python API 调用
+
+```python
+import sys, os
+sys.path.insert(0, os.path.join(
+    "<项目根>", ".trae", "skills", "drama-cover-builder", "scripts"))
+import drama_cover as dc
+
+dc.compose_cover("base.jpg", "out.jpg", title="谁料野猪王竟被他一箭放倒",
+                 style="classic_red_stroke", size_family="horizontal")
 ```
 
 ---
 
-## 4. 核心概念
+## 4. 快速上手
 
-### 画布尺寸
-所有输出固定 1080×1920 竖屏（剪映短剧标准）。
+### 场景 A：Trae 对话中直接用（阶段 1+2，最核心）
 
-### 底图优先级（--base-image > --video）
 ```
-full 子命令:
-  1) 传了 --base-image → 直接用这张图，跳过抽帧
-  2) 传了 --video → ffmpeg select+thumbnail 抽最佳帧
-  3) 两个都没传 → exit 1 报错
+你：帮我给这段短剧简介生成标题
+简介：知青为了活下去，带着粮肉和一群敢打敢拼的兄弟...
+底图：D:\素材\ganshan_ep01.jpg
 ```
 
-### 全链路 vs 单步
-- **full 子命令**：一键跑 title → art → compose-pillow(all) → compose-html(可选)
-- **单步子命令**：title / art-from-video / compose-pillow / compose-html / write-draft，按需自由组合
+流程（**阶段 1 → 用户选择 → 阶段 2，中间有强制选择门禁**）：
+
+```
+1. Trae 读 `references/title-spec.md` → 按规范生成 12 条标题（3 方案 × 4 版本）
+2. 以 T1—T12 平铺编号呈现，停下等用户选择 ← Agent 不代选、不自动往下走
+3. 用户每次回一个编号，依次为封面1/2/3 各选 1 条（也可一次给三个），或自主提供 3 条自定义标题
+4. 3 条标题按**封面位**映射到 3 张横版封面（与标题所属版本无关）：
+   封面1 → classic_red_stroke（爆点构图）
+   封面2 → shadow_outline（冷暖对比构图）
+   封面3 → neon_glow（守护挡身构图）
+5. 调 compose-pillow 合成 3 横 + 1 竖
+```
+
+### 场景 B：用户自主给标题（跳过阶段 1）
+
+```
+你：直接用这三条标题做封面：
+1. 他拿義兄當親哥，義兄卻反手背叛——...
+2. 當年遭義兄背叛，他連口氣都沒處發——...
+3. 一個趕山的也配號令萬獸？...
+底图：D:\素材\ganshan_ep01.jpg
+```
+
+Trae 跳过阶段 1，直接进阶段 2 合成。
+
+### 场景 C：CLI 单步组合
+
+```powershell
+$skill = ".trae\skills\drama-cover-builder\scripts\drama_cover.py"
+
+# Step 1: 从视频抽最佳帧
+python $skill art-from-video --video "D:\短剧\第1集.mp4" --out "best_frame.jpg"
+
+# Step 2: 一键出 4 张封面（3 横 + 1 竖，都不带标题）
+python $skill compose-pillow --base "best_frame.jpg" --style all --out "./cover_out"
+
+# Step 3: 给横版加标题（单独指定）
+python $skill compose-pillow --base "best_frame.jpg" --title "知青带粮肉闯山野！" --out "./cover_out/hit.jpg" --size horizontal --style classic_red_stroke
+
+# Step 4: 只把竖版写进剪映草稿
+python $skill write-draft --cover "./cover_out/cover_vertical.jpg" --draft-dir "C:\Users\<你>\AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft\80ganshan_ep01"
+```
+
+### 场景 C：pipeline 自动消费（阶段 3）
+
+pipeline.py 启动时自动注入 skill 路径，封面来源有三档优先级：
+
+```
+1) pipeline 内部调用 skill 的 ffmpeg 抽帧 → set_draft_cover(extract_from_video=...)
+2) 用户传了 --cover-image → set_draft_cover(cover_image=...)
+3) batch_runner.py 自动探测 → detect_cover_from_dir(series_dir)
+```
 
 ---
 
-## 5. 快速上手
+## 5. 子命令详解
 
-### 场景 A：最快（视频抽帧，零成本）
+### 5.1 title
 
-```bash
-python drama_cover.py full ^
-  --synopsis "知青为了活下去，带着粮肉和一群敢打敢拼的兄弟，在深山老林里扎了根，却意外惹上了当地地头蛇。" ^
-  --video "D:\短剧\80赶山，我带绝美女知青粮肉满仓\第1集.mp4" ^
-  --title "知青带粮肉闯山野！" ^
-  --out "C:\Users\唐唐\AppData\Local\Temp\cover_test"
+```powershell
+python drama_cover.py title --synopsis "<简介文字或.txt路径>" --out ./titles/
 ```
 
-产出：3 套标题 JSON + best_frame.jpg + 4 样式 jpg + html_cover.png
+**推荐方式**：Agent 读 `references/title-spec.md` 后直接在对话中调在线模型生成。CLI 里的 title 子命令主要输出规范路径指引，离线 Ollama 兜底可后续加。
 
-### 场景 B：用本地设计稿
+输出（Agent 在线生成）：3 个 JSON 对象，每个含 `version`（hit/revenge/legend）、`title`、`style_notes`。
 
-```bash
-python drama_cover.py full ^
-  --synopsis "同上" ^
-  --base-image "D:\我的设计稿\ep01_cover_v3.jpg" ^
-  --title "知青带粮肉闯山野！" ^
-  --out "./cover_out"
-```
+### 5.2 art-from-video
 
-### 场景 C：单步组合（最灵活）
-
-```bash
-# Step 1: 只生成标题，挑一个喜欢的
-python drama_cover.py title --synopsis "..." --out ./titles/
-
-# Step 2: 抽帧或自己找底图
-python drama_cover.py art-from-video --video ep1.mp4 --out ./art/
-
-# Step 3: 只合成 1 个样式
-python drama_cover.py compose-pillow --base ./art/best_frame.jpg --title "挑好的标题！" --out ./final.jpg --style classic_red_stroke
-
-# Step 4: 写剪映草稿
-python drama_cover.py write-draft --cover ./final.jpg --draft-dir "C:\Users\唐唐\AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft\80ganshan_ep01"
-```
-
----
-
-## 6. 子命令详解
-
-### 6.1 title（标题生成）
-
-**推荐方式（v2 架构）：Agent 直接生成**——把简介发给 Trae 在线模型（如 Qwen3.8-Max / GLM-5.3），按 `assets/title_prompts/s*.md` 的规范出 3 方案 × 3 版本，质量远超本地 7B，然后直接把选定标题传给 compose-pillow。
-
-```bash
-# 离线兜底方式（本地 Ollama qwen2.5:7b，质量有限）
-python drama_cover.py title --synopsis "<文字或.txt路径>" --out <输出目录>
-```
-
-输出文件：
-- `s1_taiyo.json` — 方案 1，3 条（爽文/敘事/傳奇）
-- `s2_coppie.json` — 方案 2，3 条
-- `s3_viral.json` — 方案 3，3 条
-- `summary.json` — 三份汇总
-
-> 7B 模型常见短板：简体混入（脚本 opencc 兜底转换）、本名泄漏、约束遗忘。正式投放建议用 Agent 在线生成。
-
-### 6.2 art-from-video（视频抽帧）
-
-```bash
-python drama_cover.py art-from-video --video <mp4> --out <输出目录>
-  [--scene-threshold 0.35]    # select 滤镜阈值，越低越严格
-  [--thumbnail-batch 500]    # thumbnail 候选帧数
-  [--fallback-time 3.0]      # 抽帧失败后回退固定秒数
+```powershell
+python drama_cover.py art-from-video --video <mp4> --out best_frame.jpg
+  [--scene-threshold 0.35]      # select 场景变化阈值
+  [--thumbnail-batch 500]       # thumbnail 候选帧数上限
+  [--fallback-time 3.0]         # 失败后回退固定秒数
 ```
 
 逻辑：
@@ -190,231 +198,214 @@ python drama_cover.py art-from-video --video <mp4> --out <输出目录>
 2. `thumbnail=n=500` 从剩余帧选颜色直方图最接近全片平均的
 3. 失败回退固定 3s 抽帧
 
-输出：`best_frame.jpg`
+### 5.3 compose-pillow
 
-### 6.3 compose-pillow（Pillow 排版）
-
-```bash
-python drama_cover.py compose-pillow --base <图片> --title "<标题>" --out <输出>
+```powershell
+python drama_cover.py compose-pillow --base <图片>
+  [--title "<标题>"]             # 不传则无标题模式
+  [--out cover.jpg]              # --style all 时为输出目录
+  [--size vertical|horizontal]   # 画布尺寸族，默认 vertical
   [--style classic_red_stroke|shadow_outline|neon_glow|bottom_tape|all]
 ```
 
-输出：
-- style=单个 → 指定 jpg
-- style=all → 输出目录下 4 个 jpg
+| --size | 画布 | 典型用途 |
+|--------|------|----------|
+| `vertical` | 1080×1920 | 剪映草稿封面（唯一写进 draft） |
+| `horizontal` | 2848×1600 | 平台发布缩略图 |
+| `all`（--style all） | 1 竖 + 3 横 | 批量出全套 |
 
-### 6.4 compose-html（HTML+Playwright 排版，可选）
+### 5.4 write-draft
 
-```bash
-python drama_cover.py compose-html --base <图片> --title "<标题>" --out <输出>
-  [--font-size 96]
-```
-
-需要 `pip install playwright && playwright install chromium`。不装也不影响 Pillow 结果。
-
-### 6.5 write-draft（写剪映草稿）
-
-```bash
+```powershell
 python drama_cover.py write-draft --cover <封面jpg> --draft-dir <草稿目录>
 ```
 
-直接覆盖 `<草稿目录>\draft_cover.jpg`。剪映运行时自动刷新缩略图，不用重启剪映。
+**剪映 5.9 正确做法——两阶段写入**：
 
-**草稿目录在哪找**：
 ```
-C:\Users\唐唐\AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft\<草稿名>\
-```
-
-### 6.6 full（一键全链路）
-
-```bash
-python drama_cover.py full --synopsis "<简介>"
-  [--video <mp4>]       # 视频抽帧
-  [--base-image <jpg>]  # 本地图片（优先级高于 --video）
-  [--title "<标题>"]     # 不传则合成时用占位
-  [--out <目录>]
-  [--pillow-style all]
+Step 1: 写 draft_cover.jpg（<草稿目录>\draft_cover.jpg）
+Step 2: 写原生 composition 结构（pipeline.py 已验证的正确做法）
+  ├── 复制封面图 → Resources/cover/<uuid>.<ext>
+  ├── materials.drafts 里建 type=composition 材质，内嵌 photo 视频段
+  └── 顶层 draft["cover"] 设为 {cover_draft_id, type:"image", sub_type:"local"}
 ```
 
-必须提供 `--video` 或 `--base-image` 至少一个。
+> **只写 draft_cover.jpg 不够**——剪映 5.9 打开草稿时若顶层 cover 字段为 None，会用第一帧覆盖它。
+
+### 5.5 full（一键全链路）
+
+```powershell
+python drama_cover.py full
+  [--video <mp4>]           # 视频抽帧（--base-image 优先级更高）
+  [--base-image <jpg>]      # 本地图片
+  [--title "<标题>"]         # 可选，不传则无标题
+  [--out ./cover_out]
+  [--draft-dir "<草稿目录>"] # 可选，传入后自动执行 write-draft
+```
 
 ---
 
-## 7. 底图三档方案
+## 6. 阶段 1：标题生成
 
-### ⭐ 方案 1：本地图片（0 成本，最推荐）
-```bash
-compose-pillow --base design.jpg
-full --base-image design.jpg
-```
-直接用你自己 P 的、淘宝买的、或之前积累的素材图。
+**核心规范文件**：`references/title-spec.md`（项目实战版 v4.1，Agent 读了之后自己在会话中调 LLM）
+**配套文件**：`references/scorecard.md`（七维评分）、`references/failure-cases.md`（翻车案例与台账）
 
-### ⭐ 方案 2：ffmpeg 视频抽帧（0 成本，默认）
-```bash
-art-from-video --video ep1.mp4
-full --video ep1.mp4
-```
-从视频里自动选最有代表性的帧。适合批量，零积分消耗。
+**产出结构**：3 方案（S1 taiyo / S2 coppie / S3 viral）× 4 版本 = **12 条标题**
 
-### 方案 3：Trae 内置 GenerateImage（消耗 Trae 月积分）
-**Agent 侧调用，脚本不直接调**：
+### → 阶段 1 → 阶段 2 衔接（强制用户选择门禁）
 
-```
-run_mcp:
-  server: integrated_default
-  tool: GenerateImage
-  args:
-    prompt: "Drama cover base image: 1980s Chinese village, sunset, film grain"
-    path: "C:\Users\唐唐\AppData\Local\Temp\cover_test\ai_base"
-    image_size: "portrait_16_9"   # 1440x2560
-```
+阶段 1 产出 12 条，阶段 2 只消费 3 条：
 
-生成后文件在 `<path>.jpg`，再走方案 1 合成。
-
-**积分政策**：Trae 每月免费 500 积分，新用户注册一次性 4000。GenerateImage 每次约 5-10 积分。97 集全 AI 生图可能不够，建议挑前 10 集精品化，其余用方案 2。
-
----
-
-## 8. 标题生成三方案（v2 新規範）
-
-每个方案输出 **3 条**，对应三版本。三方案差异化定位 + 共享同一套三版本定义。
-
-### 三版本定义（v2 定稿：张力 + 爆点 + 80 字上限）
-
-| 版本 | 定义 | 要点 |
-|------|------|------|
-| **爽文版** | 長句爆點打臉鉤子 | 第一人称「我」（「老子」可选变体，≤2次），**≤80 字**连环爆点，**打脸对象必须锁定样本核心冲突的当事方**（如「逼我加錢的那家人」），禁止泛化成「看不起我的人」，報應式收尾 |
-| **敘事版** | 寫實熱血・加爆點鉤子 | **第三人称**（与爽文版区分），处境→觉醒→行动→成果写实铺陈，**必须埋社会压力钩**（全村看笑话）做首尾呼应，**≤80 字** |
-| **傳奇版** | 人倫衝突・結局對比・戲劇張力收尾 | 人伦冲突排比（踩我的、笑我的、悔婚的）+ 结局对比（当初 vs 日后），反诘式收尾（「日後又有何臉低頭、悔不當初？」），**≤80 字** |
-
-### 張力手法（強制）
-
-| 手法 | 要求 | 禁用 |
-|------|------|------|
-| 動詞烈度 | 撕得粉碎/殺進/狂攬/殺成傳奇/一箭放倒 | 撕了/賺了/成了 |
-| 數字誇飾 | 三百斤野豬**王**（标杆示例同款） | —— |
-| 懸念鉤 | 「沒人知道我覺醒了什麼——XXX只是開胃菜」 | 平铺系统功能 |
-| 打臉烈度 | 悔到抬不起頭/連背影都追不上/還敢開口嗎 | 三方案同一收尾 |
-| 反差對撞 | 絕境vs翻盤、笑柄vs仰望、窮酸vs傳奇 | 单线无对比 |
-
-> v1 的「傳奇版玄奇懸念」保留为可选变体，适合 A/B 测试。
+1. 生成 12 条后以 T1—T12 平铺编号呈现，**停下等用户选择**
+2. 用户每次回一个编号，依次为封面1/2/3 各选 1 条；也可一次给三个编号，或自主提供 3 条自定义标题
+3. Agent **不得代选、不得自动进入阶段 2**
+4. 3 条标题按**封面位**映射 3 张横版封面（封面1 → 爆点构图 / 封面2 → 冷暖对比 / 封面3 → 守护挡身），与标题所属版本无关；版4 被选中时沿用对应封面位构图
 
 ### 三方案差异化
 
-| 方案 | 侧重 | 灵感来源 |
-|------|------|----------|
-| **S1 taiyo** | 身份反差 / 数字冲击（30岁保姆竟是首富亲生女、三百斤野猪） | taiyo 12 公式 |
-| **S2 coppie** | 情感驱动 + 冲突对比，主角行动果决 | CoppieGPT 232 模板 |
-| **S3 viral** | 好奇心缺口 + 社会认同（读者代入被羞辱→逆袭情绪曲线） | Viral 22 心理学 |
+| 方案 | 策略 | 系列特征 |
+|------|------|---------|
+| **S1 taiyo** | 身份反差 · 数字冲击 | 重「数字与资产」 |
+| **S2 coppie** | 情感驱动 · 冲突对比 | 重「恩怨情感对撞」 |
+| **S3 viral** | 好奇缺口 · 社会认同 | 重「群体反应与身份反转」 |
 
-### 硬规则（所有方案）
-- **≤80 字**（含标点，50-80 区间）
-- **全繁體**，一个简体字都不能有（團夥 not 團伙）
-- **无本名**：所有人名替换为身份称谓（他/女方/那家人/女知青/穷猎户）
-- **不擅自增改剧情**：样本没有的元素不能加，有的要强化（「野豬王」式夸饰允许）
-- 纯文字，无 emoji/hashtag/markdown
-- 禁用词：你知道吗/来看看/震惊/天哪/最/第一/顶级/唯一/必看/赶紧/你猜到了吗
-- Step 0 预处理：先圈人名和核心冲突，再动笔
+### 四版本定义
+
+#### 版1｜爽文①·先抑後揚·抓馬現場打臉線
+開頭踩慘劇/絕境鉤 → 重生/覺醒當場反擊 → 暴富/異能誇張展現 → 現場打臉反派 → 誇張幸福/成就結尾。走即時狗血、當場羞辱路線。
+
+#### 版2｜爽文②·先抑後揚·前世回溯雪恥線
+前世/前史慘狀深度回溯 → 開掛翻盤 → 複仇/奪業打臉 → 「連本帶利討回一切/不讓悲劇重演」收尾。與①拉開差異：①重現場即時打臉，②重積累回溯雪恥。
+
+#### 版3｜傳奇版·專屬狠反問·兩套默認範式
+**誅心戳背叛款**：緊扣背叛/構陷細節，戳破對方「兄弟/情義」偽裝，直擊道德痛點。
+**霸氣守山款**：以主角地位/地盤/實力為核心，踩對方「不配入門/分一杯羹」，凸顯地位碾壓。
+
+#### 版4｜機制版·不绑构图
+从八族技法池（数字资产反差 / 关键物件聚焦 / 结局倒叙 / 身份体面反差 / 价值情绪反转 / 群体社会反应 / 悬念信息缺口 / 处境痛点点名）中取 1 族 + 至多 1 个次机制，结尾仍走打脸四式。三格族不重复，字数同 60-80。
+
+### 硬规则（详见 references/title-spec.md）
+- **素材边界（最高纪律）**：只用简介原文元素；夸张只允许 5 个白名单维度（异能画面/财富堆砌/贵人态度/社会反应/地位碾压）；禁止编造剧情事件（背叛方式/牢狱/死因/反派下场）
+- 繁體字、第三人稱「他」；禁用主角本名，不擅自增改劇情
+- 每条 60-80 字（版3 反问句 55-70）；爆点 ≥5 个呈递进链
+- 开头用钩子手法（5 种之一），结尾用打脸四式（之一）
+- 每条出稿前过 12 项质检清单
 
 ---
 
-## 9. Pillow 四样式
+## 7. 阶段 2：Pillow 封面合成
 
-改 `assets/compose_styles/pillow_styles.json` 调参数，不用改 Python 代码：
+### 4 样式（改 `assets/compose_styles/pillow_styles.json` 调参数）
 
 | 样式 | 视觉 | 适用 |
 |------|------|------|
-| **classic_red_stroke** | 8px 红描边 + 白字 + 底部黑蒙版 | 抖音主流，万能 |
-| **shadow_outline** | 多层偏移阴影 + 暖白大字 + 深蒙版 | 年代剧/虐恋 |
-| **neon_glow** | 粉色光晕描边 + 白字 + 浅蒙版 | 都市/甜宠 |
-| **bottom_tape** | 底部红布条 + 黑描边白字 | 爽文/逆袭 |
+| **classic_red_stroke** | 8px 红描边 + 白字 + 底部渐变黑蒙版 | 版 1 爽文①·抓马现场打脸 |
+| **shadow_outline** | 多层偏移阴影 + 暖白大字 + 深蒙版 | 版 2 爽文②·前世回溯雪耻 |
+| **neon_glow** | 粉色光晕描边 + 白字 + 浅蒙版 | 都市/甜宠（横版可选） |
+| **bottom_tape** | 底部红布条 + 黑描边白字 | 版 3 传奇版·狠反问 / 竖版默认 |
 
-画布固定 1080×1920，标题宽度上限 0.82（886px），自动换行不超过 3 行。
+### 画布参数
 
----
-
-## 10. 批量处理
-
-### 97 集全视频抽帧（零成本）
-
-```powershell
-$outDir = "C:\Users\唐唐\AppData\Local\Temp\ganshan_covers"
-$videoDir = "D:\短剧\80赶山，我带绝美女知青粮肉满仓"
-$draftRoot = "C:\Users\唐唐\AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft"
-
-$videos = Get-ChildItem $videoDir -Filter "*.mp4" | Sort-Object Name
-foreach ($v in $videos) {
-    $epNum = [regex]::Match($v.Name, '(\d+)').Groups[1].Value
-    $draftDir = Join-Path $draftRoot "80ganshan_ep$($epNum.PadLeft(2,'0'))"
-    $epOut = Join-Path $outDir "ep$($epNum.PadLeft(2,'0'))"
-
-    python drama_cover.py full `
-      --synopsis "知青为了活下去，带着粮肉和一群敢打敢拼的兄弟，在深山老林里扎了根，却意外惹上了当地地头蛇。" `
-      --video $v.FullName --title "知青带粮肉闯山野！" --out $epOut
-
-    # 自动写草稿
-    $cover = Join-Path $epOut "composed\classic_red_stroke.jpg"
-    if (Test-Path $cover -and (Test-Path $draftDir)) {
-        python drama_cover.py write-draft --cover $cover --draft-dir $draftDir
-        Write-Output "ep$epNum done ✓"
-    }
+```json
+{
+  "vertical":   { "width": 1080,  "height": 1920 },
+  "horizontal": { "width": 2848, "height": 1600 }
 }
 ```
 
-### 推荐策略（成本控制）
+### 自动换行
 
-| 范围 | 底图方案 | 积分消耗 |
-|------|----------|----------|
-| 前 10 集（精品） | GenerateImage | ~50-100 积分 |
-| 11-97 集（量产） | ffmpeg 抽帧 | 0 |
+标题自动换行不超过 3 行，字号按画布宽度比例估算（竖版 W/14、横版 W/10）。
+
+### 无标题模式
+
+`--title` 不传时，底图直接覆盖裁切，不画蒙版也不画标题——适合后期叠字或纯视觉封面。
 
 ---
 
-## 11. 常见问题
+## 8. 阶段 3：剪映草稿写入
 
-### Q: Ollama 检测不到怎么办？
-脚本会三重检测：`which ollama` + `OLLAMA_HOST` 环境变量 + 11434 端口。只要 Ollama 服务在跑（D:\AI_Deps\Ollama\ollama serve 或已启动 Ollama App）就能识别。可手动验证：
-```powershell
-Invoke-RestMethod http://127.0.0.1:11434/api/tags | ConvertTo-Json
+### 正确做法（两阶段）
+
 ```
+写 draft_cover.jpg          ← 让剪映缩略图立刻显示
+写原生 composition 结构      ← 防止剪映 5.9 用第一帧覆盖 draft_cover.jpg
+```
+
+两个步骤合并在 `set_draft_cover()` + `set_cover_composition()` 里，`write-draft` 子命令自动调用。
+
+### ffmpeg 抽帧（art-from-video / set_draft_cover）
+
+`select=gt(scene,0.35),thumbnail=n=500` 双层筛选——select 先筛掉静止帧，thumbnail 从候选里挑颜色直方图最接近全片平均的，避开片头黑场/模糊帧/logo 帧。
+
+### 辅助能力（其他脚本可消费）
+
+| 函数 | 作用 | 消费者 |
+|------|------|--------|
+| `detect_cover_from_dir(dir)` | 从剧集目录自动探测封面（封面.png → 目录下第一张图） | batch_runner.py |
+| `extract_at_conflict_point(video, conflict_time_s, peak_json_path)` | 从音频冲突点精确抽帧 | save_covers.py / 任意分析脚本 |
+| `_cover_start_for_cut(video_path, cut_us)` | 裁点对应的封面分析起点（避免抽到被裁掉的开头） | pipeline.py 裁片流程 |
+
+---
+
+## 9. 与 pipeline 集成
+
+### pipeline.py
+
+```python
+# 自动注入 skill 路径并导入（pipeline.py 顶部）
+_dcb_scripts = os.path.join(_REPO_ROOT, ".trae", "skills",
+                            "drama-cover-builder", "scripts")
+sys.path.insert(0, _dcb_scripts)
+from drama_cover import (
+    set_draft_cover,
+    set_cover_composition,
+    _cover_start_for_cut,
+)
+```
+
+pipeline 保留 `gen_uuid()`（被 28+ 非封面调用），skill 内部自己 `import uuid` 定义独立版本，两者互不依赖。
+
+### batch_runner.py
+
+```python
+import drama_cover as _dc
+
+# 封面自动探测（原 17 行内联代码 → 1 行 skill 调用）
+found = _dc.detect_cover_from_dir(series_dir)
+```
+
+### 三种封面来源（pipeline 内部解耦）
+
+```
+1) skill 生成  →  用户手动调 compose-pillow → 产物路径传给 pipeline
+2) 本地图片   →  --cover-image 参数
+3) ffmpeg 抽帧 →  skill 的 set_draft_cover(extract_from_video=...)
+```
+
+pipeline 只管消费，不关心来源。
+
+---
+
+## 10. 常见问题
+
+### Q: 为什么有两个 gen_uuid？
+pipeline.py 里的 `gen_uuid()` 被创建草稿、轨道 ID、片段 ID、demucs 路径生成等 28+ 处非封面代码调用，不能删。skill 里自己定义一份独立版本，两者互不依赖。
+
+### Q: write-draft 为什么要写原生 composition？
+**只覆盖 draft_cover.jpg 不够**——剪映 5.9 打开草稿时若顶层 `cover` 字段为 None，会用视频第一帧覆盖掉 draft_cover.jpg。必须同时建 composition 材质并挂到 `materials.drafts` + 设置顶层 `cover` 字段。
+
+### Q: SKILL.md 放哪？
+项目内 `.trae/skills/drama-cover-builder/SKILL.md`（跟 `.trae/skills/jianying-editor/` 平级）。Phase 1 决定理由：两个 skill 都服务这个短剧 pipeline，项目内 scope 路径清晰。
+
+### Q: 离线 Ollama 有用吗？
+7B 模型常见短板：简体混入、本名泄漏、约束遗忘。阶段 1 标题生成建议用 Agent 在线调 Trae 模型（Qwen3.8-Max / GLM-5.3），质量远超本地 7B。Ollama 离线兜底可后续加。
 
 ### Q: 中文字体缺字形？
-脚本默认 `msyhbd.ttc`（微软雅黑粗体），找不到回退 DejaVuSans（全英文）。候选列表在 `_guess_font()` 里，可扩展。
+默认 `msyhbd.ttc`（微软雅黑粗体），候选列表：msyhbd → msyh → simhei → simsun，都找不到回退 DejaVuSans（全英文）。
 
-### Q: ffmpeg 路径问题？
-脚本自动注入：
-1. `D:\AI_Deps\tools\ffmpeg\bin`（AI_Deps 根目录）
-2. WinGet 默认路径
-3. PATH 里
-
-### Q: 剪映草稿目录在哪找？
-```
-C:\Users\唐唐\AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft\<草稿名>\
-```
-草稿目录下必须有 `draft_cover.jpg`，write-draft 直接覆盖它。剪映运行时自动刷新，**不用重启剪映**（2026-10-22 实测确认）。
-
-### Q: 为什么不直接用 volcengine SDK AI 生图？
-火山方舟 Seedream 5.0 lite 按量付费，Trae 内置 GenerateImage 每月免费 500 积分足够日常用。volcengine SDK 代码保留在 `cmd_art_from_ai` 里，有付费 Key 就能启用。
-
-### Q: 为什么不 pull Ollama stable-diffusion？
-Ollama 图像生成是 macOS MLX 独占功能，Windows 和 Linux Coming Soon。`ollama pull stable-diffusion` 报 `file does not exist`，`pull x/z-image-turbo` 报 `MLX runtime is not available`。
-
-### Q: compose-html 报错 BrowserType.launch 失败？
-Playwright 浏览器未安装。修：
-```powershell
-pip install playwright
-playwright install chromium
-```
-
-### Q: title 子命令输出全是"待 Trae 在线生成"？
-Ollama 服务没启动。启动 D:\AI_Deps\Ollama\ollama.exe 或 Ollama App 后重试。
-
-### Q: SKILL.md frontmatter 里 description 有啥规则？
-- 不能有 `: `（冒号空格）
-- 不能有 `<` `>`
-- 不能有 `TODO`
-- 要包含做什么 + 什么时候用 + 不什么时候用
-- 不超过 200 字符
+### Q: ffmpeg 路径？
+三重查找：PATH `which ffmpeg` → `D:\AI_Deps\tools\ffmpeg\bin` → WinGet 路径。
 
 ---
 
@@ -422,7 +413,5 @@ Ollama 服务没启动。启动 D:\AI_Deps\Ollama\ollama.exe 或 Ollama App 后�
 
 | 日期 | 版本 | 改动 |
 |------|------|------|
-| 2026-10-23 | 环境更新 | Ollama 迁移 D:\AI_Deps\Ollama；torch 换 CUDA 版（demucs GPU 加速 42x）；新增 audio-separator 0.47.1 备用；numpy 定版 2.2.4 / pillow 定版 13.0；funasr-onnx、moviepy METADATA 过时 pin 补丁 |
-| 2026-10-22 | Phase 2 最终版 | 默认 A1 抽帧 + 本地图支持；GenerateImage 走 Agent MCP；Ollama SD 废弃；volcengine 降可选 |
-| 2026-10-22 | Phase 1 修复版 | Ollama 端口三重检测；Seedream model ID 修正（doubao-seedream-5-0-260128）；Ollama SD base64 解码；Playwright 优雅降级 |
-| 2026-10-22 | Phase 1 初版 | 全链路跑通，title/art-from-video/compose-pillow/write-draft/full |
+| 2026-10-27 | v1.0 | 按最新架构重写：skill 作为三阶段独立模块、标题规范换成 v3（版1 爽文①/版2 爽文②/版3 传奇版狠反问）、Pillow 新增横版 2848×1600 尺寸族、write-draft 改为原生 composition 正确做法、pipeline.py / batch_runner.py 已接入 skill |
+| 2026-10-22 | Phase 2 最终版 | 旧版（仅为设计蓝图，脚本本体从未落地） |
