@@ -5,7 +5,7 @@ description: 剪映 pipeline 任务的桌面通知模块与 Watcher 守护进程
 
 # Task Notifier
 
-> 本 Skill 是 **"后台长任务通知"** 的统一入口。核心代码已在 `scripts/utils/notifier.py` 和 `scripts/utils/watcher.py`，本文件只描述 **Agent 如何路由到此 Skill、如何正确调用、以及与 batch_runner / auto_exporter 的联合调用 SOP**。
+> 本 Skill 是 **"后台长任务通知"** 的统一入口。核心代码已在 `scripts/utils/notifier.py` 和 `scripts/utils/watcher.py`，本文件只描述 **Agent 如何路由到此 Skill、如何正确调用、以及与 batch_runner / robust_auto_export 的联合调用 SOP**。
 >
 > ⚠️ **Agent 侧行为约定**（如"收到 task_notification 后第一条输出必须是短通知"）**不在此维护**，已写入 project_memory Hard Constraints，由 Agent 自动继承。
 
@@ -87,7 +87,7 @@ python scripts/utils/watcher.py --dir <workdir> --once
 |---|---|---|
 | 🎬 | batch_runner 业务结果 | "🎬 串流草稿已就绪 · notify_v2 第02集（1 集）" |
 | 🎬 | batch_runner 批量模式 | "🎬 批量制作完成 · 成功 78 集, 失败 2 集" |
-| 📤 | auto_exporter 导出 | "📤 导出成功 / 📤 导出失败" |
+| 📤 | robust_auto_export 导出 | "📤 导出进行中 / 📤 导出成功"（失败只写 progress json，不弹 toast） |
 | 👁️ | watcher 状态变化（聚合） | "👁️ 状态: done · 第1-10集 → done (10)" |
 | 👁️ | watcher 心跳进度 | "👁️ 进度（仍在跑）· 已完成 5/78 集" |
 | 👁️ | watcher 汇总 | "👁️ 全部终态 · done=78 \| failed=0" |
@@ -119,13 +119,14 @@ python scripts/utils/watcher.py --dir <workdir> --interval 3
 
 用户说"再查一次"时用 `--once`。
 
-### SOP 3：auto_exporter（已有 toast，无需 watcher）
+### SOP 3：robust_auto_export（已有 toast，无需 watcher）
 
 ```bash
-python .trae/skills/jianying-editor/scripts/auto_exporter.py "草稿名" "output.mp4" --res 1080
+python .trae/skills/jianying-editor/examples/robust_auto_export.py "草稿名" "output.mp4" --move
 ```
 
-auto_exporter 内置成功/失败 toast，导出场景不需要 watcher。
+robust_auto_export 在导出中/成功时弹 toast；失败不弹（原因写进 `<剧名>.progress.json` 的 `errors`），导出场景不需要 watcher。
+`scripts/auto_exporter.py` 是 98 行薄壳（仅调 `pyJianYingDraft.export_draft`），**没有 toast**，不要用它做通知。
 
 ---
 
@@ -151,7 +152,7 @@ plyer (pip install plyer)
 notifier.py (优先 plyer，无 plyer → 降级 NotifyIcon)
   ↑ 被调用
   ├── batch_runner.py (串流/批量完成点)
-  ├── auto_exporter.py (导出成功/失败)
+  ├── robust_auto_export.py (导出进行中/成功)
   ├── watcher.py (状态变化/汇总)
   └── 其他未来接入脚本
 ```
@@ -183,6 +184,6 @@ notifier.py (优先 plyer，无 plyer → 降级 NotifyIcon)
 | [batch_runner.py](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\pipeline\batch_runner.py#L200-L201) | `_toast("🎬 串流草稿已就绪", ...)` | 单草稿串流模式完成 | ✅ 多次验证 |
 | [batch_runner.py](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\pipeline\batch_runner.py#L273) | `_toast("🎬 批量制作完成", ...)` | 多草稿批量模式全部结束 | ✅ |
 | [batch_runner.py](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\pipeline\batch_runner.py#L109-L126) | `--watch` 参数 | 自动后台启动 watcher 守护进程 | ✅ |
-| [auto_exporter.py（skill 版）](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\.trae\skills\jianying-editor\scripts\auto_exporter.py#L238-L255) | `_toast("📤 导出成功/失败", ...)` | 导出成功、校验失败、参数错、异常 | ✅ 验证过 success + os bug 修复 |
-| [auto_exporter.py（项目版）](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\scripts\auto_exporter.py#L121-L124) | `toast("📤 导出成功/失败", ...)` | 同 skill 版（独立维护的副本） | ✅ |
+| [robust_auto_export.py（skill 版）](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\.trae\skills\jianying-editor\examples\robust_auto_export.py#L759) | `_toast_safe("📤 导出进行中", ...)` / `_toast_safe("📤 导出成功", ...)` | 导出中每 5 分钟一次进度、成功一次 | ✅ |
+| [auto_exporter.py（项目版）](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\scripts\auto_exporter.py#L121-L124) | `toast("📤 导出成功/失败", ...)` | 项目根 scripts 下的独立副本（skill 版已回退为无 toast 薄壳） | ✅ |
 | [watcher.py](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\scripts\utils\watcher.py#L155-L168) | `toast("👁️ 状态/全部终态", ...)` | 集结束 + 全部终态自动退出 | ✅ 生命周期测试通过 |

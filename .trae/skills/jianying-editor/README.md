@@ -115,8 +115,8 @@ playwright install chromium
 
 
 ### 2. 确认剪映安装位置
-Skill 默认认为您的剪映安装在 C 盘默认位置：
-`C:\Users\Administrator\AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft`
+Skill 默认按 `%LOCALAPPDATA%` 自动探测剪映草稿目录：
+`%LOCALAPPDATA%\JianyingPro\User Data\Projects\com.lveditor.draft`
 
 **如果您的剪映安装在 D 盘或其他位置**，请在使用时直接告诉 AI：
 > "我的剪映草稿目录在 D:\JianyingPro\..."

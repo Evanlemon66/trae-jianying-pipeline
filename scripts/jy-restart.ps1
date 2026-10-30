@@ -1,9 +1,26 @@
 param(
     [string]$DraftName,
-    [string]$JyExe = "D:\剪映5.9\剪映5.9版+jianying-skill\剪映5.9(win+mac)\剪 映5.9Windows\JianyingPro\5.9.0.11632\JianyingPro.exe"
+    [string]$JyExe = ""
 )
 
-$draftDir = Join-Path $env:USERPROFILE "AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft"
+if (-not $JyExe) {
+    # 剪映可执行文件：JY_JIANYING_DIR → %LOCALAPPDATA% 常见安装位置
+    $candidates = @()
+    if ($env:JY_JIANYING_DIR) { $candidates += (Join-Path $env:JY_JIANYING_DIR "JianyingPro.exe") }
+    $candidates += (Join-Path $env:LOCALAPPDATA "JianyingPro\Apps\JianyingPro.exe")
+    $candidates += (Join-Path $env:USERPROFILE "AppData\Local\JianyingPro\Apps\JianyingPro.exe")
+    $JyExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $JyExe) {
+        Write-Host "[ERROR] JianyingPro.exe not found; pass -JyExe or set JY_JIANYING_DIR" -ForegroundColor Red
+        exit 1
+    }
+}
+
+$draftDir = if ($env:JY_PROJECTS_ROOT) {
+    $env:JY_PROJECTS_ROOT
+} else {
+    Join-Path $env:LOCALAPPDATA "JianyingPro\User Data\Projects\com.lveditor.draft"
+}
 
 if (-not (Test-Path $draftDir)) {
     Write-Host "[ERROR] draft dir not found: $draftDir" -ForegroundColor Red

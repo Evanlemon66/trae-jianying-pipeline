@@ -28,13 +28,10 @@ def get_default_drafts_root() -> str:
             )
         )
 
-    fallback = (
-        "C:/Users/Administrator/AppData/Local/JianyingPro/User Data/Projects/com.lveditor.draft"
-    )
     for path in candidates:
         if os.path.exists(path):
             return path
-    return candidates[0] if candidates else fallback
+    return candidates[0] if candidates else ""
 
 
 def get_all_drafts(root_path: str = None) -> List[Dict]:
