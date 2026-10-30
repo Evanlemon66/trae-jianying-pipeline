@@ -60,6 +60,7 @@ _work/
 # 系统文件
 .DS_Store
 Thumbs.db
+@AutomationLog.txt
 
 # 打包文件
 *.zip

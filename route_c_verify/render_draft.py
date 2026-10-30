@@ -30,7 +30,24 @@ DRAFT_JSON = os.path.join(
     "JianyingPro", "User Data", "Projects", "com.lveditor.draft",
     "pipe_v3_final", "draft_content.json",
 )
-FONT_SRC = r"D:/剪映5.9/剪映5.9版+jianying-skill/剪映5.9(win+mac)/剪映5.9Windows/JianyingPro/5.9.0.11632/Resources/Font/SystemFont/zh-hans.ttf"
+
+
+def _resolve_font_src() -> str:
+    """剪映自带字体（zh-hans.ttf）：JY_JIANYING_DIR → 系统中文字体兜底，找不到返回空串。"""
+    jy_dir = os.environ.get("JY_JIANYING_DIR", "").strip()
+    if jy_dir:
+        p = os.path.join(jy_dir, "Resources", "Font", "SystemFont", "zh-hans.ttf")
+        if os.path.isfile(p):
+            return p
+    fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    for name in ("msyh.ttc", "msyhbd.ttc", "simhei.ttf"):
+        p = os.path.join(fonts, name)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+FONT_SRC = _resolve_font_src()
 
 CANVAS_W, CANVAS_H = 1080, 1920
 FONT_K = 3.0            # 普通文字(复合片段内): 像素字高 = size * 3.0（封面实测校准）

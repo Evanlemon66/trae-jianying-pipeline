@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import pyJianYingDraft as draft
+from utils.config import resolve_jianying_dir
 
 class MockVideoMaterial(draft.VideoMaterial):
     def __init__(self, material_id, duration, name, path):
@@ -57,7 +58,11 @@ class MockingOpsMixin:
             all_effects = materials.setdefault("effects", [])
 
             PROP_MAP = {"KFTypeBrightness": "brightness", "KFTypeContrast": "contrast", "KFTypeSaturation": "saturation"}
-            jy_res_path = "C:/Program Files/JianyingPro/5.9.0.11632/Resources/DefaultAdjustBundle/combine_adjust"
+            # 调色影子素材指向剪映自带的调色资源包：安装目录由配置/注册表推导，不写死
+            jy_res_path = "Resources/DefaultAdjustBundle/combine_adjust"
+            jy_dir = resolve_jianying_dir()
+            if jy_dir:
+                jy_res_path = os.path.join(jy_dir, jy_res_path).replace("\\", "/")
 
             for track in data.get("tracks", []):
                 for seg in track.get("segments", []):

@@ -12,7 +12,8 @@
     - whisper 兜底模型分级: 显存>=12G -> large-v3-turbo；>=6G -> medium；>=3G -> small；
       >=1.5G -> base；纯 CPU 内存>=16G -> small(int8)；>=8G -> base；更低 -> tiny
     - ASR 链路固定: 云端(videocaptioner) -> 本地 Paraformer(int8, CPU) -> faster-whisper(分级)
-  所有工具/模型/缓存统一放 -DepsRoot（默认 D:\AI_Deps），并写入用户级环境变量：
+  所有工具/模型/缓存统一放 -DepsRoot（未指定时依次读 JY_DEPS_ROOT -> presets.json 的 deps_root
+  -> 兜底 D:\AI_Deps），并写入用户级环境变量：
     HF_HUB_CACHE / TORCH_HOME / OLLAMA_MODELS / PATH(ffmpeg) / pip cache-dir
   每次运行都会在 pipeline\_env_profile.json 写入机器画像，pipeline 运行时据此选择
   whisper 模型/设备；-DetectOnly 只探测+写画像，不安装任何组件。
@@ -23,7 +24,7 @@
   powershell -ExecutionPolicy Bypass -File pipeline\install_deps.ps1 -TorchChannel cpu -SkipOllama
 #>
 param(
-    [string]$DepsRoot = "D:\AI_Deps",
+    [string]$DepsRoot = "",
     [ValidateSet("auto","cu126","cu118","cpu")] [string]$TorchChannel = "auto",
     [string]$OllamaModel = "auto",            # auto / qwen3:8b / qwen3:14b / ... / none
     [ValidateSet("auto","tiny","base","small","medium","large-v3-turbo")]
@@ -97,13 +98,24 @@ $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemor
 Ok "RAM: ${ramGB}GB"
 $summary += "RAM: ${ramGB}GB"
 
-# --- 依赖根目录（D 盘不存在时回退 C 盘）---
+# --- 依赖根目录：-DepsRoot 参数 -> JY_DEPS_ROOT -> presets.json deps_root -> 兜底 D:\AI_Deps ---
+$presetFile = Join-Path $PSScriptRoot "presets.json"
+$presetDeps = $null
+if (Test-Path $presetFile) {
+    try {
+        $presetCfg = Get-Content -Path $presetFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($presetCfg.deps_root) { $presetDeps = [string]$presetCfg.deps_root }
+    } catch { Warn "presets.json 解析失败，忽略其中的 deps_root" }
+}
+if (-not $DepsRoot) { $DepsRoot = $env:JY_DEPS_ROOT }
+if (-not $DepsRoot) { $DepsRoot = $presetDeps }
+if (-not $DepsRoot) { $DepsRoot = "D:\AI_Deps" }
+if ($presetDeps -and ($DepsRoot -ne $presetDeps)) {
+    Warn "本次 DepsRoot=$DepsRoot 与 presets.json deps_root=$presetDeps 不一致，请同步（否则运行时仍按配置找工具）"
+}
 if ($DepsRoot -like "D:\*" -and -not (Test-Path "D:\")) {
     Warn "本机没有 D 盘，DepsRoot 回退为 C:\AI_Deps"
     $DepsRoot = "C:\AI_Deps"
-}
-if ($DepsRoot -ne "D:\AI_Deps") {
-    Warn "DepsRoot=$DepsRoot 不是 D:\AI_Deps：pipeline.py 中 PARAFORMER_DIR 等常量硬编码 D:\AI_Deps，装完需同步修改或建目录联接"
 }
 Ok "DepsRoot: $DepsRoot"
 $summary += "DepsRoot: $DepsRoot"
@@ -459,7 +471,7 @@ for exe in ["ffmpeg", "ffprobe"]:
     if not p: bad += 1
 import torch
 print(f"  torch.cuda.is_available() = {torch.cuda.is_available()}")
-para = os.environ.get("PARA_HOME", r"D:\AI_Deps\models\paraformer")
+para = os.environ.get("PARA_HOME", "")
 for rel in [r"iic_onnx\model_quant.onnx", r"iic_onnx\tokens.txt", r"iic_onnx\am.mvn", r"iic_onnx\config.yaml",
             r"vad_onnx\model_quant.onnx", r"vad_onnx\am.mvn", r"vad_onnx\config.yaml"]:
     p = os.path.join(para, rel)
@@ -478,7 +490,7 @@ if prof:
     print(("  [OK] " if ok else "  [MISS] ") + f"demucs 权重缓存 ({len(ckpts)} 个文件, {torch.hub.get_dir()})")
     bad += 0 if ok else 1
     wm = (prof.get("whisper") or {}).get("model", "base")
-    hf = os.environ.get("HF_HUB_CACHE", r"D:\AI_Deps\models\huggingface\hub")
+    hf = os.environ.get("HF_HUB_CACHE", "")
     wdir = os.path.join(hf, f"models--Systran--faster-whisper-{wm}")
     ok = os.path.isdir(wdir)
     print(("  [OK] " if ok else "  [WARN] ") + f"whisper {wm} 缓存" + ("" if ok else "（未预热，首次兜底时自动下载）"))

@@ -23,6 +23,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -125,13 +126,84 @@ def _run_pipeline(series_dir: str, slug: str, overrides: dict | None = None) -> 
     return proc.returncode == 0
 
 
+def _preclean_bundles(draft_name: str, out_dir: str, keep_target: bool = False) -> None:
+    """导出前清掉上轮残留：删除不含成品 mp4 的「剧名」目录和「剧名(1)/(2)…」去重目录。
+
+    目标目录必须在导出前不存在，剪映才会直接写进「剧名」目录，而不是编号成「剧名(1)」。
+    keep_target=True 时保留目标目录本身（失败收尾用，保留 stall 截图等诊断文件）。
+    """
+    out_dir = os.path.abspath(out_dir)
+    safe = os.path.basename(out_dir)
+    parent = os.path.dirname(out_dir)
+    if not os.path.isdir(parent):
+        return
+    for name in os.listdir(parent):
+        p = os.path.join(parent, name)
+        if not os.path.isdir(p):
+            continue
+        if name != safe and not name.startswith(safe + "("):
+            continue
+        if keep_target and os.path.abspath(p) == out_dir:
+            continue
+        has_mp4 = any(f.lower().endswith(".mp4") for _r, _d, fs in os.walk(p) for f in fs)
+        if has_mp4:
+            print(f"  ⚠️ 保留含成品的目录: {p}")
+            continue
+        shutil.rmtree(p, ignore_errors=True)
+        print(f"  🧹 清理上轮残留目录: {p}")
+
+
+def _consolidate_bundle(draft_name: str, out_mp4: str) -> None:
+    """导出后归拢：封面缺失时从兄弟目录抢救，清掉空壳去重目录，保证 mp4/封面/进度文件同目录。"""
+    out_dir = os.path.dirname(os.path.abspath(out_mp4))
+    safe = os.path.splitext(os.path.basename(out_mp4))[0]
+    cover = os.path.join(out_dir, safe + "-封面.jpg")
+    parent = os.path.dirname(out_dir)
+    if not os.path.isdir(parent):
+        return
+    if os.path.isfile(out_mp4) and not os.path.isfile(cover):
+        for name in os.listdir(parent):
+            p = os.path.join(parent, name)
+            if not os.path.isdir(p) or os.path.abspath(p) == out_dir:
+                continue
+            if not name.startswith(safe):
+                continue
+            found = None
+            for f in os.listdir(p):
+                if "封面" in f and f.lower().endswith((".jpg", ".jpeg", ".png")):
+                    found = os.path.join(p, f)
+                    break
+            if found:
+                shutil.move(found, cover)
+                print(f"  🖼️ 封面已归位: {cover}")
+                break
+    for name in os.listdir(parent):
+        p = os.path.join(parent, name)
+        if not os.path.isdir(p) or os.path.abspath(p) == out_dir:
+            continue
+        if not name.startswith(safe):
+            continue
+        if any(f.lower().endswith(".mp4") for _r, _d, fs in os.walk(p) for f in fs):
+            continue
+        shutil.rmtree(p, ignore_errors=True)
+        print(f"  🧹 清理残留目录: {p}")
+
+
 def _run_export(draft_name: str, timeout: float) -> bool:
     """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。"""
     out_mp4 = export_mp4_path(draft_name)
-    os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
+    out_dir = os.path.dirname(out_mp4)
+    # 只建父目录：剧名目录留给剪映自己创建，否则剪映会把成品写进「剧名(1)」
+    os.makedirs(os.path.dirname(out_dir), exist_ok=True)
+    _preclean_bundles(draft_name, out_dir)
     cmd = [sys.executable, "-u", AUTO_EXPORTER, draft_name, out_mp4, "--move",
            "--fallback-dir", get_export_dir()]
     proc = subprocess.run(cmd, cwd=_ROOT)
+    if proc.returncode == 0:
+        _consolidate_bundle(draft_name, out_mp4)
+    else:
+        # 失败也要清掉本轮重试产生的「剧名(1)/(2)…」，保证目录只剩一个
+        _preclean_bundles(draft_name, out_dir, keep_target=True)
     return proc.returncode == 0
 
 
