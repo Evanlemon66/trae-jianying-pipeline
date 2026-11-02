@@ -1,18 +1,21 @@
 ---
 name: drama-cover-builder
-description: 中文短剧封面全链路：从简介生成封面标题（3 方案 × 4 版本 = 12 条，编号 T1—T12）、按选定标题生成横/竖封面图、从视频抽帧、把封面写入剪映草稿。触发词：短剧封面、做封面、生成短剧标题、抽帧、合成封面、写入剪映草稿。不用于非短剧封面、通用海报、剧本正文或分镜、日历选题、图片精修。默认先出 12 条标题并停在用户选择门禁，不得自动进入出图阶段。
+description: 中文短剧封面全链路：从简介生成封面标题（3 方案 × 4 版本 = 12 条，编号 T1—T12）、按选定标题生成横/竖封面图、从视频抽帧。触发词：短剧封面、做封面、生成短剧标题、抽帧、合成封面。不用于非短剧封面、通用海报、剧本正文或分镜、日历选题、图片精修、剪映草稿写入（那是 pipeline/lib/jy_cover 的事）。默认先出 12 条标题并停在用户选择门禁，不得自动进入出图阶段。
 ---
 
 # Drama Cover Builder（短剧封面流水线）
 
-三阶段独立模块：Stage 1 标题生成（核心）→ Stage 1 用户门禁 → Stage 2 AI 封面生成（核心）→ Stage 2b Pillow 兜底 → Stage 3 写入剪映草稿。每阶段可独立调用：既能直接走 CLI，也能 import Python API。
+阶段模块：Stage 0 建任务目录与 `job.json` → Stage 1 标题生成（核心）→ 用户门禁 → Stage 2 AI 封面生成（核心）→ Stage 2b Pillow 兜底。每阶段可独立调用：既能直接走 CLI，也能 import Python API；阶段之间只通过目录与 `job.json` 交接。剪映草稿封面写入不属于本 skill，由 pipeline 调 `lib/jy_cover.py` 完成。
 
 ## 文件结构与读取路由
 
 | 文件 | 内容 | 何时必读 |
 | --- | --- | --- |
+| `references/handoff-contract.md` | 任务目录、`job.json` 字段、状态机、标题与封面映射、参考图选择规则 | 建目录、读写 `job.json`、跨宿主交接时**必读** |
 | `references/title-spec.md` | 标题生成唯一执行标准（方案层、版本层、版4 机制族、素材白名单/黑名单、钩子手法、递进链、打脸四式、质检清单） | 生成或修改任何标题时**必读** |
 | `references/cover-spec.md` | 出图硬约束（无文字/无武器/无儿童/无血腥）、三版构图、尺寸、质检门禁 | 进入 Stage 2 时**必读** |
+| `references/prompt-spec.md` | 出图提示词五段结构（身份锚点→构图→画面元素→硬约束→尺寸）、元素提取规则、落盘格式 | 生成 Stage 2 提示词时**必读** |
+| `references/channels.md` | 出图渠道矩阵（doubao-jimeng / volcano-ark / trae-host）、统一后处理、adapter 接口 | Stage 2 选渠道或接新渠道时必读 |
 | `references/scorecard.md` | 七维评分、硬门槛、矩阵推荐标注、落选稿去向 | 12 条出稿后、交付门禁前读取 |
 | `references/failure-cases.md` | 失败模式分类、真实翻车记录、已验证标题台账、规范升级触发条件 | 每部剧收尾时写入；季度复盘时通读 |
 | `references/platform-rules.md` | 审核红线、平台标题规格、烧字字数档位、压缩规则 | 进入 Stage 2 前、涉及平台标题或烧字时必读 |
@@ -28,8 +31,7 @@ description: 中文短剧封面全链路：从简介生成封面标题（3 方�
 
 - 短剧封面标题生成、改写、评分与 3×4 方案矩阵；
 - 按选定标题生成横版 2848×1600 / 竖版 1080×1920 封面图；
-- 从短剧视频抽帧作为底图或身份锚点；
-- 封面写入剪映草稿（`draft_cover.jpg` + 原生 composition）。
+- 从短剧视频抽帧作为底图或身份锚点。
 
 ### 1.2 不适用范围
 
@@ -43,6 +45,7 @@ description: 中文短剧封面全链路：从简介生成封面标题（3 方�
 
 | 输入状态 | 必须采取的动作 | 禁止行为 |
 | --- | --- | --- |
+| 剧名 + 简介 + 剧集目录，且要求落盘 | 先执行 Stage 0 `prepare`，再进 Stage 1 | 跳过目录与 `job.json` 直接开写 |
 | 只有简介 | 先出素材卡片 → 生成 12 条标题 → 停在门禁 | 自动进入 Stage 2/3 |
 | 简介 + 底图 | 同上；底图仅登记为身份锚点 | 直接把文字压在底图上交付 |
 | 只有视频 | 只抽帧，给 3 个候选帧 | 顺手生成标题或写草稿 |
@@ -50,7 +53,7 @@ description: 中文短剧封面全链路：从简介生成封面标题（3 方�
 | 已选定 3 条标题 | 进入 Stage 2，按版位锁构图 | 重新发散、替换用户已选标题 |
 | 用户自带 3 条自定义标题 | 直接进 Stage 2，不改写、不评分（除非用户要求） | 擅自改写用户的标题 |
 | 只要 1 张竖版投流图 | 只做竖版 1080×1920 | 顺带产出 3 张横版 |
-| 只要写入草稿 | 只执行 Stage 3 并自校验 | 重新生成图片 |
+| 只要写入草稿 | 转交 pipeline（`lib/jy_cover.py`），本 skill 不执行 | 在本 skill 里重写草稿写入逻辑 |
 | 非短剧 / 海报 / 剧本 / 日历 | 说明边界并给转化选项 | 硬套 3×4 结构 |
 
 ### 1.4 追问规则
@@ -59,7 +62,52 @@ description: 中文短剧封面全链路：从简介生成封面标题（3 方�
 - 只有以下情况追问：三项核心信息（身份 / 道具或异能 / 冲突）同时缺失；平台或尺寸要求不明且会显著改变产物；用户要求"改标题"但没给原稿。
 - 单轮只问一个阻断性问题，最多三个；不为账号定位、语气、受众等次要信息中断任务。
 
-## 二、输入建模：素材卡片
+## 二、Stage 0：任务目录与 job.json
+
+读取 `references/handoff-contract.md`。这一步只做三件事：建目录、落简介、定参考图。
+
+```powershell
+python scripts/drama_cover.py prepare --series-dir "D:\短剧\重生八零，打猎卖货养妻女"
+```
+
+| 规则 | 说明 |
+| --- | --- |
+| 默认目录 | `<剧集目录>/cover_job`；`--out` 可覆盖 |
+| 目录一次建全 | `01_input` / `02_titles` / `03_prompts` / `04_covers` / `05_video` / `06_publish` |
+| 自动找输入 | 简介按 `简介.txt → synopsis.txt → 详细简介.txt`；参考图按契约 §5；mp4 唯一时才记 `video.path`，多个则只记数量与命名规律 |
+| 简介只认原文 | 写入 `01_input/synopsis.txt`，Stage 1 只从这里读，不沿用聊天里的改写版 |
+| 参考图只复制 | 复制为 `01_input/reference.*`，并记 `reference_original` 与 `reference_sha256`，原图不动；找不到也继续建目录 |
+| 默认映射 | `cover_1<-T1`、`cover_2<-T2`、`cover_3<-T3`，`titles.gate=pending`；门禁后按用户点选改写 |
+| 不覆盖 | `job.json` 已存在时默认报错，只有 `--force` 才重建 |
+
+宿主无本地执行能力（如豆包客户端纯对话）时，**不依赖任何脚本**，按下面的顺序直接执行——本 skill 的 Stage 0/1/2 全部知识都在 `SKILL.md` + `references/` 内，豆包导入后即可完成；本地执行段（草稿封面、视频登记、发布、清理）回 Trae：
+
+**Stage 0（建任务）**
+
+1. 向用户收集：剧集目录绝对路径、简介全文（或其中一份简介文件的内容）、参考图（可后补）。
+2. 读 `references/handoff-contract.md` §1—§3，输出三样东西让用户落盘：
+   - 目录清单（`cover_job/` 六个子目录）；
+   - `job.json` **全文**（字段一个不能少；无执行环境下 `reference_sha256` / `prompt_sha256` / `image_sha256` 等 hash 字段写 `null`，回到 Trae 时用 `validate` 补算）；
+   - `01_input/synopsis.txt` 全文（即简介原文）。
+
+**Stage 1（12 条标题 + 门禁）**
+
+3. 用户回复“已建目录”后，读 `references/title-spec.md` 生成 12 条，把 `02_titles/prompt.txt`、`titles.json`、`titles.md` 三个文件**全文**输出给用户保存，同时输出更新后的 `job.json` 全文（`stage=titles_done`、`gate=pending`、`revision+1`）。
+4. 停在门禁：用户回复 3 个编号后，输出最终 `job.json` 全文（`titles.selected` + `cover_map` 回填、`selected_by="user"`、`stage=titles_selected`），用户覆盖保存。
+
+**Stage 2（即梦出图）**
+
+5. 读 `references/cover-spec.md` 与 `references/prompt-spec.md`，按门禁选定的 3 条标题反推提示词（五段结构；构图由封面位决定：1 爆点仰拍 / 2 冷暖对比 / 3 守护挡身；竖版胸像逆光），提示词写入 `03_prompts/prompts.json` 与 `prompts.md` 全文输出给用户保存（`channel` 按 `references/channels.md` 填写）。**不需要输出 job.json**——`prompts` 登记由 Trae 侧 `ingest` 从 prompts.json 重建。
+6. 调用即梦：每张上传 `01_input` 里的参考图作身份锚点 + 对应提示词，逐张生成；按 cover-spec 四项硬约束（无文字/无武器/无血腥/无儿童）自检，不合格重做该张。
+7. 4 张图按契约文件名交给用户存入 `04_covers/`（`cover_01_hit.png` / `cover_02_contrast.png` / `cover_03_guard.png` / `cover_04_vertical.png`，jpg 亦可）。**不需要输出 job.json**——`cover_map` 登记与 hash 由 Trae 侧 `ingest` 重建。
+
+**回 Trae（本地执行段）**
+
+8. 用户回到 Trae 说“封面已就位”，Trae 依次：`validate --fix`（补算全部 hash 并校验）→ `ingest`（登记+规范化+推进 stage）→ `record-video`（登记 pipeline 导出目录）→ 草稿封面（`lib/jy_cover.py`）/ 发布 / 清理；或一条 `python lib/cover_watch.py --job "<cover_job>"` 全自动跑完（含串流导出 mp4 与 Toast 通知）。豆包侧至此交付完毕。
+
+唯一规则：无执行环境时**绝不省略 job.json 字段、绝不编造 hash**；文件内容必须完整可复制，不给“略”。
+
+## 三、输入建模：素材卡片
 
 Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用户核对**。这是防编造的前置闸门，比事后拦截更省返工。
 
@@ -77,7 +125,7 @@ Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用�
 - 关键道具/异能 与 核心冲突 同时缺失 → 追问（见 §1.4）；
 - 用户补充新素材后，更新卡片再继续，不沿用手写前的旧要素。
 
-## 三、Stage 1：标题生成
+## 四、Stage 1：标题生成
 
 读取 `references/title-spec.md`。三条不可破纪律（细则以 spec 为准）：
 
@@ -87,9 +135,9 @@ Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用�
 
 生成流程按 spec §8 执行：素材圈定 → 白名单对照 → 12 格矩阵生成 → §6 质检 → 差异化检查 → 评分（`scorecard.md`）→ 交付门禁。
 
-## 四、Stage 1 输出契约与用户门禁
+## 五、Stage 1 输出契约与用户门禁
 
-### 4.1 交付格式（固定）
+### 5.1 交付格式（固定）
 
 12 条**平铺编号**（T1—T12），每条必须包含：
 
@@ -102,11 +150,11 @@ Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用�
 - 「推荐」按 `scorecard.md` §3 标注，只推荐不排序、不删条；
 - 用户要「再来几条」时，替换最弱条目，不追加第 13 条。
 
-### 4.2 失败处理
+### 5.2 失败处理
 
 简介撑不满 12 条差异化时，明确说明「只能先交付 N 条，缺的是 <素材类型>」，并给出可补齐的方向。不硬凑、不静默降级、不用编造填空。
 
-### 4.3 用户门禁（强制）
+### 5.3 用户门禁（强制）
 
 12 条交付后**停下**，按 T 编号让用户依次为三个封面位各选 1 条：
 
@@ -120,11 +168,21 @@ Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用�
 - 用户点满 3 个编号前不得进入 Stage 2；Agent 不代选、不预设默认项；
 - 用户也可绕过 12 条自带标题，此时先确认「该标题对应哪版构图」再合成。
 
-## 五、Stage 2：AI 封面生成
+落盘方式：
 
-读取 `references/cover-spec.md`，按其硬约束反推提示词。封面是**重新生成的图**，不是底图压字；底图只作身份锚点（人物、服装、猛兽种类、环境），构图、光影、致富元素、黑影对比全部重做。
+```powershell
+python lib/job_manifest.py select --job "<cover_job>" --picks "T6,T11,T1"   # 依次为封面1/2/3
+```
 
-### 5.1 输出契约
+选定结果写入 `job.json`（`titles.selected` + `selected_by="user"` + `cover_map` 回填），并在 `titles.json` 原位标注（选中条加 `selected/slot`，顶层记 `gate`）；不复制文本、不另产文件。冻结含义：此后改选必须显式操作且 `revision` 递增，Stage 2 发现 revision 不一致要把旧封面标 `stale` 重出。
+
+**Stage 2 直调兜底**：若用户未完成门禁而 Stage 2 被直接调用，`resolve` 自动选 3 条：默认**推荐模式**（`titles.json` 的 `summary.recommended` 推荐池按总分取前 3，不足 3 条从全量补足，推荐池缺失退化为全量评分），`--mode score` 切**评分模式**（全 12 条按总分取前 3）；总分相同时推荐条目优先，再平按 内容兑现→信息缺口→情绪峰值。写回 `selected_by="auto"` + `auto_mode` 并追加 history——这是可审计的兜底而非静默代选，用户事后改选则旧封面标 `stale`。`resolve --no-auto` 可关掉该行为。
+
+## 六、Stage 2：AI 封面生成
+
+读取 `references/cover-spec.md`（硬约束与构图）、`references/prompt-spec.md`（提示词五段结构）与 `references/channels.md`（渠道矩阵），按选定标题生成提示词并交渠道出图。封面是**重新生成的图**，不是底图压字；底图只作身份锚点（人物、服装、猛兽种类、环境），构图、光影、致富元素、黑影对比全部重做。
+
+### 6.1 输出契约
 
 | 产物 | 尺寸 | 构图来源 |
 | --- | --- | --- |
@@ -139,7 +197,7 @@ Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用�
 - 交付时给文件绝对路径，不只给图片说明；
 - 出图前先过 §七 的三步审核扫描；需烧字时按 `platform-rules.md` C 层档位检查行数与安全区。
 
-### 5.2 Stage 2b：Pillow 兜底
+### 6.2 Stage 2b：Pillow 兜底
 
 AI 出图不可用时走本地合成：
 
@@ -153,21 +211,6 @@ python scripts/drama_cover.py compose-pillow --base base.jpg --style all --out .
 - 视觉参数调 `assets/compose_styles/pillow_styles.json`
 
 Pillow 路线出的是文字压图封面，与 Stage 2 的 AI 重绘图是两条路，不混用在同一批交付里。
-
-## 六、Stage 3：写入剪映草稿
-
-```powershell
-python scripts/drama_cover.py write-draft --cover cover.jpg --draft-dir <草稿目录>
-```
-
-两阶段写入，缺一不可：
-
-1. `draft_cover.jpg` 作为剪映缩略图；
-2. 原生 composition 结构（`Resources/cover/` + `materials.drafts` + 顶层 `cover` 字段）。
-
-只做第 1 步时，剪映 5.9 会用首帧覆盖 `draft_cover.jpg`。
-
-交付前自校验：`draft_cover.jpg` 与 `Resources/cover/<uuid>.jpg` 是同一张图；顶层 `cover` 字段已写入；草稿目录可被剪映正常打开。
 
 ## 七、平台审核与投放适配
 
@@ -187,7 +230,7 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 
 ## 八、复盘与规范升级
 
-每部剧收尾（Stage 2/3 完成或用户中途放弃）后，向 `references/failure-cases.md` 补记 5 行：采用的格位、是否用自定义标题、被否原因归类、下次要试的机制。
+每部剧收尾（Stage 2 完成或用户中途放弃）后，向 `references/failure-cases.md` 补记 5 行：采用的格位、是否用自定义标题、被否原因归类、下次要试的机制。
 
 季度或满 5 部剧时通读台账，按 `failure-cases.md` §4 的四个触发条件判断是否启动 v5 规范修订；没有数据支撑就不改规范。
 
@@ -195,29 +238,37 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 
 | 命令 | 作用 |
 | --- | --- |
+| `prepare` | 建任务目录、落简介、定参考图、写 `job.json` |
+| `record-titles` | 登记 Stage 1 的 12 条标题与提示词快照 |
+| `select` | 人工门禁：写 `titles.selected` 并回填 `cover_map` |
+| `resolve` | Stage 2 取上下文：标题+参考图+提示词，门禁未过自动选分（`--dry-run`/`--no-auto`） |
+| `record-video` | 登记 pipeline 导出目录（自动探测 stream manifest，只记录不复制 mp4；手工指定优先；挂 `cleanup.external`） |
+| `set-cut` | 设置/清除导出裁剪秒数 `video.cut_s`（`--cut 7200` 裁剪；`--cut 0` 清除；默认 null 不裁剪，watcher 非 null 时传 `--cut`） |
+| `derive` | 从 04_covers 派生平台尺寸到 derived/（youtube/tiktok/instagram-reels/facebook-reels，不写 job.json） |
+| `ingest` | Stage 2 收口：从落盘产物（prompts.json+4 图）重建 job.json、规范化 slot、补 hash、推进 stage，幂等 |
 | `title` | 打印标题规范路径（Agent 读规范后在线生成，Ollama 兜底） |
 | `art-from-video` | ffmpeg select+thumbnail 抽最佳帧 |
 | `compose-pillow` | Pillow 合成，4 样式 × 2 尺寸族，标题可选 |
-| `write-draft` | 两阶段写剪映草稿 |
-| `full` | 一键 title → art → compose → write-draft |
+
+剪映草稿封面写入（`draft_cover.jpg` + 原生 composition）已下沉为共享库 `lib/jy_cover.py`，由 pipeline 在导出链路调用，**不属于本 skill**：
 
 ```python
-import sys, os
-sys.path.insert(0, os.path.join("<project>", ".trae", "skills",
-                                 "drama-cover-builder", "scripts"))
-import drama_cover as dc
+import sys
+sys.path.insert(0, "<repo>/lib")
+from jy_cover import set_draft_cover, set_cover_composition
 
-dc.compose_cover("base.jpg", "out.jpg", title="...",
-                 style="classic_red_stroke", size_family="vertical")
-dc.set_draft_cover(draft_dir, cover_image="cover.jpg")
-dc.set_cover_composition(draft_dict, draft_dir, "cover.jpg")
+set_draft_cover(draft_dir, cover_image="cover.jpg")
+set_cover_composition(draft_dict, draft_dir, "cover.jpg")
 ```
 
-草稿目录结构：
+## 十、cover_watch：落盘自动触发链
 
+豆包/手工把 Stage 2 产物（4 张契约图 + prompts.json）落盘后，`lib/cover_watch.py` 可自动跑完本地执行链：
+
+```powershell
+python lib/cover_watch.py --job "<cover_job>"            # 常驻监听（可多个 --job）
+python lib/cover_watch.py --job "<cover_job>" --once --dry-run   # 只判定不执行
+python lib/cover_watch.py status --job "<cover_job>"     # 查看锁与进度
 ```
-<draft-root>/
-├── draft_content.json
-├── draft_cover.jpg
-└── Resources/cover/<uuid>.jpg   ← composition 引用此处
-```
+
+触发条件（全满足）：4 张契约图齐 AND prompts.json 存在 AND job.json 可解析 AND `titles.gate="done"` AND `stage ∈ {titles_selected, prompts_ready, covers_ready}` AND video 未导出 AND 无活锁 AND 静默 30s（防抖）。触发后依次：`validate --fix` → `ingest`（含竖版绑定最高分标题）→ `export_config.json`（若有：写 `video.cut_s`、定派生平台）→ batch_runner 串流导出 mp4（封面自动吃 `cover_04_vertical`，裁剪读 `video.cut_s`；**默认带 `--verify` 自动质检**，隐含等待导出完成后再登记，`--no-verify` 可关）→ `record-video` → `derive` → Toast 通知。配套文件（均可选）：`<repo>/cover_watch.json`（默认监听任务列表，无参启动时读）、`<cover_job>/export_config.json`（豆包/用户一句话偏好：`{"cut_s": 秒, "derive": ["youtube","tiktok"]}`）。多个 job 在单 watcher 内串行排队；跨进程由 repo 级全局锁 `.export.lock` 互斥（手工 `batch_runner` 遇活锁报错，`--force` 强跑）。进度看 Toast / `cover_job/watcher.log` / `06_publish/pipeline.log` / `status` 命令。
