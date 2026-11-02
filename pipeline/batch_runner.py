@@ -106,6 +106,51 @@ def _parse_only(values):
     return eps
 
 
+def _write_episode_map(draft_dir, draft_name, series_dir, cut_s):
+    """写 episode_map.json 到草稿目录：草稿内集身份的唯一收口。
+
+    结构 v1: {version, draft, series_dir, cut_s, created_at,
+              episodes:[{seq 串流序号, ep 真实集号, demucs 目录名,
+                         material 视频材质名, slot_start_us, slot_dur_us}]}
+    供 _framefix_draft 按真实集号重排音频（旧实现误把 demucs 串流序号当集号，
+    剧集从非第1集开始时整体错位）。原子写（.tmp + os.replace），全量覆盖幂等。
+    """
+    dp = os.path.join(draft_dir, "draft_content.json")
+    with open(dp, encoding="utf-8") as f:
+        d = json.load(f)
+    mats_v = {m.get("id"): m for m in (d.get("materials") or {}).get("videos") or []}
+    vtracks = [t for t in d.get("tracks") or [] if t.get("type") == "video"]
+    if not vtracks:
+        raise RuntimeError("草稿没有视频轨，无法生成 episode_map")
+    main = max(vtracks, key=lambda t: len(t.get("segments") or []))
+    segs = sorted(main.get("segments") or [],
+                  key=lambda s: (s.get("target_timerange") or {}).get("start", 0))
+    episodes = []
+    for seq, s in enumerate(segs, 1):
+        m = mats_v.get(s.get("material_id"), {})
+        mname = m.get("material_name") or ""
+        mt = re.search(r"第(\d+)集", mname)
+        if not mt:
+            continue
+        tt = s.get("target_timerange") or {}
+        episodes.append({
+            "seq": seq, "ep": int(mt.group(1)),
+            "demucs": f"demucs_ep{seq:02d}", "material": mname,
+            "slot_start_us": tt.get("start", 0), "slot_dur_us": tt.get("duration", 0),
+        })
+    payload = {
+        "version": 1, "draft": draft_name, "series_dir": series_dir,
+        "cut_s": cut_s, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "episodes": episodes,
+    }
+    tmp = os.path.join(draft_dir, "episode_map.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, os.path.join(draft_dir, "episode_map.json"))
+    print(f"  🗺️ episode_map.json: {len(episodes)} 集（串流序号↔真实集号）→ 草稿目录")
+    return payload
+
+
 def load_state(workdir):
     p = os.path.join(workdir, "_batch_state.json")
     if os.path.exists(p):
@@ -319,6 +364,16 @@ def main():
             **cover_kw,
         )
 
+        # ---- episode_map.json：集身份收口，写草稿目录，供 framefix 按真实集号重排 ----
+        try:
+            dp_map, _, _ = pl.find_draft_by_name(draft_name)
+            if dp_map:
+                _write_episode_map(dp_map, draft_name, series_dir, args.cut)
+            else:
+                print(f"  ⚠️ 未找到草稿 {draft_name}，episode_map 跳过")
+        except Exception as e:
+            print(f"  ⚠️ episode_map.json 写入失败（framefix 将走几何兜底）: {e}")
+
         for ep, v in sel:
             state.setdefault(v, {})
             state[v].update({
@@ -334,9 +389,14 @@ def main():
         try:
             import _framefix_draft as _ff
             ff_result = _ff.fix_draft(draft_name, run_tests=True)
+            if ff_result.get("assert_failed"):
+                print(f"  ❌ 帧对齐断言失败，终止本次导出: {ff_result['assert_failed']}")
+                _toast("❌ 帧对齐断言失败", f"{draft_name}：草稿保持帧对齐前状态，请检查")
+                return
             if ff_result["test_passed"] is False:
                 print(f"  ⚠️ 帧对齐字幕测试失败（不阻塞导出）: {ff_result['test_details']}")
-            print(f"  📐 帧对齐: {ff_result['ep_count']}集, 总长 {ff_result['old_total']:.1f}s → {ff_result['new_total']:.1f}s")
+            print(f"  📐 帧对齐: {ff_result['ep_count']}集, 总长 {ff_result['old_total']:.1f}s → {ff_result['new_total']:.1f}s"
+                  + ("" if ff_result.get("map_used") else "  [几何兜底]"))
         except Exception as e:
             print(f"  ⚠️ 帧对齐跳过（不阻塞导出）: {e}")
             ff_result = None

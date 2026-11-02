@@ -3,6 +3,8 @@ _*.py
 # 但 Python 包标识与技能目录内脚本必须跟踪（_*.py 会误伤 __init__.py / _bootstrap.py）
 !__init__.py
 !.trae/skills/**/*.py
+# batch_runner 实际 import 的功能模块（帧对齐），非临时脚本，必须跟踪
+!pipeline/_framefix_draft.py
 
 # 个人配置（含个人预设名/密钥/导出目录，不入库；参考 *.example.json）
 pipeline/presets.json
