@@ -210,14 +210,46 @@ def _intent_of(job: dict[str, Any]) -> dict[str, Any]:
     return wf
 
 
-def _effective_cut(wf: dict[str, Any], job: dict[str, Any]) -> Optional[float]:
-    """裁剪解析：workflow.cut_s（意图收口）> video.cut_s（set-cut/export_config 旧路）。"""
-    cut = wf.get("cut_s")
-    if cut is None:
-        cut = (job.get("video") or {}).get("cut_s")
-    if isinstance(cut, (int, float)) and not isinstance(cut, bool) and cut > 0:
-        return float(cut)
-    return None
+_CUT_CONFLICT_NOTIFIED: set[str] = set()  # 分歧 toast 每剧一次，避免每轮刷屏
+
+
+def _effective_cut(wf: dict[str, Any], job: dict[str, Any], job_dir: str) -> Optional[float]:
+    """cut 解析（以 intent_revision 分界）：
+
+    - rev==0（未经人工确认）：export_config.json（更新的人工动作）> workflow.cut_s（dispatch 归并）> video.cut_s
+    - rev>0（人工已确认）：workflow.cut_s 最高 > export_config > video.cut_s
+    workflow 与 export_config 分歧时记日志 + toast，禁止静默忽略。
+    export_config 必须在 edit 阶段就被消费（裁剪是构建草稿时生效的）。
+    """
+    def _pos(v: Any) -> Optional[float]:
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            return float(v)
+        return None
+
+    rev = int(wf.get("intent_revision") or 0)
+    wf_cut = _pos(wf.get("cut_s"))
+    try:
+        ec_cut = _pos(_read_export_config(job_dir).get("cut_s"))
+    except Exception:
+        ec_cut = None
+    vid_cut = _pos((job.get("video") or {}).get("cut_s"))
+
+    if wf_cut is not None and ec_cut is not None and wf_cut != ec_cut:
+        print(f"  ⚠️ cut 分歧: workflow.cut_s={wf_cut} vs export_config.cut_s={ec_cut}（{job_dir}）")
+        key = job_dir.lower()
+        if key not in _CUT_CONFLICT_NOTIFIED:
+            _CUT_CONFLICT_NOTIFIED.add(key)
+            try:
+                toast("⚠️ 裁剪意图分歧",
+                      f"{os.path.basename(os.path.dirname(job_dir))}：workflow={wf_cut} "
+                      f"export_config={ec_cut}（按 intent_revision={rev} 取舍）")
+            except Exception:
+                pass
+    if rev > 0:
+        cut = wf_cut if wf_cut is not None else (ec_cut if ec_cut is not None else vid_cut)
+    else:
+        cut = ec_cut if ec_cut is not None else (wf_cut if wf_cut is not None else vid_cut)
+    return cut
 
 
 def _effective_derive(wf: dict[str, Any], cfg: dict[str, Any],
@@ -248,7 +280,7 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
     plan: dict[str, Any] = {"job_dir": job_dir, "name": name, "draft": draft,
                             "intent": wf, "policy": policy,
                             "action": "blocked", "reason": "", "cmd": ""}
-    cut = _effective_cut(wf, job)
+    cut = _effective_cut(wf, job, job_dir)
 
     def _edit_cmd() -> list[str]:
         cmd = [sys.executable, _BATCH_RUNNER, series_dir, "--force", "--no-export"]
@@ -381,6 +413,13 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     except Exception as e:
         _log(job_dir, f"ingest 失败: {e}")
         toast("❌ 剪辑阶段失败", f"{name} ingest: {e}", icon="error")
+        return False
+    # 旧版 export_config 落盘（cut_s → video.cut_s 记账；derive 覆盖留到 export 阶段用）
+    try:
+        apply_export_config(job_dir)
+    except Exception as e:
+        _log(job_dir, f"export_config 失败: {e}")
+        toast("❌ 剪辑阶段失败", f"{name} export_config: {e}", icon="error")
         return False
     cmd = list(plan["cmd"])
     _log(job_dir, "pipeline start: " + " ".join(cmd))
