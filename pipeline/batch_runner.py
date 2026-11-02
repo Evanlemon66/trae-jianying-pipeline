@@ -43,6 +43,39 @@ except Exception:  # 锁模块缺失时退化为无锁（保持旧行为）
     _elock = None
 
 
+def _ensure_jianying_closed(grace_s=15.0):
+    """开跑前确保剪映已退出。
+
+    剪映运行中会持有草稿的内存旧副本：pipeline 写盘 draft_content.json 后，
+    剪映随后的自动保存会用旧副本回写，把封面 composition / 字幕改动整个覆盖
+    （八仙 2026-11-02 实测：04:08 剪映回写导致封面丢失）。
+    先优雅退出，超时未退再强杀；导出阶段会自动重新拉起剪映。
+    """
+    import subprocess as _sp
+
+    def _running():
+        try:
+            out = _sp.check_output(["tasklist", "/fi", "imagename eq JianyingPro.exe"],
+                                   text=True, stderr=_sp.DEVNULL)
+            return "JianyingPro.exe" in out
+        except Exception:
+            return False
+
+    if not _running():
+        return
+    print("🛑 检测到剪映正在运行：为避免草稿被其内存旧副本回写覆盖（封面/字幕丢失），先关闭剪映")
+    _sp.run(["taskkill", "/IM", "JianyingPro.exe", "/T"], capture_output=True)  # 优雅退出（含子进程）
+    t0 = time.time()
+    while time.time() - t0 < grace_s:
+        if not _running():
+            print("  ✅ 剪映已退出")
+            return
+        time.sleep(1)
+    print("  ⚠️ 剪映未在时限内退出，强制结束")
+    _sp.run(["taskkill", "/F", "/IM", "JianyingPro.exe", "/T"], capture_output=True)
+    time.sleep(2)
+
+
 def _ep_number(path, idx):
     """从文件名提取集数；提不出来就用序号。"""
     m = re.search(r"[第E]\s*(\d{1,3})\s*集", os.path.basename(path))
@@ -137,6 +170,8 @@ def main():
                     help="关闭 watcher 守护进程")
     ap.add_argument("--force", action="store_true",
                     help="忽略全局导出锁（.export.lock）强跑（watcher 持锁调用时自动加）")
+    ap.add_argument("--keep-jianying", action="store_true",
+                    help="开跑前不关闭剪映（默认会先退出剪映，防止其内存旧草稿回写覆盖封面/字幕）")
     ap.set_defaults(stream=True)
     args = ap.parse_args()
 
@@ -154,6 +189,11 @@ def main():
             sys.exit(1)
         import atexit
         atexit.register(_elock.release)
+
+    # 剪映运行中持有草稿内存旧副本，写盘后会被其自动保存回写覆盖（封面/字幕丢失）；
+    # 开跑前先退出剪映，导出阶段会自动重新拉起。--keep-jianying 可跳过。
+    if not args.keep_jianying:
+        _ensure_jianying_closed()
 
     # 未指定 workdir 时按剧名派生独立目录：demucs 产物按 demucs_epNN 同名写入，
     # 共用 _work 会让后一次运行覆盖前一部剧草稿引用的音频素材。
