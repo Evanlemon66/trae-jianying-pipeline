@@ -507,6 +507,14 @@ def update_job(job_dir: str, patch: dict[str, Any], *,
     """读-改-写 job.json：深合并、stage 只进不退、revision+1。"""
     path = os.path.join(job_dir, "job.json")
     job = load_job(path)
+    # gate 守卫：titles.gate 禁止 done→pending 回退。
+    # 历史教训（重回95 2026-11-02）：手工 update 补丁携带陈旧 titles 块，
+    # 深合并把 select 置好的 done 打回 pending，watcher 永久不触发且无告警。
+    # 重选请走 select 命令（它会成对重写 selected+gate），故此处直接拒绝。
+    patch_titles = patch.get("titles")
+    if isinstance(patch_titles, dict) and patch_titles.get("gate") == "pending" \
+            and (job.get("titles") or {}).get("gate") == "done":
+        raise ValueError("titles.gate 不能从 done 回退为 pending（重选请用 select 命令）")
     target_stage = patch.get("stage")
     if target_stage:
         if target_stage not in STAGES:
