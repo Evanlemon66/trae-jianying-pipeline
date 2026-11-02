@@ -170,8 +170,9 @@ def main():
                     help="关闭 watcher 守护进程")
     ap.add_argument("--force", action="store_true",
                     help="忽略全局导出锁（.export.lock）强跑（watcher 持锁调用时自动加）")
-    ap.add_argument("--keep-jianying", action="store_true",
-                    help="开跑前不关闭剪映（默认会先退出剪映，防止其内存旧草稿回写覆盖封面/字幕）")
+    ap.add_argument("--kill-jianying", action="store_true",
+                    help="开跑前先退出剪映（可选防护：防止其内存旧草稿回写覆盖；默认不关，"
+                         "封面已由 pipeline 末尾落盘保证 mtime 最新）")
     ap.set_defaults(stream=True)
     args = ap.parse_args()
 
@@ -190,9 +191,9 @@ def main():
         import atexit
         atexit.register(_elock.release)
 
-    # 剪映运行中持有草稿内存旧副本，写盘后会被其自动保存回写覆盖（封面/字幕丢失）；
-    # 开跑前先退出剪映，导出阶段会自动重新拉起。--keep-jianying 可跳过。
-    if not args.keep_jianying:
+    # 可选防护：剪映运行中持有草稿内存旧副本，可能被其自动保存回写覆盖；
+    # 默认不关（封面过期根因已由 pipeline 末尾落盘修复），--kill-jianying 时先退出。
+    if args.kill_jianying:
         _ensure_jianying_closed()
 
     # 未指定 workdir 时按剧名派生独立目录：demucs 产物按 demucs_epNN 同名写入，

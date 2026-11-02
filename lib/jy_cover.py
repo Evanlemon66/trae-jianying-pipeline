@@ -90,6 +90,9 @@ def set_draft_cover(draft_dir, cover_image=None, extract_from_video=None,
                 return False
             img = PILImage.open(cover_image).convert("RGB")
             img.save(dst, "JPEG", quality=96)
+        # copy2 会保留源文件 mtime；封面必须比 draft_content.json 新，
+        # 否则剪映打开草稿时判定封面过期并用第一帧重生成
+        os.utime(dst, None)
         print(f"  🖼️ draft_cover.jpg: {os.path.basename(cover_image)} "
               f"→ {os.path.getsize(dst)/1024:.0f}KB")
         return True

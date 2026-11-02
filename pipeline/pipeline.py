@@ -2717,21 +2717,11 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             print("  ✅ 终检通过")
         print()
 
-    # 封面必须在所有处理完成后、保存前写入——否则封面 mtime 早于草稿 update_time，
-    # 剪映打开时会判定封面过期并用第一帧重生成（覆盖自定义封面）
-    if cover_image or cover_extract_from_video:
-        print(f"🖼️ 设置草稿封面(末尾): cover_image={cover_image}")
-        set_draft_cover(
-            dp_root,
-            cover_image=cover_image,
-            extract_from_video=cover_extract_from_video,
-            extract_time_s=cover_extract_time_s,
-            video_start_s=(_cover_start_for_cut(cover_extract_from_video, cut_us)
-                           if cover_extract_from_video else 0.0),
-        )
-        # 本地图片封面还需挂载 composition 材质，否则剪映打开草稿时会用第一帧覆盖
-        if cover_image:
-            set_cover_composition(draft, dp_root, cover_image)
+    # 封面 composition 必须在保存前挂进草稿 JSON；draft_cover.jpg 则推迟到全部
+    # JSON 写盘（含 framefix/保存发布/补翻）之后、导出之前再写——否则封面 mtime
+    # 早于草稿 update_time，剪映打开草稿时判定封面过期，用第一帧重生成覆盖自定义封面
+    if cover_image:
+        set_cover_composition(draft, dp_root, cover_image)
 
     jy_running = _jianying_running()
     locked = _draft_json_locked(draft_path)
@@ -2811,6 +2801,20 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                 "可稍后手动执行 repair_translation.py 补翻")
         print("  ✅ 补翻复验通过，继续导出")
         print()
+
+    # ━━━━ Step 10.9: 封面图落盘（必须在所有草稿 JSON 写完之后）━━━━
+    # draft_cover.jpg 的 mtime 必须晚于 draft_content.json，否则剪映打开草稿时
+    # 判定封面过期并用第一帧重生成（覆盖自定义封面）。composition 已在保存前挂载。
+    if cover_image or cover_extract_from_video:
+        print(f"🖼️ 设置草稿封面(导出前最后写入): cover_image={cover_image}")
+        set_draft_cover(
+            dp_root,
+            cover_image=cover_image,
+            extract_from_video=cover_extract_from_video,
+            extract_time_s=cover_extract_time_s,
+            video_start_s=(_cover_start_for_cut(cover_extract_from_video, cut_us)
+                           if cover_extract_from_video else 0.0),
+        )
 
     print()
 
