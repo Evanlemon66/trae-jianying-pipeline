@@ -1,0 +1,1484 @@
+"""短剧任务目录与 job.json 的唯一实现（Handoff Contract v1.1）。
+
+只依赖标准库。被 drama-cover-builder 的 `prepare` 子命令调用，也可被
+发布 skill / pipeline 直接 import，避免每个阶段各写一套目录约定。
+
+契约见 .trae/skills/drama-cover-builder/references/handoff-contract.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime
+from typing import Any, Optional
+
+SCHEMA_VERSION = "1.1"
+
+JOB_DIRS = (
+    "01_input",
+    "02_titles",
+    "03_prompts",
+    "04_covers",
+    "05_video",
+    "06_publish",
+    "06_publish/receipts",
+)
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+EXCLUDE_TOKENS = ("draft_cover", "best_frame", "监审", "monitor", "提示词", "prompt")
+EXACT_COVER_STEMS = ("封面", "cover")
+
+SYNOPSIS_NAMES = ("简介.txt", "synopsis.txt", "剧情简介.txt", "故事简介.txt", "详细简介.txt")
+
+STAGES = (
+    "prepared",
+    "titles_done",
+    "titles_selected",
+    "prompts_ready",
+    "covers_ready",
+    "video_ready",
+    "publish_ready",
+    "published",
+)
+
+COVER_SLOTS = (
+    (1, "爆点仰拍", "cover_01_hit.png"),
+    (2, "冷暖对比", "cover_02_contrast.png"),
+    (3, "守护挡身", "cover_03_guard.png"),
+)
+
+VERTICAL_SLOT = ("vertical", "胸像逆光", "cover_04_vertical.png")
+
+CLEANUP_KEEP = [
+    "job.json",
+    "01_input/synopsis.txt",
+    "02_titles",
+    "03_prompts",
+    "04_covers",
+    "05_video",
+]
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def sanitize_name(name: str, fallback: str = "未命名剧集") -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (name or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned or fallback
+
+
+def rel_path(path: str, base: str) -> str:
+    """相对 job 目录的路径，统一使用正斜杠。"""
+    return os.path.relpath(path, base).replace(os.sep, "/")
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def natural_key(text: str) -> list[Any]:
+    """自然排序：第1集 < 第2集 < 第10集。"""
+    return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", text)]
+
+
+def _iter_images(series_dir: str) -> list[str]:
+    names = []
+    for name in os.listdir(series_dir):
+        path = os.path.join(series_dir, name)
+        if os.path.isfile(path) and os.path.splitext(name)[1].lower() in IMAGE_EXTS:
+            names.append(name)
+    return names
+
+
+def _is_excluded(name: str) -> bool:
+    low = name.lower()
+    if low.startswith("cover_") and re.match(r"cover_0\d", low):
+        return True
+    return any(tok in low for tok in EXCLUDE_TOKENS)
+
+
+def detect_reference_image(series_dir: str) -> dict[str, Optional[str]]:
+    """按契约 §5 的优先级挑选参考图。"""
+    if not series_dir or not os.path.isdir(series_dir):
+        return {"path": None, "source": None, "reason": "剧集目录不存在"}
+
+    names = _iter_images(series_dir)
+    if not names:
+        return {"path": None, "source": None, "reason": "目录内没有图片"}
+
+    for name in names:
+        stem, _ = os.path.splitext(name)
+        if stem.strip().lower() in EXACT_COVER_STEMS and not _is_excluded(name):
+            return {"path": os.path.join(series_dir, name), "source": name,
+                    "reason": "文件名精确命中封面"}
+
+    hits = [n for n in names
+            if not _is_excluded(n) and ("封面" in n or "cover" in n.lower())]
+    if hits:
+        name = sorted(hits, key=natural_key)[0]
+        return {"path": os.path.join(series_dir, name), "source": name,
+                "reason": "文件名含「封面」"}
+
+    rest = [n for n in names if not _is_excluded(n)]
+    if rest:
+        name = sorted(rest, key=natural_key)[0]
+        return {"path": os.path.join(series_dir, name), "source": name,
+                "reason": "自然排序第一张（无封面命名）"}
+
+    return {"path": None, "source": None, "reason": "候选图全部被排除规则过滤"}
+
+
+def detect_synopsis(series_dir: str) -> dict[str, Any]:
+    """探测剧集目录内的简介文件。"""
+    if not series_dir or not os.path.isdir(series_dir):
+        return {"path": None, "candidates": []}
+
+    found = [os.path.join(series_dir, n) for n in SYNOPSIS_NAMES
+             if os.path.isfile(os.path.join(series_dir, n))]
+    if not found:
+        found = [os.path.join(series_dir, n) for n in sorted(os.listdir(series_dir))
+                 if n.lower().endswith(".txt") and "简介" in n]
+    return {"path": found[0] if found else None, "candidates": found}
+
+
+def detect_video(series_dir: str) -> dict[str, Any]:
+    """探测剧集目录顶层的 mp4；只有唯一一个时才定为 video.path。"""
+    if not series_dir or not os.path.isdir(series_dir):
+        return {"path": None, "count": 0, "pattern": None}
+
+    mp4s = [n for n in os.listdir(series_dir)
+            if n.lower().endswith(".mp4") and os.path.isfile(os.path.join(series_dir, n))]
+    if not mp4s:
+        return {"path": None, "count": 0, "pattern": None}
+
+    pattern = None
+    if all(re.search(r"第\d+集", n) for n in mp4s):
+        pattern = "第N集.mp4"
+    elif len(mp4s) > 1:
+        pattern = "*.mp4"
+
+    return {
+        "path": os.path.join(series_dir, mp4s[0]) if len(mp4s) == 1 else None,
+        "count": len(mp4s),
+        "pattern": pattern,
+    }
+
+
+def default_cover_map() -> list[dict[str, Any]]:
+    return [
+        {
+            "slot": slot,
+            "kind": "horizontal",
+            "composition": composition,
+            "title_id": f"T{slot}",
+            "title": None,
+            "file": f"04_covers/{filename}",
+            "prompt": None,
+            "channel": None,
+            "image_sha256": None,
+            "status": "pending",
+            "generated_at": None,
+        }
+        for slot, composition, filename in COVER_SLOTS
+    ]
+
+
+def default_vertical_cover() -> dict[str, Any]:
+    slot, composition, filename = VERTICAL_SLOT
+    return {
+        "slot": slot,
+        "kind": "vertical",
+        "role": "video_cover",
+        "composition": composition,
+        "title_id": None,
+        "title": None,
+        "file": f"04_covers/{filename}",
+        "prompt": None,
+        "channel": None,
+        "image_sha256": None,
+        "status": "pending",
+        "generated_at": None,
+    }
+
+
+def default_cleanup() -> dict[str, Any]:
+    return {
+        "status": "blocked",
+        "eligible": False,
+        "reason": "尚未完成发布",
+        "requires_confirm": True,
+        "targets": ["01_input/reference.*"],
+        "keep": list(CLEANUP_KEEP),
+        "external": [],
+        "executed_at": None,
+        "deleted": [],
+    }
+
+
+def build_job(series: str, *, host: str = "trae") -> dict[str, Any]:
+    stamp = datetime.now().astimezone()
+    slug = sanitize_name(series)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "job_id": f"{slug}-{stamp.strftime('%Y%m%d-%H%M%S')}",
+        "series": series,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "revision": 1,
+        "host": host,
+        "stage": "prepared",
+        "input": {
+            "synopsis": "01_input/synopsis.txt",
+            "synopsis_source": None,
+            "synopsis_candidates": [],
+            "reference_image": None,
+            "reference_original": None,
+            "reference_source": None,
+            "reference_reason": None,
+            "reference_sha256": None,
+        },
+        "sizes": {"horizontal": [2848, 1600], "vertical": [1080, 1920]},
+        "titles": {
+            "file": "02_titles/titles.json",
+            "count": 12,
+            "gate": "pending",
+            "prompt_file": None,
+            "prompt_sha256": None,
+            "prompt_version": "title-spec-v4.1",
+            "selected": [],
+            "selected_at": None,
+        },
+        "cover_map": default_cover_map(),
+        "vertical_cover": default_vertical_cover(),
+        "prompts": {"file": "03_prompts/prompts.json", "channel": None,
+                    "count": 4, "items": []},
+        "video": {"path": None, "source": None, "candidates_count": 0,
+                  "name_pattern": None, "duration_s": None, "cut_s": None,
+                  "cover": None,
+                  "export_dir": None, "export_file": None, "draft_name": None,
+                  "companions": []},
+        "publish": {"status": "not_ready", "idempotency_key": None,
+                    "platforms": [], "receipts": []},
+        "cleanup": default_cleanup(),
+        "history": [],
+    }
+
+
+def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = copy.deepcopy(value)
+    return base
+
+
+def migrate_job(job: dict[str, Any]) -> dict[str, Any]:
+    """把旧版 job.json 补齐到当前 schema，不覆盖已有值。"""
+    template = build_job(job.get("series") or "未命名剧集",
+                         host=job.get("host") or "trae")
+    for key, value in template.items():
+        if key not in job:
+            job[key] = value
+        elif isinstance(value, dict) and isinstance(job[key], dict):
+            for sub_key, sub_value in value.items():
+                job[key].setdefault(sub_key, sub_value)
+    job["schema_version"] = SCHEMA_VERSION
+    job.setdefault("revision", 1)
+    return job
+
+
+def save_job(job: dict[str, Any], job_dir: str) -> str:
+    path = os.path.join(job_dir, "job.json")
+    job["updated_at"] = now_iso()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(job, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def load_job(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        return migrate_job(json.load(f))
+
+
+def _stage_index(stage: str) -> int:
+    return STAGES.index(stage) if stage in STAGES else -1
+
+
+def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str]:
+    errors: list[str] = []
+
+    for key in ("schema_version", "job_id", "series", "stage", "input", "titles",
+                "cover_map", "vertical_cover", "prompts", "video", "publish",
+                "cleanup", "history", "revision"):
+        if key not in job:
+            errors.append(f"缺少字段: {key}")
+
+    if job.get("schema_version") != SCHEMA_VERSION:
+        errors.append(f"schema_version 应为 {SCHEMA_VERSION}")
+    if job.get("stage") not in STAGES:
+        errors.append(f"未知 stage: {job.get('stage')}")
+    if not isinstance(job.get("revision"), int) or job.get("revision", 0) < 1:
+        errors.append("revision 应为正整数")
+
+    cover_map = job.get("cover_map") or []
+    if len(cover_map) != 3:
+        errors.append(f"cover_map 应有 3 项，实际 {len(cover_map)}")
+    for item in cover_map:
+        slot = item.get("slot")
+        if slot not in (1, 2, 3):
+            errors.append(f"非法 slot: {slot}")
+        if item.get("kind") != "horizontal":
+            errors.append(f"slot {slot} 的 kind 应为 horizontal")
+        title_id = item.get("title_id")
+        if title_id is not None and not re.fullmatch(r"T(?:[1-9]|1[0-2])", str(title_id)):
+            errors.append(f"slot {slot} 的 title_id 非法: {title_id}")
+        if not str(item.get("file") or "").startswith("04_covers/"):
+            errors.append(f"slot {slot} 文件应位于 04_covers/")
+
+    vertical = job.get("vertical_cover") or {}
+    if vertical.get("slot") != "vertical":
+        errors.append("vertical_cover.slot 应为 vertical")
+    if vertical.get("kind") != "vertical" or vertical.get("role") != "video_cover":
+        errors.append("vertical_cover 应为 kind=vertical / role=video_cover")
+    if not str(vertical.get("file") or "").startswith("04_covers/"):
+        errors.append("vertical_cover 文件应位于 04_covers/")
+
+    titles = job.get("titles") or {}
+    if titles.get("count") != 12:
+        errors.append("titles.count 应为 12")
+    if titles.get("gate") not in ("pending", "done"):
+        errors.append(f"titles.gate 非法: {titles.get('gate')}")
+    selected = titles.get("selected") or []
+    if len(selected) not in (0, 3):
+        errors.append("titles.selected 应为空或 3 项")
+    for entry in selected:
+        if not re.fullmatch(r"T(?:[1-9]|1[0-2])", str(entry.get("title_id"))):
+            errors.append(f"selected 中 title_id 非法: {entry.get('title_id')}")
+        if entry.get("slot") not in (1, 2, 3):
+            errors.append(f"selected 中 slot 非法: {entry.get('slot')}")
+    if titles.get("selected_by") not in (None, "user", "auto"):
+        errors.append(f"titles.selected_by 非法: {titles.get('selected_by')}")
+    if titles.get("selected_by") == "auto" and titles.get("auto_mode") not in ("recommended", "score"):
+        errors.append("selected_by=auto 时 auto_mode 应为 recommended/score")
+    if titles.get("selected_by") == "user" and titles.get("auto_mode") is not None:
+        errors.append("selected_by=user 时 auto_mode 应为 null")
+    if titles.get("gate") == "done" and len(selected) != 3:
+        errors.append("gate=done 时 selected 必须有 3 项")
+
+    prompts = job.get("prompts") or {}
+    if prompts.get("count") != 4:
+        errors.append("prompts.count 应为 4")
+    if not isinstance(prompts.get("items", []), list):
+        errors.append("prompts.items 应为数组")
+
+    video = job.get("video") or {}
+    if video.get("path") and not str(video["path"]).endswith(".mp4"):
+        errors.append("video.path 应为 mp4")
+    if not isinstance(video.get("candidates_count", 0), int):
+        errors.append("video.candidates_count 应为整数")
+    cut = video.get("cut_s")
+    if cut is not None:
+        dur = video.get("duration_s")
+        if isinstance(cut, bool) or not isinstance(cut, (int, float)) or cut <= 0:
+            errors.append("video.cut_s 应为正数秒")
+        elif isinstance(dur, (int, float)) and not isinstance(dur, bool) and dur > 0 and cut > dur:
+            errors.append(f"video.cut_s({cut}) 超过 duration_s({dur})")
+
+    publish = job.get("publish") or {}
+    if not isinstance(publish.get("platforms", []), list):
+        errors.append("publish.platforms 应为数组")
+    for p in publish.get("platforms", []):
+        if not p.get("name"):
+            errors.append("publish.platforms 项缺少 name")
+        if p.get("status") not in ("pending", "uploading", "succeeded", "failed", "blocked"):
+            errors.append(f"平台状态非法: {p.get('status')}")
+
+    cleanup = job.get("cleanup") or {}
+    if cleanup.get("status") not in ("blocked", "eligible", "done", "skipped"):
+        errors.append(f"cleanup.status 非法: {cleanup.get('status')}")
+    if not isinstance(cleanup.get("targets", []), list):
+        errors.append("cleanup.targets 应为数组")
+    for ext in cleanup.get("external", []):
+        if not isinstance(ext, dict) or not ext.get("tool") or not ext.get("draft_name"):
+            errors.append("cleanup.external 项缺少 tool/draft_name")
+        elif ext.get("status") not in ("pending", "done", "skipped"):
+            errors.append(f"cleanup.external 状态非法: {ext.get('status')}")
+
+    if job_dir:
+        for rel in JOB_DIRS:
+            if not os.path.isdir(os.path.join(job_dir, rel)):
+                errors.append(f"缺少目录: {rel}")
+        synopsis = (job.get("input") or {}).get("synopsis")
+        if not synopsis or not os.path.isfile(os.path.join(job_dir, synopsis)):
+            errors.append("简介文件不存在")
+        ref = (job.get("input") or {}).get("reference_image")
+        if ref and not os.path.isfile(os.path.join(job_dir, ref)):
+            errors.append(f"参考图不存在: {ref}")
+        prompt_file = (job.get("titles") or {}).get("prompt_file")
+        if _stage_index(job.get("stage")) >= _stage_index("titles_done") and prompt_file:
+            if not os.path.isfile(os.path.join(job_dir, prompt_file)):
+                errors.append(f"标题提示词文件不存在: {prompt_file}")
+
+    # 绝对路径白名单：video.export_dir / export_file 是 pipeline 的实际导出位置，
+    # 位于任务目录之外，必须允许绝对路径。
+    abs_ok = {("video", "export_dir"), ("video", "export_file")}
+    for section in ("input", "titles", "prompts", "video", "cleanup"):
+        for key, value in (job.get(section) or {}).items():
+            if (section, key) in abs_ok:
+                continue
+            if isinstance(value, str) and os.path.isabs(value):
+                errors.append(f"{section} 中出现绝对路径: {value}")
+
+    return errors
+
+
+def update_job(job_dir: str, patch: dict[str, Any], *,
+               event: str = "update", detail: str = "") -> dict[str, Any]:
+    """读-改-写 job.json：深合并、stage 只进不退、revision+1。"""
+    path = os.path.join(job_dir, "job.json")
+    job = load_job(path)
+    target_stage = patch.get("stage")
+    if target_stage:
+        if target_stage not in STAGES:
+            raise ValueError(f"未知 stage: {target_stage}")
+        current = _stage_index(job.get("stage"))
+        if _stage_index(target_stage) < current:
+            raise ValueError(f"stage 不能回退: {job.get('stage')} -> {target_stage}")
+    _deep_merge(job, patch)
+    job["revision"] = int(job.get("revision", 1)) + 1
+    job["history"].append({"at": now_iso(), "event": event,
+                           "detail": detail, "revision": job["revision"]})
+    errors = validate_job(job, job_dir)
+    if errors:
+        raise ValueError("job.json 校验失败: " + "；".join(errors))
+    save_job(job, job_dir)
+    return job
+
+
+def _load_titles_items(titles_path: str) -> list[dict[str, Any]]:
+    with open(titles_path, encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("titles") if isinstance(data, dict) else data
+
+
+def record_titles(job_dir: str, titles_path: str, prompt_path: Optional[str] = None,
+                  prompt_version: Optional[str] = None) -> dict[str, Any]:
+    """Stage 1 落盘：登记 12 条标题与初始提示词，停在门禁前。"""
+    items = _load_titles_items(titles_path)
+    if not isinstance(items, list) or len(items) != 12:
+        raise ValueError(f"titles.json 应有 12 条，实际 {len(items) if isinstance(items, list) else '非数组'}")
+    ids = [str(item.get("id")) for item in items]
+    if ids != [f"T{i}" for i in range(1, 13)]:
+        raise ValueError("titles.json 的 id 必须依次为 T1—T12")
+    for item in items:
+        if not str(item.get("text") or "").strip():
+            raise ValueError(f"{item.get('id')} 缺少 text")
+
+    patch: dict[str, Any] = {
+        "stage": "titles_done",
+        "titles": {
+            "file": rel_path(os.path.abspath(titles_path), job_dir),
+            "gate": "pending",
+            "selected": [],
+            "selected_at": None,
+        },
+    }
+    if prompt_path:
+        prompt_abs = os.path.abspath(prompt_path)
+        patch["titles"]["prompt_file"] = rel_path(prompt_abs, job_dir)
+        patch["titles"]["prompt_sha256"] = sha256_file(prompt_abs)
+    if prompt_version:
+        patch["titles"]["prompt_version"] = prompt_version
+
+    return update_job(job_dir, patch, event="stage1_titles",
+                      detail=f"写入 {len(items)} 条标题，等待用户门禁")
+
+
+def _score_tuple(item: dict[str, Any]) -> tuple:
+    """排序键：总分 → 内容兑现 → 信息缺口 → 情绪峰值（与 scorecard 同序）。"""
+    score = item.get("score") or {}
+    total = item.get("total")
+    if not isinstance(total, (int, float)):
+        total = sum(v for v in score.values() if isinstance(v, (int, float)))
+    return (total,
+            score.get("內容兌現", 0), score.get("内容兑现", 0),
+            score.get("信息缺口", 0), score.get("情緒峰值", 0), score.get("情绪峰值", 0))
+
+
+def auto_pick_titles(titles_path: str, top_n: int = 3,
+                     mode: str = "recommended") -> dict[str, Any]:
+    """按评分自动选 top_n 条（Stage 2 直调兜底）。
+
+    mode="recommended"（默认）：summary.recommended（每版推荐各 1 条，通常 4 条）
+        优先按分入选；推荐池不足 top_n 时从全量按分补足，并记 fallback=True；
+        推荐池缺失时整体退化为全量评分。
+    mode="score"：全量按分取前 top_n。
+    两种模式均为：总分相同时推荐条目优先；再平则按 scorecard 同序细分
+    （内容兑现 → 信息缺口 → 情绪峰值）。
+    仅在 titles.json 含 score 字段时可用；否则报错，不瞎选。
+
+    返回 {"picks": [{slot,title_id,title,total,recommended}],
+          "mode": mode, "fallback": bool, "pool": [推荐池 id]}。
+    """
+    if mode not in ("recommended", "score"):
+        raise ValueError(f"未知兜底模式: {mode}")
+    with open(titles_path, encoding="utf-8") as f:
+        data = json.load(f)
+    items = data.get("titles") if isinstance(data, dict) else data
+    if not isinstance(items, list) or not items:
+        raise ValueError("titles.json 为空或格式非法，无法自动选择")
+    for item in items:
+        if not isinstance(item.get("score"), dict):
+            raise ValueError(f"{item.get('id')} 缺少 score，无法自动选择；请先完成人工门禁")
+
+    rec_pool: list[str] = []
+    if isinstance(data, dict):
+        rec_pool = [str(x) for x in ((data.get("summary") or {}).get("recommended") or [])]
+    rec_set = set(rec_pool)
+
+    def _key(it: dict[str, Any]) -> tuple:
+        st = _score_tuple(it)
+        return (st[0], str(it.get("id")) in rec_set, *st[1:])
+
+    ranked = sorted(items, key=_key, reverse=True)
+
+    fallback = False
+    if mode == "recommended":
+        if rec_set:
+            rec_items = [it for it in ranked if str(it.get("id")) in rec_set]
+            rest_items = [it for it in ranked if str(it.get("id")) not in rec_set]
+            picked = (rec_items + rest_items)[:top_n]
+            fallback = len(rec_items) < top_n
+        else:  # 推荐池缺失，整体退化为全量评分
+            picked = ranked[:top_n]
+            fallback = True
+    else:
+        picked = ranked[:top_n]
+
+    picks = [
+        {"slot": i + 1, "title_id": str(p["id"]), "title": p["text"],
+         "total": _score_tuple(p)[0], "recommended": str(p["id"]) in rec_set}
+        for i, p in enumerate(picked)
+    ]
+    return {"picks": picks, "mode": mode, "fallback": fallback, "pool": rec_pool}
+
+
+def _best_of_selected(job_dir: str, titles_file: Optional[str],
+                      selected: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """从 selected 的 3 条里挑评分最高的一条，用于竖版绑定。
+
+    平分时与兜底同序：总分 → 推荐条目优先 → 内容兑现 → 信息缺口 → 情绪峰值。
+    评分数据缺失（titles.json 不在 / 条目无 score）时返回 None，不绑定。
+    """
+    if len(selected) != 3:
+        return None
+    path = os.path.join(job_dir, titles_file or "02_titles/titles.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    items = data.get("titles") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    rec_set = {str(x) for x in (((data.get("summary") or {}).get("recommended")) or [])} \
+        if isinstance(data, dict) else set()
+    by_id = {str(it.get("id")): it for it in items if isinstance(it, dict)}
+    ranked: list[tuple] = []
+    for entry in selected:
+        it = by_id.get(str(entry.get("title_id")))
+        if not it or not isinstance(it.get("score"), dict):
+            return None
+        st = _score_tuple(it)
+        ranked.append(((st[0], str(it.get("id")) in rec_set, *st[1:]), entry))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return ranked[0][1]
+
+
+def _annotate_titles_file(job_dir: str, job: dict[str, Any],
+                          picks: list[dict[str, Any]], by: str) -> None:
+    """门禁后在 titles.json 原位标注：选中 3 条加 selected/slot，顶层记 gate。
+
+    不复制标题文本，job.json 仍是唯一事实源；这里只是让 02_titles/titles.json
+    自包含（豆包侧 Stage 2 只读这个文件也能看懂结果）。
+    """
+    titles_rel = (job.get("titles") or {}).get("file")
+    if not titles_rel:
+        return
+    path = os.path.join(job_dir, titles_rel)
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    items = data.get("titles") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return
+    by_id = {p["title_id"]: p for p in picks}
+    for item in items:
+        item.pop("selected", None)
+        item.pop("slot", None)
+        tid = str(item.get("id"))
+        if tid in by_id:
+            item["selected"] = True
+            item["slot"] = by_id[tid]["slot"]
+    if isinstance(data, dict):
+        data["gate"] = "done"
+        data["selected_at"] = now_iso()
+        data["selected_by"] = by
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def select_titles(job_dir: str, picks: list[dict[str, Any]],
+                  by: str = "user", auto_mode: Optional[str] = None) -> dict[str, Any]:
+    """写入门禁结果：titles.selected + gate=done + cover_map 回填。
+
+    picks: [{"slot":1,"title_id":"T6","title":"..."},...] 共 3 项。
+    by: "user"（人工门禁）/ "auto"（兜底自动选分）。
+    auto_mode: 兜底模式（"recommended"/"score"），仅 by="auto" 时记录，人工选置空。
+    """
+    if by not in ("user", "auto"):
+        raise ValueError(f"by 非法: {by}")
+    if len(picks) != 3:
+        raise ValueError(f"selected 应为 3 项，实际 {len(picks)}")
+
+    path = os.path.join(job_dir, "job.json")
+    job = load_job(path)
+
+    # 回填 cover_map：按 slot 对齐 title_id / title
+    cover_map = job.get("cover_map") or []
+    by_slot = {p["slot"]: p for p in picks}
+    new_map = []
+    for item in cover_map:
+        slot = item.get("slot")
+        if slot in by_slot:
+            item = dict(item)
+            item["title_id"] = by_slot[slot]["title_id"]
+            item["title"] = by_slot[slot]["title"]
+        new_map.append(item)
+
+    patch: dict[str, Any] = {
+        "stage": "titles_selected",
+        "titles": {
+            "gate": "done",
+            "selected": [{"slot": p["slot"], "title_id": p["title_id"],
+                          "title": p["title"]} for p in picks],
+            "selected_at": now_iso(),
+            "selected_by": by,
+            "auto_mode": auto_mode if by == "auto" else None,
+        },
+        "cover_map": new_map,
+    }
+    # 竖版绑定：selected 中评分最高的一条（无评分数据则保持 null）
+    best = _best_of_selected(job_dir, (job.get("titles") or {}).get("file"), picks)
+    event = "gate_select" if by == "user" else "gate_auto_select"
+    mode_label = {"recommended": "推荐模式（推荐池优先）",
+                  "score": "评分模式（全量取前 3）"}.get(auto_mode, "评分")
+    detail = ("用户门禁选定 3 条标题" if by == "user"
+              else f"兜底机制：用户未选，{mode_label}自动选定前 3 条")
+    if best:
+        patch["vertical_cover"] = {"title_id": best["title_id"], "title": best["title"]}
+        detail += f"；竖版绑定最高分 {best['title_id']}"
+    job = update_job(job_dir, patch, event=event, detail=detail)
+    _annotate_titles_file(job_dir, job, picks, by)
+    return job
+
+
+def resolve_reference(job: dict[str, Any], job_dir: str) -> dict[str, Any]:
+    """参考图兜底链：reference_image → reference_original → 剧集目录探测 → 空。
+
+    返回 {"path": 绝对路径|None, "via": 命中环节, "warnings": [...]}
+    """
+    warnings: list[str] = []
+    inp = job.get("input") or {}
+
+    for rel, via in ((inp.get("reference_image"), "input.reference_image"),
+                     (inp.get("reference_original"), "input.reference_original")):
+        if rel:
+            p = os.path.normpath(os.path.join(job_dir, rel))
+            if os.path.isfile(p):
+                if via.endswith("reference_original"):
+                    warnings.append("任务副本缺失，回退到原始参考图")
+                return {"path": p, "via": via, "warnings": warnings}
+            warnings.append(f"{via} 指向的文件不存在: {rel}")
+
+    # 剧集目录探测（cover_job 的父目录）
+    series_dir = os.path.dirname(os.path.normpath(job_dir))
+    found = detect_reference_image(series_dir)
+    if found.get("path"):
+        warnings.append(f"回退到剧集目录探测: {found.get('reason')}")
+        return {"path": found["path"], "via": "series_dir_detect",
+                "warnings": warnings}
+
+    warnings.append("参考图兜底链全部落空")
+    return {"path": None, "via": None, "warnings": warnings}
+
+
+def resolve_context(job_dir: str, *, auto: bool = True,
+                    dry_run: bool = False,
+                    mode: str = "recommended") -> dict[str, Any]:
+    """Stage 2 一键取上下文：选定标题 + 参考图 + 提示词，带完整兜底链。
+
+    - 标题：gate=done 直接用 selected；否则 auto=True 时按 mode 自动取前 3
+      并写回 job.json（selected_by="auto"、auto_mode=mode），dry_run 只演算不落盘。
+      mode="recommended"（默认）：summary.recommended 推荐池优先；
+      mode="score"：全量评分取前 3。同分时推荐条目优先。
+    - 参考图：resolve_reference 兜底链。
+    返回 dict，含 warnings；调用方据此决定是否继续。
+    """
+    job = load_job(os.path.join(job_dir, "job.json"))
+    warnings: list[str] = []
+    titles_info: dict[str, Any]
+
+    gate = (job.get("titles") or {}).get("gate")
+    if gate == "done" and (job.get("titles") or {}).get("selected"):
+        titles_info = {
+            "selected": job["titles"]["selected"],
+            "selected_by": (job["titles"] or {}).get("selected_by") or "user",
+            "auto_applied": False,
+        }
+    else:
+        titles_file = (job.get("titles") or {}).get("file") or "02_titles/titles.json"
+        titles_path = os.path.join(job_dir, titles_file)
+        if not os.path.isfile(titles_path):
+            raise FileNotFoundError(
+                f"门禁未过且找不到 {titles_file}；请先完成 Stage 1")
+        if not auto:
+            raise ValueError(
+                "titles.gate != done 且未允许自动选择；请先完成人工门禁")
+        picks_result = auto_pick_titles(titles_path, top_n=3, mode=mode)
+        picks = picks_result["picks"]
+        mode_desc = "推荐模式" if mode == "recommended" else "评分模式"
+        fb = "（推荐池不足/缺失，已从全量补足）" if picks_result["fallback"] else ""
+        warnings.append(
+            f"用户未完成门禁，已按{mode_desc}{fb}自动选定: "
+            + ",".join(p["title_id"] for p in picks))
+        if not dry_run:
+            job = select_titles(job_dir, picks, by="auto", auto_mode=mode)
+        titles_info = {"selected": picks, "selected_by": "auto",
+                       "auto_applied": True, "auto_mode": mode,
+                       "fallback": picks_result["fallback"]}
+
+    ref = resolve_reference(job, job_dir)
+    warnings.extend(ref["warnings"])
+
+    prompts = (job.get("prompts") or {}).get("items") or []
+
+    return {
+        "job_dir": job_dir,
+        "revision": job.get("revision"),
+        "stage": job.get("stage"),
+        "titles": titles_info,
+        "reference_image": {"path": ref["path"], "via": ref["via"]},
+        "prompts": prompts,
+        "cover_map": job.get("cover_map"),
+        "dry_run": dry_run,
+        "warnings": warnings,
+    }
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def detect_stream_export(series_dir: Optional[str] = None,
+                         draft_name: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """在 pipeline/_stream_manifests 里按 source_dir 或 draft_name 找导出记录。
+
+    返回 {draft_name, manifest, export_file, export_dir, exists}；找不到返回 None。
+    """
+    mdir = os.path.join(_repo_root(), "pipeline", "_stream_manifests")
+    if not os.path.isdir(mdir):
+        return None
+    target_src = os.path.normpath(series_dir) if series_dir else None
+    for fn in sorted(os.listdir(mdir)):
+        if not fn.endswith(".json"):
+            continue
+        mp = os.path.join(mdir, fn)
+        try:
+            with open(mp, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        paths = data.get("paths") or {}
+        if draft_name:
+            if data.get("draft_name") != draft_name:
+                continue
+        elif target_src and os.path.normpath(paths.get("source_dir") or "") != target_src:
+            continue
+        export_file = paths.get("export_file")
+        if not export_file:
+            continue
+        return {
+            "draft_name": data.get("draft_name"),
+            "manifest": rel_path(mp, _repo_root()),
+            "export_file": export_file,
+            "export_dir": os.path.dirname(export_file),
+            "exists": os.path.isfile(export_file),
+        }
+    return None
+
+
+def _export_companions(export_file: str) -> list[str]:
+    """成品旁的脚本产物：<mp4>.progress.json、<名>-封面.jpg。"""
+    base, _ = os.path.splitext(export_file)
+    return [export_file + ".progress.json", base + "-封面.jpg"]
+
+
+def record_video(job_dir: str, *, export_dir: Optional[str] = None,
+                 export_file: Optional[str] = None,
+                 draft_name: Optional[str] = None,
+                 dry_run: bool = False) -> dict[str, Any]:
+    """登记 pipeline 导出目录：只记录位置，不复制 mp4。
+
+    自动按 source_dir=cover_job 父目录探测 stream manifest；同时把
+    stream_manifest.py 的清理联动挂到 cleanup.external（记录不接管）。
+    仅当当前 stage 已过 covers_ready 时才推进到 video_ready。
+    """
+    job = load_job(os.path.join(job_dir, "job.json"))
+    series_dir = os.path.dirname(os.path.normpath(job_dir))
+    info = detect_stream_export(series_dir, draft_name)
+
+    # 手工指定优先：用户显式给的值永远覆盖自动探测结果
+    overridden: list[str] = []
+    if info:
+        for key, user_val, auto_val in (
+                ("export_file", export_file, info["export_file"]),
+                ("export_dir", export_dir, info["export_dir"]),
+                ("draft_name", draft_name, info["draft_name"])):
+            if user_val and auto_val and os.path.normpath(str(user_val)) != os.path.normpath(str(auto_val)):
+                overridden.append(f"{key}: 手工={user_val}（覆盖探测 {auto_val}）")
+        export_file = export_file or info["export_file"]
+        export_dir = export_dir or info["export_dir"]
+        draft_name = draft_name or info["draft_name"]
+    if export_file and not export_dir:
+        export_dir = os.path.dirname(export_file)
+    if not export_dir and not export_file:
+        raise ValueError("未在 pipeline/_stream_manifests 找到该剧导出记录；"
+                         "请提供 --export-dir 或 --draft-name")
+    if not export_file and export_dir and os.path.isdir(export_dir):
+        mp4s = [n for n in os.listdir(export_dir) if n.lower().endswith(".mp4")]
+        if len(mp4s) == 1:
+            export_file = os.path.join(export_dir, mp4s[0])
+
+    companions = [p for p in (_export_companions(export_file) if export_file else [])
+                  if os.path.exists(p)]
+
+    patch: dict[str, Any] = {"video": {
+        "export_dir": (export_dir or "").replace(os.sep, "/") or None,
+        "export_file": (export_file or "").replace(os.sep, "/") or None,
+        "draft_name": draft_name,
+        "companions": [p.replace(os.sep, "/") for p in companions],
+    }}
+
+    if draft_name:
+        ext_entry = {
+            "tool": "pipeline/stream_manifest.py",
+            "draft_name": draft_name,
+            "manifest": info["manifest"] if info else None,
+            "command": f'python pipeline/stream_manifest.py clean "{draft_name}"',
+            "scope": ["export_bundle(mp4+封面+progress)", "draft_dir",
+                      "jycache_dir", "workdir"],
+            "deletes_final_mp4": True,
+            "status": "pending",
+        }
+        external = [e for e in (job.get("cleanup") or {}).get("external", [])
+                    if e.get("draft_name") != draft_name]
+        external.append(ext_entry)
+        patch["cleanup"] = {"external": external}
+
+    if _stage_index(job.get("stage")) >= _stage_index("covers_ready"):
+        patch["stage"] = "video_ready"
+
+    if dry_run:
+        return {"dry_run": True, "patch": patch, "overridden": overridden,
+                "detected": info, "companions": companions}
+
+    detail = f"导出目录: {patch['video']['export_dir']}"
+    if overridden:
+        detail += "；" + "；".join(overridden)
+    return update_job(job_dir, patch, event="video_recorded", detail=detail)
+
+
+def backfill_hashes(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
+    """补算无执行环境宿主（豆包）写为 null 的 hash 字段。
+
+    覆盖：input.reference_sha256、titles.prompt_sha256、cover_map[].image_sha256、
+    vertical_cover.image_sha256。仅当字段为 None 且对应文件存在时补算。
+    """
+    job = load_job(os.path.join(job_dir, "job.json"))
+    filled: list[str] = []
+
+    def _fill(container: dict[str, Any], path_key: str, hash_key: str, label: str) -> None:
+        rel = container.get(path_key)
+        if rel and container.get(hash_key) is None:
+            p = os.path.normpath(os.path.join(job_dir, rel))
+            if os.path.isfile(p):
+                container[hash_key] = sha256_file(p)
+                filled.append(label)
+
+    _fill(job.setdefault("input", {}), "reference_image", "reference_sha256",
+          "input.reference_sha256")
+    _fill(job.setdefault("titles", {}), "prompt_file", "prompt_sha256",
+          "titles.prompt_sha256")
+    for item in job.get("cover_map") or []:
+        _fill(item, "image", "image_sha256", f"cover_map[{item.get('slot')}].image_sha256")
+    _fill(job.setdefault("vertical_cover", {}), "image", "image_sha256",
+          "vertical_cover.image_sha256")
+
+    if dry_run or not filled:
+        return {"dry_run": dry_run, "filled": filled, "changed": bool(filled)}
+
+    job["revision"] = job.get("revision", 0) + 1
+    job.setdefault("history", []).append({
+        "revision": job["revision"], "event": "hash_backfill",
+        "detail": f"补算 {len(filled)} 个 hash: {', '.join(filled)}",
+        "at": now_iso()})
+    errors = validate_job(job, job_dir)
+    if errors:
+        raise ValueError("补算后校验失败: " + "; ".join(errors))
+    save_job(job, job_dir)
+    return {"dry_run": False, "filled": filled, "changed": True,
+            "revision": job["revision"]}
+
+
+# 平台派生规格（契约 §6：derived 放平台用图；尺寸为建议值，核实后更新）
+DERIVE_PRESETS: dict[str, dict[str, Any]] = {
+    "youtube":         {"source": "horizontal", "size": (1280, 720),
+                        "max_bytes": 2 * 1024 * 1024},
+    "tiktok":          {"source": "vertical",   "size": (1080, 1920),
+                        "max_bytes": None},
+    "instagram-reels": {"source": "vertical",   "size": (1080, 1920),
+                        "max_bytes": None},
+    "facebook-reels":  {"source": "vertical",   "size": (1080, 1920),
+                        "max_bytes": None},
+}
+
+
+def derive_covers(job_dir: str, platforms: list[str], *, slot: int = 1) -> dict[str, Any]:
+    """从 04_covers 契约原图派生平台尺寸到 04_covers/derived/（不写 job.json）。
+
+    horizontal 源取 cover_map[slot]（默认封面1），vertical 源取 vertical_cover。
+    输出 jpg，命名 <源stem>_<platform>_<W>x<H>.jpg；max_bytes 超限自动降 quality。
+    derived 是易变产物：不参与 hash 校验，可随时删除重新生成。
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError("derive 需要 Pillow：pip install Pillow")
+
+    bad = [p for p in platforms if p not in DERIVE_PRESETS]
+    if bad:
+        raise ValueError(
+            f"未知平台: {','.join(bad)}；可选 {','.join(DERIVE_PRESETS)} / all")
+
+    job = load_job(os.path.join(job_dir, "job.json"))
+
+    def _source_path(kind: str) -> str:
+        if kind == "horizontal":
+            cm = [c for c in (job.get("cover_map") or []) if c.get("slot") == slot]
+            rel = cm[0].get("file") if cm else None
+        else:
+            rel = (job.get("vertical_cover") or {}).get("file")
+        if not rel:
+            raise FileNotFoundError(f"job.json 缺少 {kind} 源文件登记（slot={slot}）")
+        p = os.path.join(job_dir, rel)
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"源文件不存在: {rel}（Stage 2 产物落盘后再派生）")
+        return p
+
+    out_dir = os.path.join(job_dir, "04_covers", "derived")
+    os.makedirs(out_dir, exist_ok=True)
+    results = []
+    for plat in platforms:
+        spec = DERIVE_PRESETS[plat]
+        src = _source_path(spec["source"])
+        w, h = spec["size"]
+        stem = os.path.splitext(os.path.basename(src))[0]
+        dst = os.path.join(out_dir, f"{stem}_{plat}_{w}x{h}.jpg")
+        img = Image.open(src).convert("RGB").resize((w, h), Image.LANCZOS)
+        quality = 92
+        img.save(dst, "JPEG", quality=quality)
+        limit = spec["max_bytes"]
+        while limit and os.path.getsize(dst) > limit and quality > 60:
+            quality -= 8
+            img.save(dst, "JPEG", quality=quality)
+        results.append({"platform": plat,
+                        "source": os.path.relpath(src, job_dir),
+                        "file": os.path.relpath(dst, job_dir),
+                        "size": [w, h], "bytes": os.path.getsize(dst),
+                        "quality": quality})
+    return {"derived": results}
+
+
+def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
+    """Stage 2 收口：从落盘产物（prompts.json + 4 张契约图）重建 job.json。
+
+    收登记、规范化（selected.slot 中文→数字）、补 hash、推进 stage（只进不退）。
+    幂等：重复跑安全；同名换图重跑会刷新 hash 并在报告 normalized 中体现。
+    """
+    job = load_job(os.path.join(job_dir, "job.json"))
+    stage = job.get("stage")
+    if stage not in ("titles_selected", "prompts_ready", "covers_ready"):
+        raise ValueError(
+            f"ingest 要求 stage ∈ titles_selected/prompts_ready/covers_ready，当前 {stage!r}")
+    titles = job.get("titles") or {}
+    if titles.get("gate") != "done":
+        raise ValueError("titles.gate 未 done：先完成标题门禁再 ingest")
+
+    report: dict[str, Any] = {"stage_from": stage, "prompts": None, "covers": [],
+                              "missing_covers": [], "hash_filled": [], "normalized": []}
+
+    # ── 规范化：selected[].slot "封面N" → N（canonical=数字）
+    for entry in titles.get("selected") or []:
+        slot = entry.get("slot")
+        if isinstance(slot, str):
+            m = re.fullmatch(r"封面\s*([123])", slot.strip())
+            if m:
+                entry["slot"] = int(m.group(1))
+                report["normalized"].append(f"selected.slot {slot}→{entry['slot']}")
+
+    # ── 竖版绑定：selected 中评分最高的一条（已绑过则不动）
+    vc = job.get("vertical_cover") or {}
+    if titles.get("selected") and vc.get("title_id") is None:
+        best = _best_of_selected(job_dir, titles.get("file"), titles["selected"])
+        if best:
+            job.setdefault("vertical_cover", {})
+            job["vertical_cover"]["title_id"] = best["title_id"]
+            job["vertical_cover"]["title"] = best["title"]
+            report["normalized"].append(f"vertical_cover 绑定最高分标题 {best['title_id']}")
+
+    # ── 收 prompts
+    prompts_path = os.path.join(job_dir, "03_prompts", "prompts.json")
+    if os.path.isfile(prompts_path):
+        with open(prompts_path, encoding="utf-8") as f:
+            pdata = json.load(f)
+        items = pdata.get("items") or []
+        slots = {it.get("slot") for it in items}
+        missing = sorted(({1, 2, 3, "vertical"} - slots), key=str)
+        if missing:
+            raise ValueError(f"prompts.json 槽位不齐，缺: {missing}")
+        new_hash = sha256_file(prompts_path)
+        psec = job.setdefault("prompts", {})
+        if psec.get("prompt_sha256") is None:
+            report["hash_filled"].append("prompts.prompt_sha256")
+        elif psec["prompt_sha256"] != new_hash:
+            report["normalized"].append("prompts.prompt_sha256 刷新")
+        psec.update({"file": "03_prompts/prompts.json",
+                     "channel": pdata.get("channel"), "items": items,
+                     "count": len(items), "prompt_sha256": new_hash})
+        report["prompts"] = {"items": len(items), "channel": pdata.get("channel")}
+
+    # ── 收 covers（契约文件名，扩展名自适应）
+    exts = (".png", ".jpg", ".jpeg", ".webp")
+
+    def _find(stem: str) -> Optional[str]:
+        for ext in exts:
+            p = os.path.join(job_dir, "04_covers", stem + ext)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _fill(entry: dict[str, Any], path: str, tag: Any) -> None:
+        rel = f"04_covers/{os.path.basename(path)}"
+        new_hash = sha256_file(path)
+        if entry.get("image_sha256") is None:
+            report["hash_filled"].append(f"cover[{tag}].image_sha256")
+        elif entry["image_sha256"] != new_hash:
+            report["normalized"].append(f"cover[{tag}] hash 刷新（文件已更换）")
+        entry.update({"file": rel, "image": rel,
+                      "image_sha256": new_hash, "status": "done"})
+        entry.setdefault("generated_at", now_iso())
+        report["covers"].append(tag)
+
+    stems = {1: "cover_01_hit", 2: "cover_02_contrast", 3: "cover_03_guard"}
+    for cm in job.get("cover_map") or []:
+        p = _find(stems[cm["slot"]]) if cm.get("slot") in stems else None
+        if p:
+            _fill(cm, p, cm["slot"])
+        else:
+            report["missing_covers"].append(cm.get("slot"))
+    vp = _find("cover_04_vertical")
+    if vp:
+        _fill(job.setdefault("vertical_cover", {}), vp, "vertical")
+    else:
+        report["missing_covers"].append("vertical")
+
+    # ── 参考图 hash（null 且文件在则补）
+    inp = job.get("input") or {}
+    ref = inp.get("reference_image")
+    if ref and inp.get("reference_sha256") is None:
+        rp = os.path.join(job_dir, ref)
+        if os.path.isfile(rp):
+            inp["reference_sha256"] = sha256_file(rp)
+            report["hash_filled"].append("input.reference_sha256")
+
+    # ── stage 推进（只进不退）
+    order = ["titles_selected", "prompts_ready", "covers_ready"]
+    new_stage = stage
+    horizontal = [c for c in report["covers"] if c in (1, 2, 3)]
+    if report["prompts"]:
+        new_stage = "prompts_ready"
+        if len(horizontal) == 3 and "vertical" in report["covers"]:
+            new_stage = "covers_ready"
+    if order.index(new_stage) < order.index(stage):
+        new_stage = stage
+    job["stage"] = new_stage
+    report["stage_to"] = new_stage
+
+    if dry_run:
+        report["dry_run"] = True
+        return report
+    job["revision"] = int(job.get("revision") or 0) + 1
+    job.setdefault("history", []).append({
+        "at": now_iso(), "event": "ingest",
+        "detail": f"covers={len(report['covers'])}/4 "
+                  f"missing={report['missing_covers']} stage {stage}->{new_stage}",
+        "revision": job["revision"]})
+    errors = validate_job(job, job_dir)
+    if errors:
+        raise ValueError("ingest 后校验失败: " + "；".join(errors))
+    save_job(job, job_dir)
+    report["validate"] = "ok"
+    return report
+
+
+def create_job(
+    *,
+    series: Optional[str] = None,
+    synopsis: Optional[str] = None,
+    series_dir: Optional[str] = None,
+    reference: Optional[str] = None,
+    video: Optional[str] = None,
+    out_dir: Optional[str] = None,
+    host: str = "trae",
+    force: bool = False,
+) -> dict[str, Any]:
+    """创建任务目录与 job.json。默认目录为 <剧集目录>/cover_job。"""
+    if series is None and series_dir:
+        series = os.path.basename(os.path.normpath(series_dir))
+    series = sanitize_name(series or "未命名剧集")
+    slug = sanitize_name(series)
+
+    if out_dir:
+        target = os.path.abspath(out_dir)
+    elif series_dir:
+        target = os.path.join(os.path.abspath(series_dir), "cover_job")
+    else:
+        target = os.path.abspath(os.path.join("jobs", slug))
+
+    job_path = os.path.join(target, "job.json")
+    if os.path.exists(job_path) and not force:
+        raise FileExistsError(f"{job_path} 已存在；如需重建请加 --force")
+
+    for rel in JOB_DIRS:
+        os.makedirs(os.path.join(target, rel), exist_ok=True)
+
+    synopsis_info = {"path": None, "candidates": []}
+    if not synopsis and series_dir:
+        synopsis_info = detect_synopsis(series_dir)
+        if synopsis_info["path"]:
+            with open(synopsis_info["path"], encoding="utf-8") as f:
+                synopsis = f.read().strip()
+    if not synopsis:
+        raise ValueError("简介为空；请提供 --synopsis 或在剧集目录放置 简介.txt")
+
+    with open(os.path.join(target, "01_input", "synopsis.txt"), "w", encoding="utf-8") as f:
+        f.write(synopsis.strip() + "\n")
+
+    if reference:
+        ref_path = os.path.abspath(reference)
+        if not os.path.isfile(ref_path):
+            raise FileNotFoundError(f"参考图不存在: {reference}")
+        ref_info = {"path": ref_path, "source": os.path.basename(ref_path),
+                    "reason": "显式指定"}
+    elif series_dir:
+        ref_info = detect_reference_image(series_dir)
+    else:
+        ref_info = {"path": None, "source": None, "reason": "未提供剧集目录"}
+
+    if video:
+        video_path = os.path.abspath(video)
+        if not os.path.isfile(video_path):
+            raise FileNotFoundError(f"视频不存在: {video}")
+        video_info = {"path": video_path, "count": 1, "pattern": None}
+    elif series_dir:
+        video_info = detect_video(series_dir)
+    else:
+        video_info = {"path": None, "count": 0, "pattern": None}
+
+    job = build_job(series, host=host)
+
+    if synopsis_info["path"]:
+        job["input"]["synopsis_source"] = rel_path(synopsis_info["path"], target)
+    elif series_dir:
+        job["input"]["synopsis_source"] = "cli"
+    job["input"]["synopsis_candidates"] = [
+        rel_path(p, target) for p in synopsis_info["candidates"]
+    ]
+
+    if ref_info.get("path"):
+        suffix = os.path.splitext(ref_info["path"])[1].lower() or ".jpg"
+        rel_ref = f"01_input/reference{suffix}"
+        shutil.copy2(ref_info["path"], os.path.join(target, rel_ref))
+        job["input"]["reference_image"] = rel_ref
+        job["input"]["reference_original"] = rel_path(ref_info["path"], target)
+        job["input"]["reference_sha256"] = sha256_file(ref_info["path"])
+    job["input"]["reference_source"] = ref_info.get("source")
+    job["input"]["reference_reason"] = ref_info.get("reason")
+
+    if video_info.get("path"):
+        job["video"]["path"] = rel_path(video_info["path"], target)
+        job["video"]["source"] = os.path.basename(video_info["path"])
+    job["video"]["candidates_count"] = video_info.get("count", 0)
+    job["video"]["name_pattern"] = video_info.get("pattern")
+
+    job["history"].append({
+        "at": now_iso(),
+        "event": "prepare",
+        "detail": "创建目录，写入简介与参考图",
+        "revision": 1,
+    })
+
+    errors = validate_job(job, target)
+    if errors:
+        raise ValueError("job.json 校验失败: " + "；".join(errors))
+
+    save_job(job, target)
+    return {
+        "job_dir": target,
+        "job_path": job_path,
+        "job": job,
+        "reference": ref_info,
+        "synopsis": synopsis_info,
+        "video": video_info,
+    }
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="job_manifest", description="job.json 工具")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    p_val = sub.add_parser("validate", help="校验现有 job.json")
+    p_val.add_argument("--job", required=True)
+    p_val.add_argument("--fix", action="store_true",
+                       help="先补算 null 的 hash 字段再校验（豆包交接回 Trae 时用）")
+
+    p_upd = sub.add_parser("update", help="深合并补丁并推进 stage")
+    p_upd.add_argument("--job", required=True)
+    p_upd.add_argument("--patch-file", required=True)
+    p_upd.add_argument("--event", default="update")
+    p_upd.add_argument("--detail", default="")
+
+    p_tit = sub.add_parser("record-titles", help="登记 Stage 1 的 12 条标题")
+    p_tit.add_argument("--job", required=True)
+    p_tit.add_argument("--titles", required=True)
+    p_tit.add_argument("--prompt", default=None)
+    p_tit.add_argument("--prompt-version", default=None)
+
+    p_sel = sub.add_parser("select", help="人工门禁：按 slot 顺序给 3 个编号")
+    p_sel.add_argument("--job", required=True)
+    p_sel.add_argument("--picks", required=True,
+                       help="逗号分隔 3 个编号，依次为封面1/2/3，如 T6,T11,T1")
+
+    p_res = sub.add_parser("resolve", help="Stage 2 取上下文（含兜底链）")
+    p_res.add_argument("--job", required=True)
+    p_res.add_argument("--no-auto", action="store_true",
+                       help="禁止自动选分，门禁未过直接报错")
+    p_res.add_argument("--mode", choices=["recommended", "score"],
+                       default="recommended",
+                       help="兜底模式：recommended（默认，推荐池优先）/ score（全量评分）")
+    p_res.add_argument("--dry-run", action="store_true",
+                       help="只演算不写回 job.json")
+
+    p_vid = sub.add_parser("record-video", help="登记 pipeline 导出目录与清理联动")
+    p_vid.add_argument("--job", required=True)
+    p_vid.add_argument("--export-dir", default=None)
+    p_vid.add_argument("--export-file", default=None)
+    p_vid.add_argument("--draft-name", default=None)
+    p_vid.add_argument("--dry-run", action="store_true")
+
+    p_drv = sub.add_parser("derive", help="从 04_covers 派生平台尺寸到 derived/")
+    p_drv.add_argument("--job", required=True)
+    p_drv.add_argument("--platform", default=None,
+                       help="逗号分隔：youtube,tiktok,ig,facebook 或 all；也可用下方的快捷标志")
+    p_drv.add_argument("--youtube", action="store_true", help="= youtube（1280×720 <2MB）")
+    p_drv.add_argument("--tiktok", action="store_true", help="= tiktok（1080×1920）")
+    p_drv.add_argument("--ig", action="store_true", help="= instagram-reels（1080×1920）")
+    p_drv.add_argument("--facebook", action="store_true", help="= facebook-reels（1080×1920）")
+    p_drv.add_argument("--slot", type=int, default=1, choices=[1, 2, 3],
+                       help="横版源用第几个封面位（默认 1）")
+
+    p_ing = sub.add_parser("ingest", help="Stage 2 收口：收 prompts+covers、规范化、补 hash、推进 stage")
+    p_ing.add_argument("--job", required=True)
+    p_ing.add_argument("--dry-run", action="store_true")
+
+    p_cut = sub.add_parser("set-cut", help="设置/清除导出裁剪秒数 video.cut_s（默认 null 不裁剪）")
+    p_cut.add_argument("--job", required=True)
+    p_cut.add_argument("--cut", required=True,
+                       help="正数秒数（≤ duration_s）；传 0 或 null 清除为不裁剪")
+
+    args = ap.parse_args(argv)
+    job_dir = os.path.dirname(os.path.abspath(args.job))
+    if os.path.isdir(args.job):
+        job_dir = os.path.abspath(args.job)
+
+    if args.command == "validate":
+        if args.fix:
+            try:
+                result = backfill_hashes(job_dir)
+            except ValueError as e:
+                print(f"[FAIL] {e}")
+                return 1
+            if result["filled"]:
+                print(f"[OK] 补算 {len(result['filled'])} 个 hash: "
+                      + ", ".join(result["filled"]))
+            else:
+                print("[OK] 无需补算的 hash")
+        job = load_job(os.path.join(job_dir, "job.json"))
+        errors = validate_job(job, job_dir)
+        if errors:
+            print("[FAIL] " + "；".join(errors))
+            return 1
+        print("[OK] job.json 通过校验")
+        return 0
+
+    if args.command == "update":
+        with open(args.patch_file, encoding="utf-8") as f:
+            patch = json.load(f)
+        job = update_job(job_dir, patch, event=args.event, detail=args.detail)
+        print(f"[OK] revision={job['revision']} stage={job['stage']}")
+        return 0
+
+    if args.command == "record-titles":
+        job = record_titles(job_dir, args.titles, args.prompt, args.prompt_version)
+        print(f"[OK] revision={job['revision']} stage={job['stage']} gate={job['titles']['gate']}")
+        return 0
+
+    if args.command == "select":
+        ids = [s.strip() for s in args.picks.split(",") if s.strip()]
+        if len(ids) != 3:
+            print("[FAIL] --picks 需要恰好 3 个编号，如 T6,T11,T1")
+            return 1
+        titles_file = os.path.join(
+            job_dir, (load_job(os.path.join(job_dir, "job.json"))
+                      .get("titles") or {}).get("file") or "02_titles/titles.json")
+        items = {str(t.get("id")): t for t in _load_titles_items(titles_file)}
+        picks = []
+        for slot, tid in enumerate(ids, start=1):
+            if tid not in items:
+                print(f"[FAIL] 编号不存在: {tid}")
+                return 1
+            picks.append({"slot": slot, "title_id": tid,
+                          "title": items[tid]["text"]})
+        job = select_titles(job_dir, picks, by="user")
+        print(f"[OK] revision={job['revision']} stage={job['stage']} gate=done "
+              f"selected={','.join(ids)}")
+        return 0
+
+    if args.command == "resolve":
+        try:
+            ctx = resolve_context(job_dir, auto=not args.no_auto,
+                                  dry_run=args.dry_run, mode=args.mode)
+        except (ValueError, FileNotFoundError) as e:
+            print(f"[FAIL] {e}")
+            return 1
+        print(json.dumps(ctx, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "record-video":
+        try:
+            result = record_video(job_dir, export_dir=args.export_dir,
+                                  export_file=args.export_file,
+                                  draft_name=args.draft_name,
+                                  dry_run=args.dry_run)
+        except ValueError as e:
+            print(f"[FAIL] {e}")
+            return 1
+        if args.dry_run:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(f"[OK] revision={result['revision']} stage={result['stage']} "
+                  f"export_dir={result['video']['export_dir']}")
+        return 0
+
+    if args.command == "derive":
+        alias = {"youtube": "youtube", "tiktok": "tiktok",
+                 "ig": "instagram-reels", "facebook": "facebook-reels"}
+        plats = [v for k, v in alias.items() if getattr(args, k)]
+        if args.platform:
+            plats += [alias.get(p.strip(), p.strip())
+                      for p in args.platform.split(",") if p.strip()]
+        if "all" in plats:
+            plats = list(DERIVE_PRESETS)
+        plats = list(dict.fromkeys(plats))
+        if not plats:
+            print("[FAIL] 至少指定一个平台：--platform tiktok 或 --tiktok")
+            return 1
+        try:
+            result = derive_covers(job_dir, plats, slot=args.slot)
+        except (ValueError, FileNotFoundError, RuntimeError) as e:
+            print(f"[FAIL] {e}")
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "ingest":
+        try:
+            result = ingest_job(job_dir, dry_run=args.dry_run)
+        except (ValueError, FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"[FAIL] {e}")
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "set-cut":
+        raw = str(args.cut).strip().lower()
+        if raw in ("0", "null", "none"):
+            cut: Optional[float] = None
+        else:
+            try:
+                cut = float(raw)
+            except ValueError:
+                print(f"[FAIL] --cut 无法解析为数字: {args.cut}")
+                return 1
+            if cut <= 0:
+                print("[FAIL] --cut 必须为正数秒数；要清除请传 0 或 null")
+                return 1
+        try:
+            job = update_job(job_dir, {"video": {"cut_s": cut}},
+                             event="set_cut",
+                             detail=f"video.cut_s={cut}")
+        except ValueError as e:
+            print(f"[FAIL] {e}")
+            return 1
+        print(f"[OK] revision={job['revision']} video.cut_s={job['video']['cut_s']}")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
