@@ -1,7 +1,7 @@
 """cover_watch.py — cover_job 落盘监听 → 本地执行链自动触发（Stage 2 之后）。
 
 触发条件（全部满足，契约见 references/handoff-contract.md）：
-  1. 04_covers/ 4 张契约图齐（cover_01_hit / 02_contrast / 03_guard / 04_vertical，png/jpg/jpeg/webp）
+  1. 04_covers/ 有 4 张图，可被自动识别为 3 横 + 1 竖（文件名可任意，宽高比/编号容错）
   2. 03_prompts/prompts.json 存在
   3. job.json 可解析
   4. titles.gate == "done"
@@ -13,14 +13,17 @@
 进度观测：Toast 通知 / cover_job/watcher.log / cover_job/06_publish/pipeline.log / status 命令 / job.json。
 
 用法：
-  python lib/cover_watch.py --job "<cover_job>" [--job "<另一个>"]   # 常驻监听
-  python lib/cover_watch.py                                          # 读 cover_watch.json 的默认任务列表
-  python lib/cover_watch.py --job "<cover_job>" --once               # 检查一轮（满足即执行）后退出
-  python lib/cover_watch.py --job "<cover_job>" --once --dry-run     # 只判定打印，不执行
+  python lib/cover_watch.py                                          # 读 presets.json 的 watch 段（roots 自动发现 / jobs 显式）
+  python lib/cover_watch.py --root "D:/短剧"                          # 直接扫盘，自动发现所有 <剧集>/cover_job
+  python lib/cover_watch.py --job "<cover_job>" [--job "<另一个>"]   # 只监听指定任务
+  python lib/cover_watch.py --root "D:/短剧" --once --dry-run         # 预览这一轮会捕获哪些、为什么跳过
   python lib/cover_watch.py status --job "<cover_job>"               # 查看锁与进度
 
-配套文件（均可选）：
-  <repo>/cover_watch.json        默认监听配置：{"jobs": ["<cover_job>", ...], "settle": 30, "interval": 5, "derive": true}
+配套文件：
+  <repo>/pipeline/presets.json   本机配置的 watch 段（每轮热加载，改完不用重启）：
+                                 {"watch": {"roots": ["D:/短剧"], "jobs": [], "exclude": [], "settle": 30, "interval": 5, "derive": true}}
+                                 roots 下的 <剧集>/cover_job 自动发现，无需逐个登记
+  --config <file>                也可单独指定监听配置文件（JSON 对象，或含 watch 段）
   <cover_job>/export_config.json 豆包/用户的一句话偏好：{"cut_s": 7200, "derive": ["youtube","tiktok"]}
                                  cut_s 省略=不裁剪；derive 省略=全平台，[]=不派生
 """
@@ -40,6 +43,8 @@ import export_lock  # noqa: E402
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BATCH_RUNNER = os.path.join(_REPO, "pipeline", "batch_runner.py")
+sys.path.insert(0, os.path.join(_REPO, "pipeline"))
+import export_config as pc  # noqa: E402  # 本机配置（presets.json）唯一读取入口
 sys.path.insert(0, os.path.join(_REPO, "scripts", "utils"))
 try:
     from notifier import toast  # noqa: E402
@@ -66,9 +71,11 @@ def _norm_job_dir(path: str) -> str:
 def check_trigger(job_dir: str) -> tuple[bool, list[str]]:
     """触发判定：返回 (可否触发, 未满足原因列表)。"""
     reasons: list[str] = []
-    for stem in REQUIRED_COVERS:
-        if not any(os.path.isfile(os.path.join(job_dir, "04_covers", stem + e)) for e in EXTS):
-            reasons.append(f"缺图 {stem}")
+    # 允许任意文件名：交给 ingest 的识别逻辑判定（竖版看宽高比，横版看编号/顺序）
+    found, _ = jm.detect_cover_files(job_dir, apply=False)
+    for slot in (1, 2, 3, "vertical"):
+        if slot not in found:
+            reasons.append(f"缺图 slot={slot}")
     if not os.path.isfile(os.path.join(job_dir, "03_prompts", "prompts.json")):
         reasons.append("缺 03_prompts/prompts.json")
     try:
@@ -78,24 +85,29 @@ def check_trigger(job_dir: str) -> tuple[bool, list[str]]:
         return False, reasons
     if (job.get("titles") or {}).get("gate") != "done":
         reasons.append("titles.gate != done")
-    stage = job.get("stage")
+    stage = jm.canon_stage(job.get("stage"))
     if stage not in TRIGGER_STAGES:
-        reasons.append(f"stage={stage} 不在可触发集合")
+        reasons.append(f"stage={job.get('stage')} 不在可触发集合")
     if (job.get("video") or {}).get("status") == "done":
         reasons.append("video 已导出（status=done）")
     return (not reasons), reasons
 
 
 def last_change_ts(job_dir: str) -> float:
-    """相关文件（job.json / prompts.json / 4 图）的最大 mtime，用于防抖。"""
+    """相关文件（job.json / prompts.json / 04_covers 下任意图片）的最大 mtime，用于防抖。
+
+    04_covers 里文件名可以任意（ingest 才改名），所以这里不能只看契约名，
+    必须扫目录下所有图片扩展名，否则"刚落盘的新图"不会刷新静默计时。
+    """
     files = [os.path.join(job_dir, "job.json"),
              os.path.join(job_dir, "03_prompts", "prompts.json")]
-    for stem in REQUIRED_COVERS:
-        for ext in EXTS:
-            p = os.path.join(job_dir, "04_covers", stem + ext)
-            if os.path.isfile(p):
-                files.append(p)
-                break
+    covers_dir = os.path.join(job_dir, "04_covers")
+    try:
+        for name in os.listdir(covers_dir):
+            if os.path.splitext(name)[1].lower() in EXTS:
+                files.append(os.path.join(covers_dir, name))
+    except OSError:
+        pass
     ts = 0.0
     for p in files:
         try:
@@ -366,17 +378,67 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_watch_config(path: Optional[str]) -> dict[str, Any]:
-    """--config 显式指定；否则找 <repo>/cover_watch.json。都没有返回 {}。"""
-    p = path or os.path.join(_REPO, "cover_watch.json")
-    if not os.path.isfile(p):
-        return {}
-    with open(p, encoding="utf-8-sig") as f:  # 兼容 BOM
-        data = json.load(f)
-    if not isinstance(data, dict):
-        raise ValueError(f"监听配置应为 JSON 对象: {p}")
-    print(f"使用监听配置: {p}")
+def _load_watch_config(path: Optional[str], *, quiet: bool = False) -> dict[str, Any]:
+    """监听配置来源：--config 显式文件 > pipeline/presets.json 的 watch 段。
+
+    默认走本机唯一配置 presets.json（与本机 export_dir/deps_root 同源），
+    脚本内不写死任何剧集目录；每轮重新读取即热加载。
+    """
+    if path:
+        try:
+            with open(path, encoding="utf-8-sig") as f:  # 兼容 BOM
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"[WARN] 监听配置不可读（沿用上一轮）: {e}")
+            return {}
+        if not isinstance(data, dict):
+            raise ValueError(f"监听配置应为 JSON 对象: {path}")
+        if isinstance(data.get("watch"), dict):  # 兼容直接指向 presets.json
+            data = data["watch"]
+        if not quiet:
+            print(f"使用监听配置: {path}")
+        return data
+    data = pc.get_watch_config()
+    if not quiet:
+        if data:
+            print(f"使用监听配置: {pc.CONFIG_PATH}（watch 段）")
+        else:
+            print(f"[WARN] 未配置 watch 段（{pc.CONFIG_PATH}），可用 --root/--job 指定")
     return data
+
+
+def _discover_jobs(roots: list[str], exclude: list[str]) -> list[str]:
+    """扫描 roots 下所有 <剧集目录>/cover_job，自动发现任务（无需预先登记）。"""
+    found: list[str] = []
+    ex = {str(x).replace("\\", "/").strip("/").lower() for x in exclude or []}
+    for root in roots:
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            job_dir = os.path.join(root, name, "cover_job")
+            if not os.path.isfile(os.path.join(job_dir, "job.json")):
+                continue
+            key = job_dir.replace("\\", "/").lower()
+            if any(key.endswith(e) or name.lower() == e for e in ex):
+                continue
+            found.append(os.path.abspath(job_dir))
+    return found
+
+
+def _collect_jobs(args: argparse.Namespace, cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """显式 --job / 配置 jobs + roots 自动发现，去重。"""
+    explicit = args.job or cfg.get("jobs") or []
+    roots = list(args.root or []) + list(cfg.get("roots") or [])
+    merged = [_norm_job_dir(j) for j in explicit]
+    merged += _discover_jobs(roots, cfg.get("exclude") or [])
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for j in merged:
+        if j.lower() not in seen:
+            seen.add(j.lower())
+            uniq.append(j)
+    return uniq, roots
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -385,23 +447,38 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as e:
         print(f"[FAIL] {e}")
         return 1
-    job_args = args.job or cfg.get("jobs") or []
-    if not job_args:
-        print("[FAIL] 需要 --job <cover_job>（可多个），或在 cover_watch.json 里配置 jobs")
+    jobs, roots = _collect_jobs(args, cfg)
+    if not jobs:
+        print("[FAIL] 没有可监听的任务：给 --job <cover_job>、--root <目录>，"
+              "或在 pipeline/presets.json 的 watch 段配置 roots（如 {\"watch\":{\"roots\":[\"D:/短剧\"]}}）")
         return 1
     settle = args.settle if args.settle is not None else float(cfg.get("settle", 30.0))
     interval = args.interval if args.interval is not None else float(cfg.get("interval", 5.0))
     derive_on = (not args.no_derive) and bool(cfg.get("derive", True))
     verify_on = not args.no_verify
-    jobs = [_norm_job_dir(j) for j in job_args]
-    for j in jobs:
-        if not os.path.isfile(os.path.join(j, "job.json")):
-            print(f"[FAIL] 不是 cover_job 目录（缺 job.json）: {j}")
-            return 1
     print(f"cover_watch 监听 {len(jobs)} 个任务（静默 {settle:.0f}s 防抖，"
-          f"轮询 {interval:.0f}s）")
+          f"轮询 {interval:.0f}s，roots={roots or '无'}，配置热加载）")
     done: set[str] = set()
+    known: set[str] = set()
     while True:
+        # 配置热加载：新增 roots/jobs 无需重启；显式 --job 始终保留
+        try:
+            cfg_new = _load_watch_config(getattr(args, "config", None), quiet=True)
+        except (OSError, ValueError):
+            cfg_new = {}
+        if cfg_new:
+            cfg = cfg_new
+        jobs, roots = _collect_jobs(args, cfg)
+        if args.settle is None:
+            settle = float(cfg.get("settle", settle))
+        if args.interval is None:
+            interval = float(cfg.get("interval", interval))
+        derive_on = (not args.no_derive) and bool(cfg.get("derive", True))
+        fresh = [j for j in jobs if j.lower() not in known]
+        for j in fresh:
+            print(f"[new] 自动发现任务: {j}")
+            known.add(j.lower())
+
         for job_dir in jobs:
             if job_dir in done:
                 continue
@@ -445,9 +522,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--job", action="append", default=None,
-                    help="cover_job 目录或其中的 job.json（可多个）；省略时读 cover_watch.json")
+                    help="cover_job 目录或其中的 job.json（可多个）；省略时读 presets.json 的 watch 段")
+    ap.add_argument("--root", action="append", default=None,
+                    help="自动发现根目录（扫描 <root>/*/cover_job，可多个；无需预先登记任务）")
     ap.add_argument("--config", default=None,
-                    help="监听配置 JSON（默认 <repo>/cover_watch.json）")
+                    help="监听配置 JSON（默认读 pipeline/presets.json 的 watch 段）")
     ap.add_argument("--settle", type=float, default=None, help="静默确认秒数（默认 30 或配置值）")
     ap.add_argument("--interval", type=float, default=None, help="轮询间隔秒数（默认 5 或配置值）")
     ap.add_argument("--once", action="store_true", help="只检查一轮就退出")

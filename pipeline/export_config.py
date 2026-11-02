@@ -9,6 +9,7 @@
                   <export_dir>/<草稿名>/<草稿名>.mp4（封面/进度文件同目录）
   deps_root     统一依赖根目录（ffmpeg/ffprobe/模型缓存都在其下）
   jianying_dir  剪映安装目录（字幕字体等内置资源从这儿取）
+  watch         cover_watch 落盘监听的默认参数（roots/jobs/exclude/settle/interval/derive）
 """
 import json
 import os
@@ -43,6 +44,16 @@ def get_deps_root():
 def get_jianying_dir():
     """剪映安装目录：presets.json 的 jianying_dir > 内置默认值。"""
     return (_cfg().get("jianying_dir") or "").strip() or DEFAULT_JIANYING_DIR
+
+
+def get_watch_config():
+    """cover_watch 监听配置：presets.json 的 watch 段（缺失返回 {}）。
+
+    roots 用目录自动发现（扫 <root>/*/cover_job），不必逐个登记任务；
+    与 export_dir/deps_root 同在本机配置，脚本内不写死任何路径。
+    """
+    watch = _cfg().get("watch") or {}
+    return watch if isinstance(watch, dict) else {}
 
 
 def get_ffmpeg():
