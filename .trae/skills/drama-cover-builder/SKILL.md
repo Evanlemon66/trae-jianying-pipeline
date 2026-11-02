@@ -92,20 +92,20 @@ python scripts/drama_cover.py prepare --series-dir "D:\短剧\重生八零，打
 
 **Stage 1（12 条标题 + 门禁）**
 
-3. 用户回复“已建目录”后，读 `references/title-spec.md` 生成 12 条，把 `02_titles/prompt.txt`、`titles.json`、`titles.md` 三个文件**全文**输出给用户保存，同时输出更新后的 `job.json` 全文（`stage=titles_done`、`gate=pending`、`revision+1`）。
-4. 停在门禁：用户回复 3 个编号后，输出最终 `job.json` 全文（`titles.selected` + `cover_map` 回填、`selected_by="user"`、`stage=titles_selected`），用户覆盖保存。
+3. 用户回复“已建目录”后，读 `references/title-spec.md` 生成 12 条，把 `02_titles/prompt.txt`、`titles.json`、`titles.md` 三个文件**全文**输出给用户保存。**不需要输出 job.json**——`stage=titles_done` 由 Trae 侧 `record-titles` 登记。
+4. 停在门禁：用户回复 3 个编号后，只输出 `02_titles/selection.json`（`{"picks":["T9","T10","T7"],"selected_by":"user"}`）让用户保存。**不再手写 job.json**——`titles.selected`、`cover_map` 回填、`stage=titles_selected` 全部由 Trae 侧 `ingest`/`select` 生成。
 
 **Stage 2（即梦出图）**
 
 5. 读 `references/cover-spec.md` 与 `references/prompt-spec.md`，按门禁选定的 3 条标题反推提示词（五段结构；构图由封面位决定：1 爆点仰拍 / 2 冷暖对比 / 3 守护挡身；竖版胸像逆光），提示词写入 `03_prompts/prompts.json` 与 `prompts.md` 全文输出给用户保存（`channel` 按 `references/channels.md` 填写）。**不需要输出 job.json**——`prompts` 登记由 Trae 侧 `ingest` 从 prompts.json 重建。
 6. 调用即梦：每张上传 `01_input` 里的参考图作身份锚点 + 对应提示词，逐张生成；按 cover-spec 四项硬约束（无文字/无武器/无血腥/无儿童）自检，不合格重做该张。
-7. 4 张图按契约文件名交给用户存入 `04_covers/`（`cover_01_hit.png` / `cover_02_contrast.png` / `cover_03_guard.png` / `cover_04_vertical.png`，jpg 亦可）。**不需要输出 job.json**——`cover_map` 登记与 hash 由 Trae 侧 `ingest` 重建。
+7. 4 张图存入 `04_covers/`，**文件名可任意**（`cover_01_hit` / `封面图1` / `T2 封面` / `竖版` 都行，png/jpg/jpeg/webp）——Trae 侧 `ingest` 会按竖版宽高比与编号自动识别并改名到契约名。**不需要输出 job.json**——`cover_map` 登记与 hash 由 `ingest` 重建。
 
 **回 Trae（本地执行段）**
 
-8. 用户回到 Trae 说“封面已就位”，Trae 依次：`validate --fix`（补算全部 hash 并校验）→ `ingest`（登记+规范化+推进 stage）→ `record-video`（登记 pipeline 导出目录）→ 草稿封面（`lib/jy_cover.py`）/ 发布 / 清理；或一条 `python lib/cover_watch.py --job "<cover_job>"` 全自动跑完（含串流导出 mp4 与 Toast 通知）。豆包侧至此交付完毕。
+8. 用户回到 Trae 说“封面已就位”，Trae 依次：`validate --fix`（补算全部 hash 并校验）→ `ingest`（登记+规范化+改名+推进 stage）→ `record-video`（登记 pipeline 导出目录）→ 草稿封面（`lib/jy_cover.py`）/ 发布 / 清理；或一条 `python lib/cover_watch.py --root "D:/短剧"` 全自动跑完（含串流导出 mp4 与 Toast 通知）。豆包侧至此交付完毕。
 
-唯一规则：无执行环境时**绝不省略 job.json 字段、绝不编造 hash**；文件内容必须完整可复制，不给“略”。
+唯一规则：**不在对话里手写 job.json**（它是 Trae 侧 CLI 的收口产物），也绝不编造 hash；只交内容产物，文件内容必须完整可复制，不给“略”。
 
 ## 三、输入建模：素材卡片
 
@@ -245,7 +245,7 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 | `record-video` | 登记 pipeline 导出目录（自动探测 stream manifest，只记录不复制 mp4；手工指定优先；挂 `cleanup.external`） |
 | `set-cut` | 设置/清除导出裁剪秒数 `video.cut_s`（`--cut 7200` 裁剪；`--cut 0` 清除；默认 null 不裁剪，watcher 非 null 时传 `--cut`） |
 | `derive` | 从 04_covers 派生平台尺寸到 derived/（youtube/tiktok/instagram-reels/facebook-reels，不写 job.json） |
-| `ingest` | Stage 2 收口：从落盘产物（prompts.json+4 图）重建 job.json、规范化 slot、补 hash、推进 stage，幂等 |
+| `ingest` | Stage 2 收口：从落盘产物（prompts.json+4 图+selection.json）重建 job.json，宽容规范化（selected/stage/文件名）、补 hash、推进 stage，幂等 |
 | `title` | 打印标题规范路径（Agent 读规范后在线生成，Ollama 兜底） |
 | `art-from-video` | ffmpeg select+thumbnail 抽最佳帧 |
 | `compose-pillow` | Pillow 合成，4 样式 × 2 尺寸族，标题可选 |
@@ -266,9 +266,12 @@ set_cover_composition(draft_dict, draft_dir, "cover.jpg")
 豆包/手工把 Stage 2 产物（4 张契约图 + prompts.json）落盘后，`lib/cover_watch.py` 可自动跑完本地执行链：
 
 ```powershell
-python lib/cover_watch.py --job "<cover_job>"            # 常驻监听（可多个 --job）
-python lib/cover_watch.py --job "<cover_job>" --once --dry-run   # 只判定不执行
-python lib/cover_watch.py status --job "<cover_job>"     # 查看锁与进度
+python lib/cover_watch.py                                 # 读 pipeline/presets.json 的 watch 段：roots 自动发现 / jobs 显式
+python lib/cover_watch.py --root "D:/短剧"                 # 直接扫盘，新剧落盘自动纳入，无需登记
+python lib/cover_watch.py --root "D:/短剧" --once --dry-run  # 预览会捕获哪些、为什么跳过
+python lib/cover_watch.py status --job "<cover_job>"      # 查看锁与进度
 ```
 
-触发条件（全满足）：4 张契约图齐 AND prompts.json 存在 AND job.json 可解析 AND `titles.gate="done"` AND `stage ∈ {titles_selected, prompts_ready, covers_ready}` AND video 未导出 AND 无活锁 AND 静默 30s（防抖）。触发后依次：`validate --fix` → `ingest`（含竖版绑定最高分标题）→ `export_config.json`（若有：写 `video.cut_s`、定派生平台）→ batch_runner 串流导出 mp4（封面自动吃 `cover_04_vertical`，裁剪读 `video.cut_s`；batch_runner **本身默认导出后自动质检** `verify_export.py`（隐含等待导出完成再登记），`--no-verify` 可关）→ `record-video` → `derive` → Toast 通知。配套文件（均可选）：`<repo>/cover_watch.json`（默认监听任务列表，无参启动时读）、`<cover_job>/export_config.json`（豆包/用户一句话偏好：`{"cut_s": 秒, "derive": ["youtube","tiktok"]}`）。多个 job 在单 watcher 内串行排队；跨进程由 repo 级全局锁 `.export.lock` 互斥（手工 `batch_runner` 遇活锁报错，`--force` 强跑）。进度看 Toast / `cover_job/watcher.log` / `06_publish/pipeline.log` / `status` 命令。
+配置 `<repo>/pipeline/presets.json` 的 `watch` 段（与本机 `export_dir`/`deps_root` 同一份配置，从 `presets.example.json` 复制起步），每轮热加载、改完不用重启：`{"watch":{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":true}}`。`roots` 下的 `<剧集>/cover_job` 会被自动发现，无需逐个登记。
+
+触发条件（全满足）：4 张图齐（文件名可任意，`ingest` 自动识别改名）、prompts.json 存在、job.json 可解析、`titles.gate="done"`、`stage ∈ {titles_selected, prompts_ready, covers_ready}`（`covers_done` 等别名自动映射）、video 未导出、无活锁、静默 30s（防抖）。触发后依次：`validate --fix` → `ingest`（含竖版绑定最高分标题）→ `export_config.json`（若有：写 `video.cut_s`、定派生平台）→ batch_runner 串流导出 mp4（封面自动吃 `cover_04_vertical`，裁剪读 `video.cut_s`；batch_runner **本身默认导出后自动质检** `verify_export.py`（隐含等待导出完成再登记），`--no-verify` 可关）→ `record-video` → `derive` → Toast 通知。配套文件：`<repo>/pipeline/presets.json` 的 `watch` 段（roots 自动发现 + 每轮热加载）、`<cover_job>/export_config.json`（豆包/用户一句话偏好：`{"cut_s": 秒, "derive": ["youtube","tiktok"]}`）。多个 job 在单 watcher 内串行排队；跨进程由 repo 级全局锁 `.export.lock` 互斥（手工 `batch_runner` 遇活锁报错，`--force` 强跑）。进度看 Toast / `cover_job/watcher.log` / `06_publish/pipeline.log` / `status` 命令。

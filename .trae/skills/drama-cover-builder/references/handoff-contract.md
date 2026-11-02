@@ -20,7 +20,8 @@ D:\短剧\<剧名>\
     ├── 02_titles\
     │   ├── prompt.txt
     │   ├── titles.md
-    │   └── titles.json
+    │   ├── titles.json
+    │   └── selection.json          # 可选：agent 只交编号清单 {"picks":["T9","T10","T7"]}
     ├── 03_prompts\
     │   ├── prompts.md
     │   └── prompts.json
@@ -97,6 +98,8 @@ D:\短剧\<剧名>\
 | `cleanup` | object | 见 §6 |
 | `history` | array | `{at,event,detail,revision}` 追加写 |
 
+**单一写入口**：`job.json` 是**收口产物**，不是 agent 的交付物。第三方 agent 只交内容产物（`titles.json`、`selection.json`、`prompts.json`、4 张图），`job.json` 由 `prepare` / `record-titles` / `select` / `ingest` / `set-cut` / `record-video` 生成与更新。`ingest` 同时负责宽容规范化（`selected` 对象/`"T9"`/`9`/纯文本、`slot` 数字/`"封面1"`、`stage` 别名如 `covers_done`、图片任意命名），全部动作记入 `history`。
+
 示例（准备阶段）：
 
 ```json
@@ -167,7 +170,7 @@ D:\短剧\<剧名>\
 | `publish_ready` | 元数据与物料齐 | 发布 skill |
 | `published` | 至少一个平台回执成功 | 发布 skill |
 
-只允许向前推进，不回退；失败时只追加 `history`，`stage` 保持不变。每次写 `job.json` 都是「读-改-写 + 原子替换」，`revision` 递增。
+只允许向前推进，不回退；失败时只追加 `history`，`stage` 保持不变。每次写 `job.json` 都是「读-改-写 + 原子替换」，`revision` 递增。第三方 agent 写的非契约 stage 别名（`covers_done` / `covers_complete` / `videos_done`）由 `ingest` 与 watcher 统一映射为契约值后再判定。
 
 ## 4. 标题与封面映射
 
@@ -183,6 +186,7 @@ D:\短剧\<剧名>\
 - 三条横版必须与标题一一对应；竖版标 `role=video_cover`。
 - 竖版绑定：门禁（`select`）或收口（`ingest`）时，自动绑定 `selected` 三条中评分最高的一条（平分按总分→推荐优先→内容兑现→信息缺口→情绪峰值，与兜底同序）；无评分数据则保持 `title_id=null`。
 - 门禁后 `selected` 冻结；改选必须显式操作，`revision` 递增，Stage 2 发现 revision 不一致要把旧图标 `stale`。
+- 文件名容错：`04_covers/` 内可用任意文件名（`cover_01_hit` / `封面图1` / `T2 封面` / `竖版` …），`ingest` 按「竖版宽高比/名称提示优先，横版按文件名编号 1/2/3，否则自然顺序」识别并**改名到契约名**，改名记录写入 `history` 与 `report.renamed`。
 
 ## 5. 跨阶段兜底链
 
@@ -263,9 +267,10 @@ python lib/job_manifest.py derive --job "<cover_job>" --platform all --slot 2
 python lib/job_manifest.py ingest --job "<cover_job>" [--dry-run]
 
 # 落盘自动触发链（监听 cover_job，产物齐自动跑：validate --fix → ingest → export_config → 串流导出 mp4（batch_runner 默认自动质检，--no-verify 关）→ record-video → derive → Toast）
+python lib/cover_watch.py --root "D:/短剧"                 # 扫盘自动发现 <剧集>/cover_job（推荐）
 python lib/cover_watch.py --job "<cover_job>" [--job "<另一个>"] [--settle 30] [--once] [--dry-run] [--no-verify] [--no-derive]
 python lib/cover_watch.py status --job "<cover_job>"
-python lib/cover_watch.py          # 无参：读 <repo>/cover_watch.json 的默认任务列表 {"jobs":[...],"settle":30,"interval":5,"derive":true}
+python lib/cover_watch.py          # 无参：读 <repo>/pipeline/presets.json 的 watch 段（每轮热加载）{"watch":{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":true}}
 
 # 导出偏好（可选）：豆包/用户写 <cover_job>/export_config.json，watcher 触发时应用并记 history
 # {"cut_s": 7200, "derive": ["youtube","tiktok"]}
