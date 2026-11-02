@@ -712,8 +712,11 @@ class Exporter:
         if not confirm_btn.Exists(0):
             confirm_btn = self.window.ButtonControl(Name="导出")
         
-        if not confirm_btn.Exists(1):
-             raise Exception("无法在导出弹窗中找到确认按钮。")
+        # 大草稿（上百集）弹窗渲染慢，确认按钮最多等 15s，找到就立即点
+        deadline = time.time() + 15
+        while not confirm_btn.Exists(0.5):
+            if time.time() >= deadline:
+                raise Exception("无法在导出弹窗中找到确认按钮（已等待 15s）。")
 
         dprint("确认导出...")
         confirm_btn.Click(simulateMove=False)
