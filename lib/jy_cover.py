@@ -14,8 +14,6 @@
 """
 import os, sys, json, uuid, shutil, subprocess, glob
 
-_DRAFTPATH_PLACEHOLDER = "##_draftpath_placeholder_0E685133-18CE-45ED-8CB8-2904A212EC80##"
-
 
 def gen_uuid():
     return str(uuid.uuid4()).upper()
@@ -157,6 +155,15 @@ def set_cover_composition(draft, draft_dir, cover_image):
     # 1) 复制封面图到 Resources/cover/，用 copy 不保留源 mtime，避免被剪映按"过期资源"清理
     cover_dir = os.path.join(draft_dir, "Resources", "cover")
     os.makedirs(cover_dir, exist_ok=True)
+
+    # 先摘掉旧的封面 composition（重复应用时不叠加，避免残留多个）
+    old_cover = draft.get("cover") or {}
+    old_id = old_cover.get("cover_draft_id")
+    mats0 = draft.get("materials") or {}
+    if old_id and isinstance(mats0.get("drafts"), list):
+        mats0["drafts"] = [x for x in mats0["drafts"]
+                          if not (x.get("type") == "composition" and x.get("id") == old_id)]
+
     img_uuid = gen_uuid()
     dst_name = f"{img_uuid}{ext}"
     dst_path = os.path.join(cover_dir, dst_name)
@@ -181,7 +188,9 @@ def set_cover_composition(draft, draft_dir, cover_image):
     scm_id = gen_uuid()
     vs_id = gen_uuid()
 
-    rel_path = f"{_DRAFTPATH_PLACEHOLDER}/Resources/cover/{dst_name}"
+    # 用绝对路径（正斜杠）：与草稿内其它已能正常加载的素材保持一致，
+    # 避免 ##_draftpath_placeholder## 解析不到导致封面渲染成黑帧
+    rel_path = os.path.abspath(dst_path).replace("\\", "/")
 
     # 内嵌 photo 视频材质
     photo_mat = {
@@ -238,7 +247,9 @@ def set_cover_composition(draft, draft_dir, cover_image):
         "reverse": False,
         "source_timerange": {"duration": 3000000, "start": 0},
         "speed": 1.0,
-        "target_timerange": {"duration": 3000000, "start": 7207200000},
+        # 封面画布是从 0 帧开始渲染的：片段必须落在时间线起点，
+        # 否则第 0 帧没有任何可见素材 → 剪映生成纯黑封面
+        "target_timerange": {"duration": 3000000, "start": 0},
         "template_id": "", "template_scene": "default", "track_attribute": 0,
         "track_render_index": 101,
         "uniform_scale": {"on": True, "value": 1.0},
@@ -274,7 +285,8 @@ def set_cover_composition(draft, draft_dir, cover_image):
     }
 
     comp_draft = {
-        "canvas_config": {"height": 0, "ratio": "original", "width": 0},
+        # 画布尺寸必须与封面图一致；0x0 会让剪映渲染出空白/黑帧
+        "canvas_config": {"height": img_h, "ratio": "original", "width": img_w},
         "color_space": -1,
         "config": {
             "adjust_max_index": 1, "attachment_info": [], "combination_max_index": 1,
@@ -289,7 +301,7 @@ def set_cover_composition(draft, draft_dir, cover_image):
             "subtitle_taskinfo": [], "system_font_list": [], "video_mute": False,
             "zoom_info_params": None,
         },
-        "cover": None, "create_time": 0, "duration": 0, "extra_info": None,
+        "cover": None, "create_time": 0, "duration": 3000000, "extra_info": None,
         "fps": 30.0, "free_render_index_mode_on": False, "group_container": None,
         "id": comp_id,
         "keyframe_graph_list": [],
