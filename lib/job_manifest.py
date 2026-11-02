@@ -65,6 +65,21 @@ def canon_stage(stage: Any) -> Any:
         return STAGE_ALIASES.get(key, stage)
     return stage
 
+
+# 调度意图契约：豆包写 dispatch.json 声明，Trae ingest 归并进 job.json.workflow
+DISPATCH_NAME = "dispatch.json"
+WORKFLOW_MODES = ("full", "edit_only")
+WORKFLOW_DEFAULTS: dict[str, Any] = {
+    "mode": "full",          # full=剪辑+导出；edit_only=只剪辑停在草稿
+    "cut_s": None,           # 正数秒裁剪；None/0=不裁
+    "derive": [],            # 派生平台列表；[]=不派生
+    "priority": 0,           # 调度优先级（大者优先）
+    "intent_revision": 0,    # 仅人工 +1，任何程序路径只读不写
+    "intent_source": "default",  # default | dispatch | manual
+    "merged_at": None,
+}
+DERIVE_ALIASES = {"ig": "instagram-reels", "facebook": "facebook-reels"}
+
 COVER_SLOTS = (
     (1, "爆点仰拍", "cover_01_hit.png"),
     (2, "冷暖对比", "cover_02_contrast.png"),
@@ -287,6 +302,7 @@ def build_job(series: str, *, host: str = "trae") -> dict[str, Any]:
                   "cover": None,
                   "export_dir": None, "export_file": None, "draft_name": None,
                   "companions": []},
+        "workflow": copy.deepcopy(WORKFLOW_DEFAULTS),
         "publish": {"status": "not_ready", "idempotency_key": None,
                     "platforms": [], "receipts": []},
         "cleanup": default_cleanup(),
@@ -342,8 +358,8 @@ def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str
     errors: list[str] = []
 
     for key in ("schema_version", "job_id", "series", "stage", "input", "titles",
-                "cover_map", "vertical_cover", "prompts", "video", "publish",
-                "cleanup", "history", "revision"):
+                "cover_map", "vertical_cover", "prompts", "video", "workflow",
+                "publish", "cleanup", "history", "revision"):
         if key not in job:
             errors.append(f"缺少字段: {key}")
 
@@ -353,6 +369,23 @@ def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str
         errors.append(f"未知 stage: {job.get('stage')}")
     if not isinstance(job.get("revision"), int) or job.get("revision", 0) < 1:
         errors.append("revision 应为正整数")
+
+    wf = job.get("workflow")
+    if wf is not None:
+        if not isinstance(wf, dict):
+            errors.append("workflow 应为对象")
+        else:
+            if wf.get("mode") not in WORKFLOW_MODES:
+                errors.append(f"workflow.mode 应为 {WORKFLOW_MODES}: {wf.get('mode')!r}")
+            cut = wf.get("cut_s")
+            if cut is not None and (isinstance(cut, bool)
+                                     or not isinstance(cut, (int, float)) or cut <= 0):
+                errors.append(f"workflow.cut_s 应为正数秒或 null: {cut!r}")
+            dv = wf.get("derive")
+            if not isinstance(dv, list) or any(p not in DERIVE_PRESETS for p in dv):
+                errors.append(f"workflow.derive 应为已知平台列表: {dv!r}")
+            if not isinstance(wf.get("intent_revision"), int) or wf.get("intent_revision") < 0:
+                errors.append("workflow.intent_revision 应为非负整数（仅人工递增）")
 
     cover_map = job.get("cover_map") or []
     if len(cover_map) != 3:
@@ -490,6 +523,124 @@ def update_job(job_dir: str, patch: dict[str, Any], *,
         raise ValueError("job.json 校验失败: " + "；".join(errors))
     save_job(job, job_dir)
     return job
+
+
+# ── 调度意图：dispatch.json → job.json.workflow 归并 ──────────────────────
+
+def read_dispatch(job_dir: str) -> dict[str, Any]:
+    """读 cover_job/dispatch.json（豆包侧意图声明）；不存在返回 {}。"""
+    p = os.path.join(job_dir, DISPATCH_NAME)
+    if not os.path.isfile(p):
+        return {}
+    with open(p, encoding="utf-8-sig") as f:  # 兼容 Windows 记事本 BOM
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"{DISPATCH_NAME} 应为 JSON 对象")
+    return data
+
+
+def _normalize_dispatch(raw: dict[str, Any]) -> dict[str, Any]:
+    """规范化 dispatch 声明（mode/cut_s/derive/priority）；非法值抛 ValueError。"""
+    out: dict[str, Any] = {}
+    mode = str(raw.get("mode") or "full").strip().lower()
+    if mode not in WORKFLOW_MODES:
+        raise ValueError(f"dispatch.mode 应为 {WORKFLOW_MODES}: {raw.get('mode')!r}")
+    out["mode"] = mode
+    cut = raw.get("cut_s")
+    if cut is not None:
+        if isinstance(cut, bool) or not isinstance(cut, (int, float)):
+            raise ValueError(f"dispatch.cut_s 应为秒数: {cut!r}")
+        if cut < 0:
+            raise ValueError(f"dispatch.cut_s 不能为负: {cut!r}")
+        cut = float(cut) if cut > 0 else None  # 0 = 不裁剪
+    out["cut_s"] = cut
+    derive = raw.get("derive")
+    derive = [] if derive is None else ([derive] if isinstance(derive, str) else list(derive))
+    names: list[str] = []
+    if any(str(n).strip().lower() == "all" for n in derive):
+        names = list(DERIVE_PRESETS)
+    else:
+        for n in derive:
+            key = DERIVE_ALIASES.get(str(n).strip().lower(), str(n).strip().lower())
+            if key not in DERIVE_PRESETS:
+                raise ValueError(f"dispatch.derive 未知平台: {n}")
+            if key not in names:
+                names.append(key)
+    out["derive"] = names
+    pri = raw.get("priority", 0)
+    if isinstance(pri, bool) or not isinstance(pri, (int, float)):
+        raise ValueError(f"dispatch.priority 应为整数: {pri!r}")
+    out["priority"] = int(pri)
+    return out
+
+
+def merge_workflow_core(job: dict[str, Any], job_dir: str, *, notify=None) -> dict[str, Any]:
+    """把 dispatch.json 归并进 job['workflow']（只改内存，不落盘）。
+
+    规则：
+      - intent_revision==0：dispatch 提供全部值（幂等可重复）；无 dispatch 则默认值
+      - intent_revision>0（人工已确认）：job.json 永远优先，dispatch 只补缺失、
+        不覆盖；值冲突记入 report.conflicts 并可 notify
+      - 任何程序路径都不写 intent_revision（只读）
+    """
+    wf = dict(job.get("workflow") or {})
+    for k, v in WORKFLOW_DEFAULTS.items():
+        wf.setdefault(k, copy.deepcopy(v))
+    rev = int(wf.get("intent_revision") or 0)
+    raw = read_dispatch(job_dir)
+    conflicts: list[str] = []
+    changed = False
+    if rev == 0:
+        merged = _normalize_dispatch(raw) if raw else {}
+        src = "dispatch" if raw else (wf.get("intent_source") or "default")
+        for k in ("mode", "cut_s", "derive", "priority"):
+            if k in merged and wf.get(k) != merged[k]:
+                wf[k] = merged[k]
+                changed = True
+        if wf.get("intent_source") != src:
+            wf["intent_source"] = src
+            changed = True
+        if changed or wf.get("merged_at") is None:
+            wf["merged_at"] = now_iso()
+            changed = True
+    else:
+        if raw:
+            disp = _normalize_dispatch(raw)
+            for k, v in disp.items():
+                cur = wf.get(k)
+                cur_empty = cur is None or (isinstance(cur, list) and not cur)
+                val_empty = v is None or (isinstance(v, list) and not v)
+                if cur_empty and not val_empty:
+                    wf[k] = v
+                    wf["merged_at"] = now_iso()
+                    changed = True
+                elif cur != v:
+                    conflicts.append(f"{k}: job.json={cur!r} dispatch={v!r}")
+        if conflicts:
+            if notify:
+                try:
+                    notify("⚠️ 调度意图冲突",
+                           f"{os.path.basename(os.path.dirname(job_dir))}：人工意图优先，"
+                           f"dispatch 未覆盖（{'；'.join(conflicts[:2])}）")
+                except Exception:
+                    pass
+    job["workflow"] = wf
+    return {"changed": changed, "intent_source": wf.get("intent_source"),
+            "intent_revision": rev, "conflicts": conflicts, "workflow": dict(wf)}
+
+
+def merge_workflow(job_dir: str, *, dry_run: bool = False, notify=None) -> dict[str, Any]:
+    """独立归并入口（watcher 人工意图重归并）：读-归并-写，revision+1 记 history。"""
+    job = load_job(os.path.join(job_dir, "job.json"))
+    rep = merge_workflow_core(job, job_dir, notify=notify)
+    if dry_run or not rep["changed"]:
+        rep["dry_run"] = dry_run
+        return rep
+    patch = {k: v for k, v in rep["workflow"].items() if k != "intent_revision"}
+    update_job(job_dir, {"workflow": patch}, event="workflow_merge",
+               detail=f"intent_source={rep['intent_source']} "
+                      f"conflicts={len(rep['conflicts'])}")
+    return rep
 
 
 def _load_titles_items(titles_path: str) -> list[dict[str, Any]]:
@@ -1357,6 +1508,12 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
         new_stage = stage
     job["stage"] = new_stage
     report["stage_to"] = new_stage
+
+    # ── dispatch.json → workflow 归并（意图收口；intent_revision 程序只读）
+    try:
+        report["workflow"] = merge_workflow_core(job, job_dir)
+    except ValueError as e:
+        report["workflow"] = {"error": str(e)}
 
     if dry_run:
         report["dry_run"] = True
