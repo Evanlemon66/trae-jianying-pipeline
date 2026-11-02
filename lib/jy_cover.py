@@ -83,16 +83,13 @@ def set_draft_cover(draft_dir, cover_image=None, extract_from_video=None,
     if cover_image and os.path.exists(cover_image):
         ext = os.path.splitext(cover_image)[1].lower()
         if ext in (".jpg", ".jpeg"):
-            shutil.copy2(cover_image, dst)
+            shutil.copy(cover_image, dst)  # copy 不保留源 mtime，目标文件天然"现在"
         else:
             if PILImage is None:
                 print(f"  ⚠️ 需要 Pillow 把 {ext} 转 jpg，未安装，跳过封面")
                 return False
             img = PILImage.open(cover_image).convert("RGB")
             img.save(dst, "JPEG", quality=96)
-        # copy2 会保留源文件 mtime；封面必须比 draft_content.json 新，
-        # 否则剪映打开草稿时判定封面过期并用第一帧重生成
-        os.utime(dst, None)
         print(f"  🖼️ draft_cover.jpg: {os.path.basename(cover_image)} "
               f"→ {os.path.getsize(dst)/1024:.0f}KB")
         return True
@@ -157,15 +154,13 @@ def set_cover_composition(draft, draft_dir, cover_image):
         print(f"  ⚠️ 封面格式 {ext} 不受支持，跳过 composition")
         return False
 
-    # 1) 复制封面图到 Resources/cover/，并强制刷新 mtime（copy2 会保留源文件旧 mtime，
-    #    剪映在导出时可能按"过期资源"清理掉）
+    # 1) 复制封面图到 Resources/cover/，用 copy 不保留源 mtime，避免被剪映按"过期资源"清理
     cover_dir = os.path.join(draft_dir, "Resources", "cover")
     os.makedirs(cover_dir, exist_ok=True)
     img_uuid = gen_uuid()
     dst_name = f"{img_uuid}{ext}"
     dst_path = os.path.join(cover_dir, dst_name)
-    shutil.copy2(cover_image, dst_path)
-    os.utime(dst_path, None)
+    shutil.copy(cover_image, dst_path)
 
     # 读取图片尺寸
     try:
