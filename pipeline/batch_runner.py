@@ -31,10 +31,15 @@ _PROJECT_ROOT = os.path.dirname(_HERE)                    # pipeline/ → 项目
 _SCRIPTS_DIR = os.path.join(_PROJECT_ROOT, "scripts")     # scripts/utils/notifier.py 在这里
 sys.path.insert(0, _HERE)
 sys.path.insert(0, _SCRIPTS_DIR)
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, "lib"))
 
 import pipeline as pl  # noqa: E402
 from utils.notifier import toast as _toast  # noqa: E402
 from export_config import export_mp4_path  # noqa: E402
+try:
+    import export_lock as _elock  # noqa: E402
+except Exception:  # 锁模块缺失时退化为无锁（保持旧行为）
+    _elock = None
 
 
 def _ep_number(path, idx):
@@ -127,6 +132,8 @@ def main():
                     help="(默认) 启动 watcher 守护进程（后台监控状态变化，桌面通知，脚本崩溃也能告知）")
     ap.add_argument("--no-watch", dest="watch", action="store_false",
                     help="关闭 watcher 守护进程")
+    ap.add_argument("--force", action="store_true",
+                    help="忽略全局导出锁（.export.lock）强跑（watcher 持锁调用时自动加）")
     ap.set_defaults(stream=True)
     args = ap.parse_args()
 
@@ -134,6 +141,16 @@ def main():
     if not os.path.isdir(series_dir):
         print(f"✗ 目录不存在: {series_dir}")
         sys.exit(1)
+
+    # 全局导出锁：同一时刻只允许一个导出（防剪映云并发/草稿冲突）
+    if _elock is not None and not args.force:
+        if not _elock.acquire(owner=f"batch_runner {os.path.basename(series_dir)}"):
+            holder = _elock.read_lock() or {}
+            print(f"✗ 已有导出在跑（pid={holder.get('pid')} owner={holder.get('owner')}）；"
+                  f"等它完成，或用 --force 强跑")
+            sys.exit(1)
+        import atexit
+        atexit.register(_elock.release)
 
     # 未指定 workdir 时按剧名派生独立目录：demucs 产物按 demucs_epNN 同名写入，
     # 共用 _work 会让后一次运行覆盖前一部剧草稿引用的音频素材。
@@ -189,7 +206,14 @@ def main():
         print(f"✗ 目录里没找到视频: {series_dir}")
         sys.exit(1)
 
-    # 封面自动探测（默认行为）：封面.png/jpg → 目录下任意图片兜底 → 都没有则抽帧
+    # 封面自动探测（默认行为）：cover_job 竖版契约图 → 封面.png/jpg → 目录下任意图片兜底 → 都没有则抽帧
+    auto_cover = not args.cover_image
+    if not args.cover_image:
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            p = os.path.join(series_dir, "cover_job", "04_covers", f"cover_04_vertical{ext}")
+            if os.path.isfile(p):
+                args.cover_image = p
+                break
     if not args.cover_image:
         for name in ("封面.png", "封面.jpg", "封面.jpeg", "封面.webp"):
             p = os.path.join(series_dir, name)
@@ -204,8 +228,8 @@ def main():
             )
             if imgs:
                 args.cover_image = os.path.join(series_dir, imgs[0])
-        if args.cover_image:
-            print(f"🖼️ 自动封面: {os.path.basename(args.cover_image)}")
+    if auto_cover and args.cover_image:
+        print(f"🖼️ 自动封面: {os.path.relpath(args.cover_image, series_dir)}")
 
     prefix = args.draft_prefix or os.path.basename(series_dir.rstrip("\\/"))
     state = {} if args.fresh else load_state(args.workdir)
