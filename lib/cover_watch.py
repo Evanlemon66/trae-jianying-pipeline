@@ -228,6 +228,8 @@ def _effective_derive(wf: dict[str, Any], cfg: dict[str, Any],
     if legacy_override is not None:
         return legacy_override
     g = cfg.get("derive", [])
+    if isinstance(g, bool):  # 旧配置兼容：derive:true=全平台 / false=不派生
+        return list(jm.DERIVE_PRESETS) if g else []
     if isinstance(g, str):
         g = [g]
     return list(g) if g else []

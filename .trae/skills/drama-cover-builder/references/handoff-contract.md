@@ -13,7 +13,8 @@ D:\短剧\<剧名>\
 ├── 封面.png / 简介.txt / 第N集.mp4     # 原始素材，只读
 └── cover_job\                          # 唯一写入区
     ├── job.json
-    ├── export_config.json              # 可选：导出偏好（cut_s / derive），见 §7
+    ├── dispatch.json                   # 可选：豆包侧调度意图声明（mode/cut_s/derive/priority），ingest 归并进 job.json.workflow，见 §7
+    ├── export_config.json              # 可选（旧版兼容）：导出偏好（cut_s / derive），见 §7
     ├── 01_input\
     │   ├── synopsis.txt
     │   └── reference.png
@@ -91,6 +92,13 @@ D:\短剧\<剧名>\
 | `video.export_file` | string \| null | 最终成品 mp4 完整路径 |
 | `video.draft_name` | string \| null | 串流草稿名，关联 `pipeline/_stream_manifests/<名>.json` |
 | `video.companions` | array | 成品旁的脚本产物（`.progress.json`、`-封面.jpg`） |
+| `workflow.mode` | string | `full`（剪辑+导出，默认）/ `edit_only`（只剪辑停在草稿） |
+| `workflow.cut_s` | number \| null | 开头裁剪秒数（正数；`0`/null=不裁）；优先级高于 `video.cut_s` |
+| `workflow.derive` | array | 派生平台列表（`[]`=不派生）；支持 `all`/别名 `ig`、`facebook` |
+| `workflow.priority` | number | 调度优先级（大者优先，默认 0） |
+| `workflow.intent_revision` | number | **仅人工 +1**，程序只读不写；变大即视为人工最终意图 |
+| `workflow.intent_source` | string | `default` / `dispatch` / `manual` |
+| `workflow.merged_at` | string \| null | 最近一次归并时间 |
 | `publish.status` | string | `not_ready` / `ready` / `uploading` / `published` / `failed` |
 | `publish.platforms` | array | 每平台 `{name,status,video_id,url,cover_file,attempts,error,uploaded_at}` |
 | `publish.idempotency_key` | string \| null | 防重复上传 |
@@ -98,7 +106,7 @@ D:\短剧\<剧名>\
 | `cleanup` | object | 见 §6 |
 | `history` | array | `{at,event,detail,revision}` 追加写 |
 
-**单一写入口**：`job.json` 是**收口产物**，不是 agent 的交付物。第三方 agent 只交内容产物（`titles.json`、`selection.json`、`prompts.json`、4 张图），`job.json` 由 `prepare` / `record-titles` / `select` / `ingest` / `set-cut` / `record-video` 生成与更新。`ingest` 同时负责宽容规范化（`selected` 对象/`"T9"`/`9`/纯文本、`slot` 数字/`"封面1"`、`stage` 别名如 `covers_done`、图片任意命名），全部动作记入 `history`。
+**单一写入口**：`job.json` 是**收口产物**，不是 agent 的交付物。第三方 agent 只交内容产物（`titles.json`、`selection.json`、`prompts.json`、4 张图）与调度意图声明（`dispatch.json`，可选），`job.json` 由 `prepare` / `record-titles` / `select` / `ingest` / `set-cut` / `record-video` 生成与更新。`ingest` 同时负责宽容规范化（`selected` 对象/`"T9"`/`9`/纯文本、`slot` 数字/`"封面1"`、`stage` 别名如 `covers_done`、图片任意命名）并把 `dispatch.json` 归并进 `workflow` 段，全部动作记入 `history`。`workflow.intent_revision` 是人工意图标记：仅人工 +1，程序路径只读；变大即视为人工最终意图（`intent_source=manual`），此后 `dispatch.json` 只补缺失、不覆盖。
 
 示例（准备阶段）：
 
@@ -266,16 +274,30 @@ python lib/job_manifest.py derive --job "<cover_job>" --platform all --slot 2
 # 收登记、规范化（selected.slot 中文→数字）、补 hash、推进 stage（只进不退），幂等
 python lib/job_manifest.py ingest --job "<cover_job>" [--dry-run]
 
-# 落盘自动触发链（监听 cover_job，产物齐自动跑：validate --fix → ingest → export_config → 串流导出 mp4（batch_runner 默认自动质检，--no-verify 关）→ record-video → derive → Toast）
+# 落盘两阶段调度（监听 cover_job，产物齐自动跑；串行、每轮只推进一部）
+#   edit 阶段：validate --fix → ingest（含 dispatch 归并）→ batch_runner --no-export（生成串流草稿+帧对齐）
+#   export 阶段：导出 mp4 → verify 质检 → record-video → derive → Toast
 python lib/cover_watch.py --root "D:/短剧"                 # 扫盘自动发现 <剧集>/cover_job（推荐）
-python lib/cover_watch.py --job "<cover_job>" [--job "<另一个>"] [--settle 30] [--once] [--dry-run] [--no-verify] [--no-derive]
+python lib/cover_watch.py plan --root "D:/短剧"            # 只查看：各剧阶段/意图来源/rev/下一步/被挡原因
+python lib/cover_watch.py --hold --once                    # 只列计划不执行（先核对 job.json 再放行）
+python lib/cover_watch.py --phase export --once            # 单轮强制只推进导出阶段（配合 export_policy=manual）
 python lib/cover_watch.py status --job "<cover_job>"
-python lib/cover_watch.py          # 无参：读 <repo>/pipeline/presets.json 的 watch 段（每轮热加载）{"watch":{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":true}}
+python lib/cover_watch.py          # 无参：读 <repo>/pipeline/presets.json 的 watch 段（每轮热加载）
+# watch 段：{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,
+#            "derive":[],"export_policy":"immediate","hold":false}
+#   export_policy: immediate（剪完即导，默认）/ after_edit_queue_drained（全部剪完才导出）/ manual（等 --phase export）
+#   derive: 全局派生平台列表，默认 []（不派生）；剧级声明优先走 dispatch.json
 
-# 导出偏好（可选）：豆包/用户写 <cover_job>/export_config.json，watcher 触发时应用并记 history
-# {"cut_s": 7200, "derive": ["youtube","tiktok"]}
-#   cut_s 省略 = 不裁剪（正数秒，≤ duration_s，validate 把关）
-#   derive 省略 = 全平台；[] = 不派生；平台名支持短名 ig/facebook，"all" = 全量
+# 调度意图（豆包侧声明）：写 <cover_job>/dispatch.json，ingest 时归并进 job.json.workflow
+# {"version":1,"mode":"full","cut_s":15,"derive":["youtube","tiktok"],"priority":0}
+#   mode: full（剪辑+导出，默认）/ edit_only（只剪辑停在草稿）
+#   cut_s: 正数秒裁剪；0/省略 = 不裁。derive: []/省略 = 不派生；支持 ig/facebook/all
+#   归并规则：intent_revision==0 时 dispatch 全量归并（幂等）；人工把 intent_revision +1 后
+#   job.json 永远优先，dispatch 只补缺失不覆盖（冲突记 watcher.log + 桌面通知）
+#   人工改意图 = 直接编辑 job.json.workflow 并把 workflow.intent_revision +1（程序永不写该字段）
+
+# 旧版兼容：<cover_job>/export_config.json（{"cut_s": 7200, "derive": [...] }）仍被导出阶段读取，
+# 但新任务一律用 dispatch.json；cut 解析优先级 workflow.cut_s > video.cut_s（set-cut 写的旧字段）
 
 # 任意阶段更新
 python lib/job_manifest.py update --job "<cover_job>" --patch-file patch.json `
