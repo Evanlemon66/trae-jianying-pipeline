@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 from datetime import datetime
 from typing import Any, Optional
@@ -47,6 +48,22 @@ STAGES = (
     "publish_ready",
     "published",
 )
+
+# 兼容第三方 agent 的别名写法（收口时统一映射到契约值）
+STAGE_ALIASES = {
+    "covers_done": "covers_ready",
+    "covers_complete": "covers_ready",
+    "videos_done": "video_ready",
+    "video_done": "video_ready",
+}
+
+
+def canon_stage(stage: Any) -> Any:
+    """把非契约 stage 别名映射成契约值；未知值原样返回。"""
+    if isinstance(stage, str):
+        key = stage.strip().lower()
+        return STAGE_ALIASES.get(key, stage)
+    return stage
 
 COVER_SLOTS = (
     (1, "爆点仰拍", "cover_01_hit.png"),
@@ -369,6 +386,9 @@ def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str
     if len(selected) not in (0, 3):
         errors.append("titles.selected 应为空或 3 项")
     for entry in selected:
+        if not isinstance(entry, dict):
+            errors.append(f"selected 条目应为对象 {{slot,title_id,title}}，实际: {entry!r}")
+            continue
         if not re.fullmatch(r"T(?:[1-9]|1[0-2])", str(entry.get("title_id"))):
             errors.append(f"selected 中 title_id 非法: {entry.get('title_id')}")
         if entry.get("slot") not in (1, 2, 3):
@@ -1033,6 +1053,179 @@ def derive_covers(job_dir: str, platforms: list[str], *, slot: int = 1) -> dict[
     return {"derived": results}
 
 
+def _image_size(path: str) -> Optional[tuple[int, int]]:
+    """纯标准库读 PNG/JPEG 宽高；解析失败返回 None。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(33)
+            if head[:8] == b"\x89PNG\r\n\x1a\n":
+                return struct.unpack(">II", head[16:24])
+            if head[:2] != b"\xff\xd8":
+                return None
+            f.seek(2)
+            while True:
+                b = f.read(1)
+                if not b:
+                    return None
+                if b != b"\xff":
+                    continue
+                marker = f.read(1)
+                if not marker or marker in (b"\xd8", b"\xd9"):
+                    continue
+                seg_len = struct.unpack(">H", f.read(2))[0]
+                if marker[0] in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                                 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    data = f.read(seg_len - 2)
+                    h, w = struct.unpack(">HH", data[1:5])
+                    return w, h
+                f.seek(seg_len - 2, 1)
+    except (OSError, struct.error):
+        return None
+
+
+CANONICAL_COVER_STEMS: dict[Any, str] = {
+    1: "cover_01_hit", 2: "cover_02_contrast", 3: "cover_03_guard",
+    "vertical": "cover_04_vertical",
+}
+
+
+def detect_cover_files(job_dir: str, *, apply: bool = True) -> tuple[dict[Any, str], list[str]]:
+    """识别 04_covers 下的图并改名到契约名。
+
+    规则：契约文件名优先；竖版按文件名（vertical/竖）或宽高比（竖图）判定；
+    其余横版按文件名编号（1/2/3）或自然顺序映射到 slot 1/2/3。
+    apply=False 只演算不改名。返回 ({slot: 绝对路径}, [改名记录])。
+    """
+    covers = os.path.join(job_dir, "04_covers")
+    result: dict[Any, str] = {}
+    renames: list[str] = []
+    if not os.path.isdir(covers):
+        return result, renames
+
+    files = [os.path.join(covers, n) for n in sorted(os.listdir(covers), key=natural_key)
+             if os.path.isfile(os.path.join(covers, n))
+             and os.path.splitext(n)[1].lower() in IMAGE_EXTS]
+    by_stem = {os.path.splitext(os.path.basename(p))[0].lower(): p for p in files}
+    for slot, stem in CANONICAL_COVER_STEMS.items():
+        if stem in by_stem:
+            result[slot] = by_stem[stem]
+    rest = [p for p in files if p not in set(result.values())]
+
+    # 竖版：名称提示优先，其次宽高比
+    if "vertical" not in result and rest:
+        hint = [p for p in rest if re.search(r"vertical|竖", os.path.basename(p), re.I)]
+        portrait = [p for p in rest
+                    if (lambda s: bool(s) and s[1] > s[0])(_image_size(p))]
+        pick = (hint or portrait or [None])[0]
+        if pick:
+            result["vertical"] = pick
+            rest.remove(pick)
+
+    # 横版：先按文件名里的 1/2/3，再自然顺序补位
+    numbered: dict[int, str] = {}
+    for p in rest:
+        stem = os.path.splitext(os.path.basename(p))[0].lower()
+        m = re.search(r"(?:cover|封面|图|t)?[ _\-]?(0?[1-3])(?!\d)", stem)
+        if m:
+            numbered.setdefault(int(m.group(1)), p)
+    used = set(numbered.values())
+    for slot in (1, 2, 3):
+        if slot in result:
+            continue
+        pick = numbered.get(slot)
+        if pick is None:
+            pick = next((x for x in rest if x not in used), None)
+            if pick:
+                used.add(pick)
+        if pick:
+            result[slot] = pick
+
+    # 改名到契约名（保留原扩展名）
+    for slot, p in list(result.items()):
+        stem = CANONICAL_COVER_STEMS[slot]
+        ext = os.path.splitext(p)[1].lower()
+        if os.path.splitext(os.path.basename(p))[0].lower() == stem:
+            continue
+        dst = os.path.join(covers, stem + ext)
+        renames.append(f"{os.path.basename(p)} → {os.path.basename(dst)}")
+        if apply:
+            os.replace(p, dst)
+            result[slot] = dst
+    return result, renames
+
+
+def _title_texts(job_dir: str, titles_file: Optional[str]) -> dict[str, str]:
+    """titles.json 的 id → 标题文本映射（结构容错）。"""
+    rel = titles_file or "02_titles/titles.json"
+    path = os.path.join(job_dir, rel)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    items = data.get("items") or data.get("titles") or (data if isinstance(data, list) else [])
+    texts: dict[str, str] = {}
+    for idx, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        tid = it.get("id") or it.get("title_id") or f"T{idx + 1}"
+        if it.get("title"):
+            texts[str(tid).upper()] = it["title"]
+    return texts
+
+
+def _normalize_selected(job_dir: str, titles_file: Optional[str],
+                        entries: list[Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """把第三方 agent 的各种 selected 写法统一成 [{slot,title_id,title}]。
+
+    支持：对象 / "T9" / 9 / 纯标题文本；slot 支持 1 / "1" / "封面1"。
+    """
+    texts = _title_texts(job_dir, titles_file)
+    out: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for idx, entry in enumerate(entries[:3]):
+        slot: Any = idx + 1
+        title_id: Optional[str] = None
+        title: Optional[str] = None
+        if isinstance(entry, dict):
+            slot = entry.get("slot", slot)
+            title_id = entry.get("title_id")
+            title = entry.get("title")
+        elif isinstance(entry, int):
+            title_id = f"T{entry}"
+        elif isinstance(entry, str):
+            s = entry.strip()
+            if re.fullmatch(r"T\d{1,2}", s, re.I):
+                title_id = s.upper()
+            elif s.isdigit():
+                title_id = f"T{int(s)}"
+            else:
+                title = s
+        if isinstance(slot, str):
+            m = re.fullmatch(r"封面\s*([123])", slot.strip())
+            slot = int(m.group(1)) if m else (int(slot) if slot.strip().isdigit() else idx + 1)
+        if slot not in (1, 2, 3):
+            slot = idx + 1
+        if title_id is None and title:
+            hit = [k for k, v in texts.items() if v == title]
+            title_id = hit[0] if hit else None
+        if title_id is None and isinstance(entry, dict) and entry.get("title"):
+            title_id = None
+        if title_id is None:
+            title_id = f"T{idx + 1}"
+            notes.append(f"selected[{idx}] 缺 title_id，按顺序补 {title_id}")
+        title_id = str(title_id).upper()
+        title = title or texts.get(title_id)
+        out.append({"slot": int(slot), "title_id": title_id, "title": title})
+    if [e["slot"] for e in out] != [1, 2, 3]:
+        notes.append("selected slot 重排为 1/2/3")
+        for i, e in enumerate(out, 1):
+            e["slot"] = i
+    return out, notes
+
+
 def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
     """Stage 2 收口：从落盘产物（prompts.json + 4 张契约图）重建 job.json。
 
@@ -1040,25 +1233,49 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
     幂等：重复跑安全；同名换图重跑会刷新 hash 并在报告 normalized 中体现。
     """
     job = load_job(os.path.join(job_dir, "job.json"))
-    stage = job.get("stage")
+    # ── stage 别名映射（第三方 agent 可能写 covers_done 等非契约值）
+    raw_stage = job.get("stage")
+    stage = canon_stage(raw_stage)
+    if stage != raw_stage:
+        report_stage_alias = f"stage {raw_stage}→{stage}"
+        job["stage"] = stage
+    else:
+        report_stage_alias = None
     if stage not in ("titles_selected", "prompts_ready", "covers_ready"):
         raise ValueError(
             f"ingest 要求 stage ∈ titles_selected/prompts_ready/covers_ready，当前 {stage!r}")
+
     titles = job.get("titles") or {}
-    if titles.get("gate") != "done":
-        raise ValueError("titles.gate 未 done：先完成标题门禁再 ingest")
-
     report: dict[str, Any] = {"stage_from": stage, "prompts": None, "covers": [],
-                              "missing_covers": [], "hash_filled": [], "normalized": []}
+                              "missing_covers": [], "hash_filled": [], "normalized": [],
+                              "renamed": []}
+    if report_stage_alias:
+        report["normalized"].append(report_stage_alias)
 
-    # ── 规范化：selected[].slot "封面N" → N（canonical=数字）
-    for entry in titles.get("selected") or []:
-        slot = entry.get("slot")
-        if isinstance(slot, str):
-            m = re.fullmatch(r"封面\s*([123])", slot.strip())
-            if m:
-                entry["slot"] = int(m.group(1))
-                report["normalized"].append(f"selected.slot {slot}→{entry['slot']}")
+    # ── 标题门禁：优先读 selection.json（agent 只需交编号清单，不写 job.json）
+    sel_file = os.path.join(job_dir, "02_titles", "selection.json")
+    if os.path.isfile(sel_file) and len(titles.get("selected") or []) != 3:
+        with open(sel_file, encoding="utf-8-sig") as f:
+            sdata = json.load(f)
+        picks = sdata.get("picks") or sdata.get("selected") or []
+        titles["selected"] = picks
+        titles["selected_by"] = sdata.get("selected_by") or "user"
+        titles["selected_at"] = titles.get("selected_at") or now_iso()
+        titles["gate"] = "done"
+        report["normalized"].append(f"读取 selection.json（{len(picks)} 条）")
+
+    # ── 规范化 selected：对象 / "T9" / 9 / 纯文本 → canonical 对象
+    if titles.get("selected"):
+        norm, notes = _normalize_selected(job_dir, titles.get("file"),
+                                          list(titles["selected"]))
+        titles["selected"] = norm
+        report["normalized"].extend(notes)
+    if titles.get("selected_by") not in ("user", "auto"):
+        titles["selected_by"] = "user" if titles.get("selected") else None
+    if titles.get("selected_by") != "auto":
+        titles["auto_mode"] = None
+    if titles.get("gate") != "done" or len(titles.get("selected") or []) != 3:
+        raise ValueError("titles.gate 未 done 或 selected 不足 3 条：先完成标题门禁再 ingest")
 
     # ── 竖版绑定：selected 中评分最高的一条（已绑过则不动）
     vc = job.get("vertical_cover") or {}
@@ -1091,15 +1308,9 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
                      "count": len(items), "prompt_sha256": new_hash})
         report["prompts"] = {"items": len(items), "channel": pdata.get("channel")}
 
-    # ── 收 covers（契约文件名，扩展名自适应）
-    exts = (".png", ".jpg", ".jpeg", ".webp")
-
-    def _find(stem: str) -> Optional[str]:
-        for ext in exts:
-            p = os.path.join(job_dir, "04_covers", stem + ext)
-            if os.path.isfile(p):
-                return p
-        return None
+    # ── 收 covers：先识别并把任意命名的图改名到契约名（agent 不需记文件名）
+    found, renames = detect_cover_files(job_dir, apply=not dry_run)
+    report["renamed"] = renames
 
     def _fill(entry: dict[str, Any], path: str, tag: Any) -> None:
         rel = f"04_covers/{os.path.basename(path)}"
@@ -1113,14 +1324,13 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
         entry.setdefault("generated_at", now_iso())
         report["covers"].append(tag)
 
-    stems = {1: "cover_01_hit", 2: "cover_02_contrast", 3: "cover_03_guard"}
     for cm in job.get("cover_map") or []:
-        p = _find(stems[cm["slot"]]) if cm.get("slot") in stems else None
+        p = found.get(cm.get("slot"))
         if p:
             _fill(cm, p, cm["slot"])
         else:
             report["missing_covers"].append(cm.get("slot"))
-    vp = _find("cover_04_vertical")
+    vp = found.get("vertical")
     if vp:
         _fill(job.setdefault("vertical_cover", {}), vp, "vertical")
     else:
