@@ -157,13 +157,15 @@ def set_cover_composition(draft, draft_dir, cover_image):
         print(f"  ⚠️ 封面格式 {ext} 不受支持，跳过 composition")
         return False
 
-    # 1) 复制封面图到 Resources/cover/
+    # 1) 复制封面图到 Resources/cover/，并强制刷新 mtime（copy2 会保留源文件旧 mtime，
+    #    剪映在导出时可能按"过期资源"清理掉）
     cover_dir = os.path.join(draft_dir, "Resources", "cover")
     os.makedirs(cover_dir, exist_ok=True)
     img_uuid = gen_uuid()
     dst_name = f"{img_uuid}{ext}"
     dst_path = os.path.join(cover_dir, dst_name)
     shutil.copy2(cover_image, dst_path)
+    os.utime(dst_path, None)
 
     # 读取图片尺寸
     try:

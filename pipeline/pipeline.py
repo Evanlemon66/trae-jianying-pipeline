@@ -2717,11 +2717,10 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             print("  ✅ 终检通过")
         print()
 
-    # 封面 composition 必须在保存前挂进草稿 JSON；draft_cover.jpg 则推迟到全部
-    # JSON 写盘（含 framefix/保存发布/补翻）之后、导出之前再写——否则封面 mtime
-    # 早于草稿 update_time，剪映打开草稿时判定封面过期，用第一帧重生成覆盖自定义封面
-    if cover_image:
-        set_cover_composition(draft, dp_root, cover_image)
+    # 封面延迟到所有 pipeline 自己的 JSON 写盘（保存发布/补翻 framefix）之后再挂，
+    # 避免资源/JSON 分批写入被剪映在导出时清理或判定过期
+    # （八仙 2026-11-02：早挂 composition 的 Resources/cover 资源被剪映清掉，
+    #  重回84 2026-11-02：draft_cover.jpg mtime 早于 draft_content.json 被重生成）
 
     jy_running = _jianying_running()
     locked = _draft_json_locked(draft_path)
@@ -2802,11 +2801,20 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         print("  ✅ 补翻复验通过，继续导出")
         print()
 
-    # ━━━━ Step 10.9: 封面图落盘（必须在所有草稿 JSON 写完之后）━━━━
-    # draft_cover.jpg 的 mtime 必须晚于 draft_content.json，否则剪映打开草稿时
-    # 判定封面过期并用第一帧重生成（覆盖自定义封面）。composition 已在保存前挂载。
+    # ━━━━ Step 10.9: 封面最终落盘（导出前最后一步，原子性写全三个东西）━━━━
+    # 重新从磁盘读（补翻等步骤可能改过 on-disk draft_content.json），然后：
+    #   1) set_cover_composition — 新建 Resources/cover/<uuid>.<ext> + 更新 cover 字段
+    #   2) save_draft            — 写 draft_content.json（和上面同批）
+    #   3) set_draft_cover      — 写 draft_cover.jpg（os.utime 已在 jy_cover 内置）
+    # 三者 mtime 都在导出前，剪映打开草稿时封面不会过期
     if cover_image or cover_extract_from_video:
-        print(f"🖼️ 设置草稿封面(导出前最后写入): cover_image={cover_image}")
+        print(f"🖼️ 设置草稿封面(导出前原子落盘): cover_image={cover_image}")
+        if cover_image:
+            with open(draft_path, encoding="utf-8") as _f:
+                _final_draft = json.load(_f)
+            set_cover_composition(_final_draft, dp_root, cover_image)
+            save_draft(_final_draft, draft_path)
+            draft = _final_draft  # 让后续 summarize/return 用最新版
         set_draft_cover(
             dp_root,
             cover_image=cover_image,
