@@ -262,7 +262,7 @@ python lib/job_manifest.py derive --job "<cover_job>" --platform all --slot 2
 # 收登记、规范化（selected.slot 中文→数字）、补 hash、推进 stage（只进不退），幂等
 python lib/job_manifest.py ingest --job "<cover_job>" [--dry-run]
 
-# 落盘自动触发链（监听 cover_job，产物齐自动跑：validate --fix → ingest → export_config → 串流导出 mp4（默认 --verify 自动质检）→ record-video → derive → Toast）
+# 落盘自动触发链（监听 cover_job，产物齐自动跑：validate --fix → ingest → export_config → 串流导出 mp4（batch_runner 默认自动质检，--no-verify 关）→ record-video → derive → Toast）
 python lib/cover_watch.py --job "<cover_job>" [--job "<另一个>"] [--settle 30] [--once] [--dry-run] [--no-verify] [--no-derive]
 python lib/cover_watch.py status --job "<cover_job>"
 python lib/cover_watch.py          # 无参：读 <repo>/cover_watch.json 的默认任务列表 {"jobs":[...],"settle":30,"interval":5,"derive":true}

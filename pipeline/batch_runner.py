@@ -13,6 +13,7 @@
 - --per-episode 逐集独立草稿：状态机 pending → running → done / failed，记录在 <workdir>/_batch_state.json，
   中断后重跑自动跳过 done，失败集可单独 --only 重试，跑完可 --auto-merge 合并
 - 串行 + 每集间隔(--delay)，降低剪映云接口风控概率；单集失败不阻塞后续集
+- 默认导出完成后自动质检（verify_export.py，隐含等待导出完成）；--no-verify 关闭
 """
 
 import os
@@ -121,9 +122,11 @@ def main():
     ap.add_argument("--export-dir", default=None,
                     help="自动导出落点根目录（默认读 pipeline/presets.json 的 export_dir）")
     ap.add_argument("--wait-export", action="store_true",
-                    help="后台导出启动后轮询 progress.json 等待完成（默认立即 return）")
-    ap.add_argument("--verify", action="store_true",
-                    help="导出完成后自动跑 verify_export.py（隐含 --wait-export）")
+                    help="后台导出启动后轮询 progress.json 等待完成（默认由 --verify 隐含开启）")
+    ap.add_argument("--verify", dest="verify", action="store_true", default=True,
+                    help="(默认) 导出完成后自动跑 verify_export.py 质检（隐含 --wait-export）")
+    ap.add_argument("--no-verify", dest="verify", action="store_false",
+                    help="跳过导出后自动质检（同时不再等待导出完成）")
     ap.add_argument("--export-timeout", type=float, default=60.0,
                     help="导出等待上限分钟数（默认 60；超时视为异常，不阻塞继续）")
     ap.add_argument("--presets", default=None, metavar="'名1,名2:0.03'",

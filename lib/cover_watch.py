@@ -231,9 +231,9 @@ def _build_cmd(series_dir: str, cut: Any, verify: bool = True) -> list[str]:
     cmd = [sys.executable, _BATCH_RUNNER, series_dir, "--force"]
     if isinstance(cut, (int, float)) and not isinstance(cut, bool) and cut > 0:
         cmd += ["--cut", str(cut)]
-    # 默认自动质检：--verify 隐含 --wait-export，确保导出真正完成后再登记
-    if verify:
-        cmd += ["--verify"]
+    # 质检是 batch_runner 默认行为（--verify 隐含 --wait-export，导出完成后再登记）；仅在关闭时显式传
+    if not verify:
+        cmd += ["--no-verify"]
     return cmd
 
 
