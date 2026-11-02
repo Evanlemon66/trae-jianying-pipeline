@@ -66,6 +66,13 @@ Thumbs.db
 *.zip
 *.exe
 
+# 运行态全局导出锁与本机 watcher 任务配置（含个人路径，不入库）
+.export.lock
+cover_watch.json
+
+# 豆包分发包构建产物（由 .trae/skills/drama-cover-builder 生成，可重建）
+dist/
+
 # 剪映本地资源 (体积大，由 sync_jy_assets 自动同步；仅根目录，技能内 assets 正常入库)
 /assets/
 /covers/
