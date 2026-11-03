@@ -54,6 +54,27 @@ Read the individual rule files for specific tasks and constraints:
 - 只有在明确知道轨道上已有至少两个视频片段时，才允许用 `track_name="V1"` 让包装层自动推断转场锚点。
 - 生成完成后，必须检查草稿是否真的写入了 `filters`、`video_effects`、`transitions`，不能只依据 AI 自己的口头说明判断成功。
 
+## 🔄 导出实例生命周期与失败自愈（robust_auto_export）
+
+`examples/robust_auto_export.py` 的拉起/回首页统一走 `examples/jy_instance.py` 的实例管理器，关键行为：
+
+- **实例状态机**：`stopped → launching → home → editing → exporting → (home | stopped)`。所有转移用墙钟 deadline，每次 UIA 探测带独立线程超时，探测失败不会无限等待。
+- **冷启动默认开**：`--cold-start`（watcher 侧 `watch.cold_start`，默认 true）在每部剧导出前杀进程→拉起→等首页，规避「上一部刚导完、窗口存在但未就绪」的首试假死；手动同时用剪映时设 false。
+- **杀进程唯一入口**：只有管理器的 `kill()` 调 `taskkill`，`connect`/`switch_to_home`/重启/冷启动均为薄封装转调，不直接杀进程。
+- **就绪兜底**：`ensure` 到 deadline 未就绪只 `restart()` 一次，再失败抛含「未就绪/冷启动失败」关键词的异常，交由上层失败分类处理。
+
+失败按 `lib/failure_class.py` 分五类（+`unknown` 兜底），决定重试与自愈动作：
+
+| 类别 | 可重试 | 动作 |
+| --- | --- | --- |
+| `ui_hang`（窗口无响应/打开草稿超时） | 是 | 重启剪映重试 |
+| `asset_missing`（草稿/素材缺失损坏） | **否** | 直接失败不重试 |
+| `disk_full`（目标盘不足） | **否** | 拒绝启动不重试 |
+| `export_timeout`（导出无进展卡死） | 是 | 杀进程重试 |
+| `version_dialog`（更新/公告弹窗挡路） | 是 | 关弹窗后重试 |
+
+`asset_missing`/`disk_full` 不重试、不计入连续失败，直接终态并通知，避免长时间空转。
+
 ## 📖 经典示例 (Examples)
 
 Refer to these for complete workflows:

@@ -15,6 +15,8 @@ D:\短剧\<剧名>\
     ├── job.json
     ├── dispatch.json                   # 可选：豆包侧调度意图声明（mode/cut_s/derive/priority），ingest 归并进 job.json.workflow，见 §7
     ├── export_config.json              # 可选（旧版兼容）：导出偏好（cut_s / derive），见 §7
+    ├── .export_state.json              # 运行态：导出状态机单一真源（cover_watch 自动写，无需手工建），见 §7.1
+    ├── .export_retry.json              # 运行态（旧版，仅迁移来源）：首次读真源时迁入 .export_state.json 并备份 .bak
     ├── 01_input\
     │   ├── synopsis.txt
     │   └── reference.png
@@ -284,9 +286,13 @@ python lib/cover_watch.py --phase export --once            # 单轮强制只推�
 python lib/cover_watch.py status --job "<cover_job>"
 python lib/cover_watch.py          # 无参：读 <repo>/pipeline/presets.json 的 watch 段（每轮热加载）
 # watch 段：{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,
-#            "derive":[],"export_policy":"immediate","hold":false}
+#            "derive":[],"export_policy":"immediate","hold":false,
+#            "cold_start":true,"export_stall_timeout":1800,"retry_pause_after":5}
 #   export_policy: immediate（剪完即导，默认）/ after_edit_queue_drained（全部剪完才导出）/ manual（等 --phase export）
 #   derive: 全局派生平台列表，默认 []（不派生）；剧级声明优先走 dispatch.json
+#   cold_start: 每部剧导出前冷启动剪映（杀进程→拉起→等首页），默认 true；手动同时用剪映时设 false
+#   export_stall_timeout: 导出「无进展」判定卡死的秒数，默认 1800（进度 json 每 30s 刷新，仍在写盘不误杀）
+#   retry_pause_after: 连续导出失败多少次后暂停该剧，默认 5；退避 1/2/4/8/16/30 分钟，见 §7.1
 
 # 调度意图（豆包侧声明）：写 <cover_job>/dispatch.json，ingest 时归并进 job.json.workflow
 # {"version":1,"mode":"full","cut_s":15,"derive":["youtube","tiktok"],"priority":0}
@@ -310,6 +316,62 @@ python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先补算豆�
 
 并发保护：同一任务同一时间只允许一个阶段写；如需并行，先加 `cover_job/.lock` 并在写完删除。
 导出互斥：repo 级全局锁 `.export.lock`（`lib/export_lock.py`，pid 判活）保证同一时刻只有一个 batch_runner 导出；watcher 导出步自动持锁，手工跑遇活锁报错退出，`--force` 可强跑。
+
+### 7.1 导出状态真源 `.export_state.json`
+
+导出阶段的「是否已导 / 失败几次 / 是否暂停 / 进度到哪」只读这一份文件，不再分散判断。
+
+- **位置**：`<cover_job>/.export_state.json`（与 `.watcher.lock` 同级）。运行态文件，watcher 首次导出评估时自动创建，无需手工建。
+- **唯一写者**：`lib/export_state.py`，且只由 `cover_watch` 的导出链路调用。剪映导出子进程、`job_manifest`、`series_runner` 都不写它。`job.json` 的 `video.status` 是展示字段，由本真源派生（真源 `done` → `video.status="done"`），任何地方不得绕过真源直接改。
+- **原子与幂等**：`.tmp` + `os.replace` 写入；`succeed` 对已 `done` 原样返回不重写。
+
+状态取值与转移：
+
+| 状态 | 谁写 / 何时 | 下一步允许 |
+| --- | --- | --- |
+| `pending` | 迁移/初始化（无失败记录） | → `exporting` |
+| `exporting` | 导出启动前 | → `done` / `retrying` / `paused`；心跳超时被回收为 `retrying` |
+| `retrying` | 失败未超阈值；或 `exporting` 心跳超时回收 | 退避结束 → `exporting`；再失败超阈值 → `paused` |
+| `paused` | 连续失败 ≥ `retry_pause_after` | 仅 `--phase export` 人工放行 → `exporting`（**不清零计数**） |
+| `done` | 导出成功（record-video 后） | 终态；重导需人工删本文件或 `--phase export` |
+| `failed` | 不可重试硬失败（素材缺失/磁盘不足） | 终态，需人工处理 |
+
+字段含义：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 上表六态之一 |
+| `attempts` | 本轮成功前的尝试次数（成功清零） |
+| `consecutive_failures` | 连续失败次数（驱动退避/暂停；成功清零；硬失败不递增） |
+| `last_error` | 最近一次失败原因 |
+| `next_retry_at` | 下次可重试的 epoch 秒（0=立即可重试） |
+| `progress` | 0–100 进度快照（实时值仍在导出子进程的 `.progress.json`） |
+| `heartbeat_ts` | epoch 心跳；`exporting` 时与 `.progress.json` mtime 取大者判活 |
+| `updated_at` / `writer` | 最近写入时间 / 写入者 pid |
+| `phase` | 当前子阶段（`cold_start`/`export`/`verify`），供追溯 |
+| `failure_class` | 失败分类（见下），默认 `unknown` |
+
+**崩溃恢复**：`exporting` 且心跳超过 180s 无更新 → 判定上次导出崩溃，回收为 `retrying`。心跳 = `max(heartbeat_ts, .progress.json mtime)`，子进程仍在写盘则不误杀。
+
+**失败分类 `failure_class`**（`lib/failure_class.py`，写入本真源）：
+
+| 类别 | 可重试 | 动作 | 计数 |
+| --- | --- | --- | --- |
+| `ui_hang` | 是 | 重启剪映重试 | 是 |
+| `asset_missing` | **否** | 直接终态 `failed` + 通知 | 否 |
+| `disk_full` | **否** | 直接终态 `failed` + 通知 | 否 |
+| `export_timeout` | 是 | 杀进程重试 | 是 |
+| `version_dialog` | 是 | 关弹窗后重试 | 是 |
+| `unknown` | 是 | 重启重试 | 是 |
+
+**迁移优先级**（真源缺失时按旧数据一次性推断，并把 `.export_retry.json` 备份为 `.bak`）：
+1. `job.json` `video.status=="done"` 或 `stage=="video_ready"` → `done`（已导出事实不可回退）
+2. `.export_retry.json` `paused` → `paused`
+3. `.export_retry.json` `fails>0` → `retrying`（继承计数与退避点）
+4. `.progress.json` `status==running` 且 mtime 新鲜 → `exporting`（交崩溃恢复判定）
+5. 其余 → `pending`
+
+**暂停放行**：`paused`/`failed` 只能 `python lib/cover_watch.py --phase export --once` 人工强制放行，或删除本文件重建；放行**不清零** `consecutive_failures`，若再失败会继续计数。
 
 ## 8. 各阶段产物与意义
 
