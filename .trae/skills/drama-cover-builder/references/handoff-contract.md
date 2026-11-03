@@ -15,7 +15,7 @@ D:\短剧\<剧名>\
     ├── job.json
     ├── dispatch.json                   # 可选：豆包侧调度意图声明（mode/cut_s/derive/priority），ingest 归并进 job.json.workflow，见 §7
     ├── export_config.json              # 可选（旧版兼容）：导出偏好（cut_s / derive），见 §7
-    ├── .export_state.json              # 运行态：导出状态机单一真源（cover_watch 自动写，无需手工建），见 §7.1
+    ├── .export_state.json              # 运行态：导出状态机单一真源（进入导出闸门时 cover_watch 自动写，无需手工建），见 §7.1
     ├── .export_retry.json              # 运行态（旧版，仅迁移来源）：首次读真源时迁入 .export_state.json 并备份 .bak
     ├── 01_input\
     │   ├── synopsis.txt
@@ -321,7 +321,7 @@ python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先补算豆�
 
 导出阶段的「是否已导 / 失败几次 / 是否暂停 / 进度到哪」只读这一份文件，不再分散判断。
 
-- **位置**：`<cover_job>/.export_state.json`（与 `.watcher.lock` 同级）。运行态文件，watcher 首次导出评估时自动创建，无需手工建。
+- **位置**：`<cover_job>/.export_state.json`（与 `.watcher.lock` 同级）。运行态文件，**仅当该剧首次进入导出闸门（即将执行导出）时创建**；未进闸门的剧（已 `video_ready`、缺图/缺 prompts、gate 未 done 等）不会生成该文件。无需手工建。
 - **唯一写者**：`lib/export_state.py`，且只由 `cover_watch` 的导出链路调用。剪映导出子进程、`job_manifest`、`series_runner` 都不写它。`job.json` 的 `video.status` 是展示字段，由本真源派生（真源 `done` → `video.status="done"`），任何地方不得绕过真源直接改。
 - **原子与幂等**：`.tmp` + `os.replace` 写入；`succeed` 对已 `done` 原样返回不重写。
 
@@ -357,12 +357,14 @@ python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先补算豆�
 
 | 类别 | 可重试 | 动作 | 计数 |
 | --- | --- | --- | --- |
-| `ui_hang` | 是 | 重启剪映重试 | 是 |
+| `ui_hang` | 是 | 软关回首页（关闭按钮失败才重启）重试 | 是 |
 | `asset_missing` | **否** | 直接终态 `failed` + 通知 | 否 |
 | `disk_full` | **否** | 直接终态 `failed` + 通知 | 否 |
-| `export_timeout` | 是 | 杀进程重试 | 是 |
-| `version_dialog` | 是 | 关弹窗后重试 | 是 |
-| `unknown` | 是 | 重启重试 | 是 |
+| `export_timeout` | 是 | **强制杀进程重启**（经管理器，不走软关）重试 | 是 |
+| `version_dialog` | 是 | 先关弹窗，再软关回首页重试 | 是 |
+| `unknown` | 是 | 软关回首页（失败才重启）重试 | 是 |
+
+实际执行的自愈动作（`soft_home` / `kill_restart` / `dismiss`）记入导出进度侧写 `.progress.json` 的 `recovery_action` 字段与流程日志，可追溯「这次是软回还是真杀」；杀进程只经 `jy_instance.kill()`。
 
 **迁移优先级**（真源缺失时按旧数据一次性推断，并把 `.export_retry.json` 备份为 `.bak`）：
 1. `job.json` `video.status=="done"` 或 `stage=="video_ready"` → `done`（已导出事实不可回退）
