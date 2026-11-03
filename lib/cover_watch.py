@@ -338,6 +338,27 @@ def _read_progress_failure(out_mp4: str) -> tuple[Optional[str], Optional[str], 
     return rec.get("failure_class"), rec.get("phase"), last
 
 
+def _read_progress_recovery(out_mp4: str) -> Optional[str]:
+    """从 .progress.json 读回导出子进程实际执行的自愈动作 recovery_action。
+
+    旧版本产物无该字段时返回 None（不报错、不写空值）。
+    """
+    out_dir = os.path.dirname(os.path.abspath(out_mp4))
+    side = os.path.join(os.path.dirname(out_dir),
+                        os.path.basename(out_dir) + ".progress.json")
+    final = out_mp4 + ".progress.json"
+    cands = [p for p in (final, side) if os.path.isfile(p)]
+    if not cands:
+        return None
+    p = max(cands, key=os.path.getmtime)
+    try:
+        with open(p, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return rec.get("recovery_action") or None
+
+
 def _migrate_ctx(job: dict[str, Any]) -> dict[str, Any]:
     """真源缺失时的迁移上下文：从 job.json 提取已导/阶段信号（只读）。"""
     return {"video_status": (job.get("video") or {}).get("status"),
@@ -639,6 +660,8 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
                            failure_class=p_class,
                            retryable=bool(strat.get("retryable")),
                            phase=p_phase)
+        # 从 sidecar 读回实际自愈动作写入真源（唯一写者仍是 export_state；无值不写）
+        es.record_recovery(job_dir, _read_progress_recovery(out_mp4))
         toast("❌ 导出失败", f"{name}（{p_class}）", icon="error")
         return False
     # 质检（与 batch_runner 默认行为一致；--no-verify 关闭）
@@ -660,6 +683,8 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     # 真源终态 done（计数清零），随后把 video.status 由真源派生落 job.json
     note_export_result(job_dir, name, True)
     _derive_video_status(job_dir)
+    # 从 sidecar 读回实际自愈动作写入真源（唯一写者仍是 export_state；无值不写）
+    es.record_recovery(job_dir, _read_progress_recovery(out_mp4))
     if platforms:
         try:
             rep = jm.derive_covers(job_dir, platforms)

@@ -145,6 +145,25 @@ plan_forced = cw.build_plan(jd, job, {"cold_start": False}, pending_edit=0,
                             phase_override="export")
 check("--phase export 强制放行", plan_forced["action"] == "export", plan_forced["action"])
 
+print("\n== ⑨ record_recovery：sidecar 值 → 真源（唯一写者仍 export_state）==")
+jd = fresh("自愈记录")
+es.begin(jd, phase="export")  # 先有真源
+st = es.record_recovery(jd, "kill_restart")
+check("有值 → 写 last_recovery_action", st["last_recovery_action"] == "kill_restart", st)
+check("同时写 last_recovery_at", st["last_recovery_at"] is not None)
+check("无值(None) → 保持不写", es.record_recovery(jd, None)["last_recovery_action"] == "kill_restart")
+check("空串 → 保持不写", es.record_recovery(jd, "")["last_recovery_action"] == "kill_restart")
+snap1 = open(es.state_path(jd), encoding="utf-8").read()
+es.record_recovery(jd, "kill_restart")  # 幂等
+snap2 = open(es.state_path(jd), encoding="utf-8").read()
+check("重复写同一动作幂等（内容不变）", snap1 == snap2)
+check("不同动作覆盖（只留最近一次）",
+      es.record_recovery(jd, "dismiss_then_kill")["last_recovery_action"] == "dismiss_then_kill")
+jd_none = fresh("自愈无真源")
+check("真源不存在 → 不创建、返回 None",
+      es.record_recovery(jd_none, "kill_restart") is None
+      and not os.path.isfile(es.state_path(jd_none)))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\n{'='*40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
 sys.exit(1 if fails else 0)

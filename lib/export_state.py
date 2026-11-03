@@ -92,6 +92,8 @@ def _default() -> dict[str, Any]:
         "writer": None,              # 最近写入者 pid
         "phase": None,               # 预留：cold_start / export / verify
         "failure_class": "unknown",  # 预留：失败分类（第 3 项）
+        "last_recovery_action": None,  # 最近一次自愈动作（soft_home/kill_restart/dismiss/dismiss_then_kill）
+        "last_recovery_at": None,      # 最近一次自愈动作时间（ISO）
     }
 
 
@@ -316,6 +318,28 @@ def heartbeat(job_dir: str, *, progress: Optional[int] = None,
     if phase:
         st["phase"] = phase
     _save_if_changed(job_dir, st)
+
+
+def record_recovery(job_dir: str, action: Optional[str], *,
+                    now: Optional[float] = None) -> Optional[dict[str, Any]]:
+    """记录最近一次自愈动作（由 cover_watch 从 progress sidecar 读回后经本接口写入）。
+
+    唯一写者仍是本模块；本函数只存**最近一次**（不做历史数组，避免真源膨胀）。
+    兼容：action 为 None/空（sidecar 无该字段，旧版本产物）时不写、不报错；
+    幂等：重复写入同一 action 不重写。真源尚不存在时不创建（返回 None）。
+    """
+    if not action:
+        return _read_raw(job_dir)
+    st = _read_raw(job_dir)
+    if st is None:
+        return None
+    if st.get("last_recovery_action") == action:
+        return st  # 幂等：同一动作不重写
+    now = now if now is not None else _now()
+    st = dict(st)
+    st["last_recovery_action"] = action
+    st["last_recovery_at"] = _iso(now)
+    return _save_if_changed(job_dir, st)
 
 
 def succeed(job_dir: str, *, now: Optional[float] = None) -> dict[str, Any]:
