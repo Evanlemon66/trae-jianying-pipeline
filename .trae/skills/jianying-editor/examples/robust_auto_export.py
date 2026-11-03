@@ -36,6 +36,18 @@ _init_frozen_env()
 
 import uiautomation as uia
 
+# ========== 1b. 失败分类器（第 3 项，lib/failure_class.py）==========
+# 从仓库 lib 目录导入分类器；导入失败时退化为旧的关键词重试行为，保证脚本独立可用。
+_HERE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_HERE_DIR))))
+_LIB_DIR = os.path.join(_REPO_ROOT, "lib")
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+try:
+    import failure_class as fc  # noqa: E402
+except Exception:  # 分类器不可用时退回旧逻辑
+    fc = None
+
 # ========== 2. 核心辅助类 ==========
 
 def dprint(msg):
@@ -190,7 +202,8 @@ _last_progress_toast = [0.0]
 # 查进度时先看这个 json：status/stage/attempt/flow/errors 就能还原整个任务
 _TASK = {"draft": None, "output": None, "move": False, "attempt": 1, "attempts_max": 1,
          "status": "running", "stage": None, "start_time": None, "expected_duration": None,
-         "real_file": None, "errors": []}
+         "real_file": None, "errors": [],
+         "phase": None, "failure_class": None}
 _FLOW = []
 _PREFLIGHT_DONE = [False]
 
@@ -260,6 +273,8 @@ def _write_progress(output_path, real_export_file, expected_duration, start_time
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "flow": list(_FLOW),
         "errors": list(_TASK.get("errors") or []),
+        "phase": _TASK.get("phase"),
+        "failure_class": _TASK.get("failure_class"),
     }
     if done and final_file:
         try:
@@ -995,9 +1010,38 @@ class Exporter:
         return True
 
 
-# 移植自老脚本 auto_exporter.py（2026-10-25）
+# 移植自老脚本 auto_exporter.py（2026-10-25）——第 3 项后仅作分类器不可用时的兜底
 _UI_RETRY_KEYWORDS = ("剪映窗口未找到", "导出按钮", "编辑窗口", "草稿", "未找到", "卡死", "超时")
 _EST_BYTES_PER_SEC = 1.05 * 1024 * 1024  # 1080P 导出码率经验估值（字节/秒）
+
+
+def _classify_failure(reason):
+    """第 3 项：把错误串 + 当前阶段分类，返回 (类别, 策略 dict)。
+
+    分类器（lib/failure_class.py）不可用时退回旧关键词逻辑（视为可重试 restart）。
+    """
+    phase = _TASK.get("phase")
+    if fc is not None:
+        category, _action = fc.classify(reason, phase)
+        return category, fc.strategy_of(category)
+    ui_fail = any(k in str(reason) for k in _UI_RETRY_KEYWORDS)
+    return ("unknown", {"retryable": ui_fail, "action": "restart", "counts": True})
+
+
+def _do_recovery(action):
+    """按策略动作自愈（第 2 项管理器落地后，restart/kill 统一经管理器执行）。
+
+    dismiss_retry：先关阻挡弹窗再回首页；其余可重试动作：回首页（内部失败自动重启兜底）。
+    """
+    try:
+        if action == "dismiss_retry":
+            try:
+                Exporter().dismiss_blocking_dialogs()
+            except Exception:
+                pass
+        Exporter().switch_to_home()  # 新实例重绑窗口；内部失败自动重启剪映兜底
+    except Exception as e2:
+        dprint(f"⚠️ 自愈回首页失败（仍将继续重试）: {e2}")
 
 
 def _record_export_manifest(draft_name, export_file):
@@ -1340,6 +1384,7 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
 
     # 2. 确保在首页：--cold-start 时先冷启动（每部剧一次，避开"刚导完上一部"的
     #    窗口存在但未就绪状态）；否则按原逻辑切回首页
+    _TASK["phase"] = "cold_start"
     if cold_start:
         _cold_start_jianying(exporter)
         try:
@@ -1362,6 +1407,7 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
 
     # 2. 打开草稿
     _TASK["stage"] = "打开草稿"
+    _TASK["phase"] = "open_draft"
     exporter.open_draft(draft_name)
     _flow("已进入编辑页")
 
@@ -1370,6 +1416,7 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
 
     # 3. 导出（剪映导出到它自己记住的路径，脚本负责定位与校验；
     #    move_output=True 时再把成品+封面搬到 output_path）
+    _TASK["phase"] = "export"
     export_started = time.time()
     try:
         exporter.export(output_path, draft_name,
@@ -1431,12 +1478,18 @@ if __name__ == "__main__":
             sys.exit(0)
         except Exception as e:
             reason = str(e)
-            ui_fail = any(k in reason for k in _UI_RETRY_KEYWORDS)
-            if not ui_fail or attempt >= attempts:
-                _TASK["errors"].append(f"[尝试 {attempt}] {reason}")
+            category, strat = _classify_failure(reason)
+            _TASK["failure_class"] = category
+            retryable = bool(strat.get("retryable"))
+            action = strat.get("action", "restart")
+            if (not retryable) or attempt >= attempts:
+                _TASK["errors"].append(f"[尝试 {attempt}] [{category}] {reason}")
                 _TASK.update(status="failed", stage="失败")
-                _flow(f"任务失败（第 {attempt}/{attempts} 次尝试后停止）：{reason[:160]}")
-                dprint(f"❌ 错误: {reason}")
+                _flow(f"任务失败（{category}，动作={action}，第 {attempt}/{attempts} 次后停止）："
+                      f"{reason[:160]}")
+                dprint(f"❌ 错误[{category}/{action}]: {reason}")
+                if not retryable:
+                    dprint(f"⛔ 类别 {category} 不可重试，直接终止（避免空转）。")
                 dprint("-" * 40)
                 dprint("💡 建议：如果脚本无法定位窗口或草稿，请尝试【手动重启剪映程序】后再运行。")
                 dprint("-" * 40)
@@ -1445,11 +1498,9 @@ if __name__ == "__main__":
                 if sys.stdin.isatty():
                     input("按回车键退出...")
                 sys.exit(1)
-            _TASK["errors"].append(f"[尝试 {attempt}] {reason}")
-            _flow(f"第 {attempt} 次尝试失败：{reason[:160]}，回首页后重试")
-            dprint(f"⚠️ 导出 UI 失败（{reason}），回首页后重试（{attempt}/{attempts - 1}）...")
-            try:
-                Exporter().switch_to_home()  # 新实例重绑窗口；内部失败自动重启剪映兜底
-            except Exception as e2:
-                dprint(f"⚠️ 回首页恢复失败（仍将继续重试）: {e2}")
+            _TASK["errors"].append(f"[尝试 {attempt}] [{category}] {reason}")
+            _flow(f"第 {attempt} 次尝试失败（{category}，动作={action}）：{reason[:160]}，自愈后重试")
+            dprint(f"⚠️ 导出失败[{category}]（{reason}），执行 {action} 后重试"
+                   f"（{attempt}/{attempts - 1}）...")
+            _do_recovery(action)
             time.sleep(5)

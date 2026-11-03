@@ -338,16 +338,31 @@ def succeed(job_dir: str, *, now: Optional[float] = None) -> dict[str, Any]:
 def fail(job_dir: str, error: Optional[str] = None, *,
          pause_after: int = DEFAULT_PAUSE_AFTER,
          failure_class: str = "unknown",
+         retryable: bool = True,
+         phase: Optional[str] = None,
          now: Optional[float] = None) -> dict[str, Any]:
-    """→ retrying（未超阈值，按 1/2/4/8/16/30 分钟退避）或 paused（连续失败超限）。"""
+    """记录一次失败。
+
+    - retryable=True（默认）：→ retrying（未超阈值，按 1/2/4/8/16/30 分钟退避）或
+      paused（连续失败超限），并递增 consecutive_failures。
+    - retryable=False（asset_missing / disk_full 等硬错误）：→ 终态 failed，
+      **不递增** consecutive_failures（不计数），next_retry_at=0，等人工处理。
+    phase/failure_class 写入对应字段，供第 2/3 项追溯。
+    """
     now = now if now is not None else _now()
     st = _read_raw(job_dir) or _default()
     st = dict(st)
-    fails = int(st.get("consecutive_failures") or 0) + 1
-    st["consecutive_failures"] = fails
     st["last_error"] = error
     st["failure_class"] = failure_class
     st["heartbeat_ts"] = now
+    if phase:
+        st["phase"] = phase
+    if not retryable:
+        st["status"] = "failed"
+        st["next_retry_at"] = 0
+        return _save_if_changed(job_dir, st)
+    fails = int(st.get("consecutive_failures") or 0) + 1
+    st["consecutive_failures"] = fails
     if fails >= max(1, pause_after):
         st["status"] = "paused"
         st["next_retry_at"] = 0

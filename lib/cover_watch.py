@@ -55,6 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import job_manifest as jm  # noqa: E402
 import export_lock  # noqa: E402
 import export_state as es  # noqa: E402  # 导出状态机单一真源（.export_state.json）
+import failure_class as fc  # noqa: E402  # 第 3 项：失败分类器 + 自愈策略表
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BATCH_RUNNER = os.path.join(_REPO, "pipeline", "batch_runner.py")
@@ -222,20 +223,36 @@ def retry_gate(job_dir: str, phase_override: Optional[str] = None,
 
 def note_export_result(job_dir: str, name: str, ok: bool, *,
                        pause_after: int = RETRY_PAUSE_AFTER,
-                       error: Optional[str] = None) -> None:
-    """记录导出结果（写真源）：成功置 done 并清零；失败退避/暂停并告警。"""
+                       error: Optional[str] = None,
+                       failure_class: str = "unknown",
+                       retryable: bool = True,
+                       phase: Optional[str] = None) -> None:
+    """记录导出结果（写真源）：成功置 done 并清零；失败按分类走退避/暂停或终态。
+
+    第 3 项：不可重试类（asset_missing/disk_full，retryable=False）直接置终态
+    failed、不计数并 toast，避免空转；可重试类按 1/2/4/8/16/30 分钟退避/暂停。
+    """
     if ok:
         es.succeed(job_dir)
         _log(job_dir, "export ok（真源置 done，计数清零）")
         return
-    st = es.fail(job_dir, error, pause_after=pause_after)
+    st = es.fail(job_dir, error, pause_after=pause_after,
+                 failure_class=failure_class, retryable=retryable, phase=phase)
+    if st.get("status") == "failed":
+        _log(job_dir, f"export 硬失败[{failure_class}]，置终态不重试：{error}")
+        try:
+            toast("⛔ 导出硬失败（不重试）",
+                  f"{name}：{failure_class}，需人工处理\n{error or ''}", icon="error")
+        except Exception:
+            pass
+        return
     fails = int(st.get("consecutive_failures") or 0)
     paused = st.get("status") == "paused"
     if paused:
         _log(job_dir, f"export 失败第 {fails} 次（已暂停该剧）")
     else:
         delay = es.BACKOFF_S[min(fails - 1, len(es.BACKOFF_S) - 1)]
-        _log(job_dir, f"export 失败第 {fails} 次，{delay}s 后重试")
+        _log(job_dir, f"export 失败第 {fails} 次[{failure_class}]，{delay}s 后重试")
     try:
         if paused:
             toast("⛔ 导出连续失败已暂停", f"{name}：连续 {fails} 次失败，需人工排查", icon="error")
@@ -295,6 +312,30 @@ def _progress_info(out_mp4: str) -> tuple[float, Optional[str], Optional[int]]:
     except (OSError, ValueError):
         return mtime, None, None
     return mtime, rec.get("status"), es.parse_percent(rec.get("percent"))
+
+
+def _read_progress_failure(out_mp4: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """从 .progress.json 读回导出子进程写下的 (failure_class, phase, last_error)。
+
+    robust_auto_export 已用同一分类器在失败时落盘 failure_class；这里读回作为权威来源。
+    缺失时返回 (None, None, None)，由调用方退回对 last_error 重新分类。
+    """
+    out_dir = os.path.dirname(os.path.abspath(out_mp4))
+    side = os.path.join(os.path.dirname(out_dir),
+                        os.path.basename(out_dir) + ".progress.json")
+    final = out_mp4 + ".progress.json"
+    cands = [p for p in (final, side) if os.path.isfile(p)]
+    if not cands:
+        return None, None, None
+    p = max(cands, key=os.path.getmtime)
+    try:
+        with open(p, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return None, None, None
+    errs = rec.get("errors") or []
+    last = str(errs[-1]) if errs else None
+    return rec.get("failure_class"), rec.get("phase"), last
 
 
 def _migrate_ctx(job: dict[str, Any]) -> dict[str, Any]:
@@ -587,10 +628,18 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
         export_lock.release()
     _log(job_dir, f"export {'ok' if ok else '失败'}")
     if not ok:
+        # 第 3 项：读回子进程落盘的 failure_class（权威），缺失则对 last_error 重新分类
+        p_class, p_phase, last_err = _read_progress_failure(out_mp4)
+        if not p_class:
+            p_class, _act = fc.classify(last_err, p_phase)
+        strat = fc.strategy_of(p_class)
         note_export_result(job_dir, name, False,
                            pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
-                           error="robust_auto_export 返回非 0")
-        toast("❌ 导出失败", name, icon="error")
+                           error=last_err or "robust_auto_export 返回非 0",
+                           failure_class=p_class,
+                           retryable=bool(strat.get("retryable")),
+                           phase=p_phase)
+        toast("❌ 导出失败", f"{name}（{p_class}）", icon="error")
         return False
     # 质检（与 batch_runner 默认行为一致；--no-verify 关闭）
     es.heartbeat(job_dir, phase="verify")
