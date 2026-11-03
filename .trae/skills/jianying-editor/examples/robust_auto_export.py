@@ -48,10 +48,33 @@ try:
 except Exception:  # 分类器不可用时退回旧逻辑
     fc = None
 
+# ========== 1c. 实例生命周期管理器（第 2 项，同目录 jy_instance.py）==========
+# 四套拉起/回首页逻辑收敛到该管理器；只有它的 kill() 允许 taskkill。
+import jy_instance  # noqa: E402
+
 # ========== 2. 核心辅助类 ==========
 
 def dprint(msg):
     print(f"[*] {msg}")
+
+
+def _get_manager(exporter):
+    """每个 Exporter 绑定一个实例管理器（懒加载）。find_exe 复用 Exporter 的路径定位。"""
+    mgr = getattr(exporter, "_manager", None)
+    if mgr is None:
+        mgr = jy_instance.JyInstance(find_exe=exporter._find_jianying_path, log=dprint)
+        exporter._manager = mgr
+    return mgr
+
+
+def _rebind_from_manager(exporter):
+    """管理器操作后窗口句柄可能已变，从管理器后端重新绑定到 exporter.window。"""
+    try:
+        w = _get_manager(exporter).backend.rebind_window()
+        if w is not None:
+            exporter.window = w
+    except Exception as e:
+        dprint(f"⚠️ 重绑窗口失败: {e}")
 
 
 def _presets_jianying_dir():
@@ -386,46 +409,24 @@ def _poll_with_timeout(fn, timeout):
     return True, result["value"]
 
 
-def _jianying_running():
-    """剪映进程是否还在（冷启动前等旧进程真正退出）。"""
-    try:
-        for p in psutil.process_iter(["name"]):
-            if (p.info.get("name") or "").lower() == "jianyingpro.exe":
-                return True
-    except Exception:
-        pass
-    return False
-
-
 def _cold_start_jianying(exporter, wait_home=90):
-    """冷启动剪映：杀掉旧实例 → 拉起 → 等首页就绪（全程墙钟上限）。
+    """冷启动剪映（第 2 项：薄封装转调实例管理器 restart，唯一 kill 入口）。
 
     每部剧导出前执行，避开"上一部刚导完 / 进程刚拉起"时窗口存在但 UI 未就绪
-    （此时 open_draft 会假死在草稿查找或加载阶段）。
+    （此时 open_draft 会假死在草稿查找或加载阶段）。管理器内部全程墙钟 deadline，
+    杀进程 → 拉起 → 等首页；无法定位安装路径时抛含「冷启动失败」关键词的异常。
     """
-    dprint("冷启动剪映：关闭现有实例...")
-    _flow("冷启动剪映：关闭旧实例并等待首页就绪")
-    jy_path = exporter._find_jianying_path()
-    subprocess.run(["taskkill", "/F", "/IM", "JianyingPro.exe"], capture_output=True)
-    deadline = time.time() + 15
-    while time.time() < deadline and _jianying_running():
-        time.sleep(1)
-    time.sleep(2)
-    if not jy_path:
-        raise Exception("未找到【剪映专业版】窗口且无法定位安装路径，冷启动失败")
-    dprint(f"启动: {jy_path}")
-    subprocess.Popen([jy_path])
-    deadline = time.time() + wait_home
-    while time.time() < deadline:
-        time.sleep(2)
-        try:
-            win = uia.WindowControl(searchDepth=1, SubName="剪映")
-            if win.Exists(1) and "HomePage" in (win.ClassName or ""):
-                dprint("✅ 剪映冷启动完成，已停在首页")
-                return
-        except Exception:
-            pass
-    dprint("⚠️ 冷启动未在限定时间内看到首页，继续尝试打开草稿（open_draft 有墙钟上限）")
+    dprint("冷启动剪映：交由实例管理器（杀进程→拉起→等首页，唯一 kill 入口）...")
+    _flow("冷启动剪映：管理器 restart")
+    try:
+        ok = _get_manager(exporter).restart(wait_home)
+    except jy_instance.JyInstanceError as e:
+        raise Exception(f"冷启动失败：{e}")
+    _rebind_from_manager(exporter)
+    if ok:
+        dprint("✅ 剪映冷启动完成，已停在首页")
+    else:
+        dprint("⚠️ 冷启动未在限定时间内看到首页，继续尝试打开草稿（open_draft 有墙钟上限）")
 
 
 class ControlFinder:
@@ -525,17 +526,16 @@ class Exporter:
                 self.window = export_win
             else:
                 if retry:
-                    dprint("未找到【剪映专业版】，尝试启动程序...")
-                    exe_path = self._find_jianying_path()
-                    if exe_path:
-                        dprint(f"启动: {exe_path}")
-                        subprocess.Popen(exe_path)
-                        # 等待程序启动完成
-                        for _ in range(30):
-                            time.sleep(2)
-                            if uia.WindowControl(searchDepth=1, Name='剪映专业版').Exists(0):
-                                dprint("程序已启动。")
-                                return self.connect(retry=False)
+                    # 第 2 项：启动统一经实例管理器（墙钟 deadline + 探测线程超时）
+                    dprint("未找到【剪映专业版】，交由实例管理器启动...")
+                    try:
+                        ok = _get_manager(self).launch(timeout=60)
+                    except jy_instance.JyInstanceError as e:
+                        raise Exception(f"无法自动启动【剪映专业版】：{e}")
+                    _rebind_from_manager(self)
+                    if ok:
+                        dprint("程序已启动。")
+                        return
                     raise Exception("无法自动启动【剪映专业版】，请手动启动后重试。")
                 else:
                     raise Exception("未找到【剪映专业版】窗口，请确保它已启动。")
@@ -583,40 +583,24 @@ class Exporter:
         return "MainWindow" in self.window.ClassName
 
     def switch_to_home(self):
-        """从编辑页返回首页。
+        """从编辑页返回首页（第 2 项：薄封装转调实例管理器 go_home）。
 
         2026-10-25 实测（剪映 5.9）：编辑页右上角"关闭"按钮（TitleBarButton foundIndex=3）
-        = 退出编辑页回首页——点击后窗口先 GONE、约 1s 内重建为 HomePage，进程保留不杀。
-        优选点关闭；失败（按钮不存在/超时未回首页）则重启剪映兜底。
+        = 退出编辑页回首页，进程保留不杀。管理器先软关（该按钮），失败再重启兜底；
+        全程墙钟 deadline，每次 UIA 探测带独立线程超时。杀进程仅经管理器 kill()。
         """
-        dprint("正在切换回首页...")
+        dprint("正在切换回首页（实例管理器）...")
         if self.is_home_page():
             dprint("已在首页.")
             return
-
-        close_btn = self.window.GroupControl(searchDepth=1, ClassName="TitleBarButton", foundIndex=3)
-        if close_btn.Exists(1):
-            close_btn.Click(simulateMove=False)
-            # 点击后窗口先消失再重建为首页，轮询等重建完成（最多 30s）
-            for _ in range(15):
-                time.sleep(2)
-                try:
-                    w = uia.WindowControl(searchDepth=1, SubName="剪映")
-                    if w.Exists(1) and "HomePage" in (w.ClassName or ""):
-                        self.connect()
-                        if self.is_home_page():
-                            dprint("✅ 已关闭编辑页回到首页")
-                            return
-                except Exception:
-                    pass
-            dprint("⚠️ 关闭编辑页后 30s 未回首页，转重启兜底...")
-        else:
-            dprint("⚠️ 未找到关闭按钮，转重启兜底...")
-
-        _restart_jianying_to_home(self)
-        self.connect()  # 重启后窗口句柄已变，必须重新绑定
-        if not self.is_home_page():
+        try:
+            ok = _get_manager(self).go_home(timeout=60, allow_restart=True)
+        except jy_instance.JyInstanceError as e:
+            raise Exception(f"重启后仍未回到首页：{e}")
+        _rebind_from_manager(self)
+        if not ok or not self.is_home_page():
             raise Exception("重启后仍未回到首页，请手动检查剪映状态。")
+        dprint("✅ 已回到首页")
 
     def open_draft(self, draft_name):
         """在首页查找并打开草稿"""
@@ -1230,25 +1214,21 @@ def _salvage_existing_output(draft_name, output_path, expected_duration, min_mti
 
 
 def _restart_jianying_to_home(exporter):
-    """导出成功后重启剪映回首页（兜底手段，优选是 switch_to_home 点关闭按钮）。
+    """导出成功后重启剪映回首页（第 2 项：薄封装转调管理器 restart，唯一 kill 入口）。
 
     仅在关闭按钮失效时使用：导出已完成落盘或导出任务未开始，杀进程安全。
     """
-    dprint("重启剪映以回到首页...")
-    jy_path = exporter._find_jianying_path()
-    subprocess.run(["taskkill", "/F", "/IM", "JianyingPro.exe"], capture_output=True)
-    time.sleep(2)
-    subprocess.Popen([jy_path])
-    for _ in range(30):  # 最多等 60s 首页出现
-        time.sleep(2)
-        try:
-            win = uia.WindowControl(searchDepth=1, SubName="剪映")
-            if win.Exists(1) and "HomePage" in (win.ClassName or ""):
-                dprint("✅ 剪映已重启并回到首页")
-                return
-        except Exception:
-            pass
-    dprint("⚠️ 剪映已重启，但未检测到首页（可能仍在启动中，不影响导出结果）")
+    dprint("重启剪映以回到首页（实例管理器）...")
+    try:
+        ok = _get_manager(exporter).restart(90)
+    except jy_instance.JyInstanceError as e:
+        dprint(f"⚠️ 重启失败（不影响导出结果）: {e}")
+        return
+    _rebind_from_manager(exporter)
+    if ok:
+        dprint("✅ 剪映已重启并回到首页")
+    else:
+        dprint("⚠️ 剪映已重启，但未检测到首页（可能仍在启动中，不影响导出结果）")
 
 
 def _find_draft_dir(draft_name):
