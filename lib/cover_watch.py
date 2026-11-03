@@ -366,8 +366,10 @@ def _migrate_ctx(job: dict[str, Any]) -> dict[str, Any]:
 
 
 # 裁剪分歧去重：落盘到 cover_job/.cut_conflict.json（原子写），跨进程有效。
-# 语义：冲突 (workflow.cut_s, export_config.cut_s) 相比上次通知「发生变化」才再次通知；
-# 同一对值重复出现不再弹（进程重启也不重复），值变了才弹。
+# 两个独立通道，各自按「值变化才再做一次」去重：
+#   logged   —— 已写进 watcher.log（真实执行轮次：持续 watcher 与 --once）
+#   notified —— 已弹过桌面通知（仅持续 watcher 真实轮次）
+# 分开记：--once 记日志不吞掉首轮桌面通知，持久 watcher 也不会每轮刷日志。
 CUT_CONFLICT_NAME = ".cut_conflict.json"
 
 
@@ -380,16 +382,16 @@ def _read_cut_conflict(job_dir: str) -> dict[str, Any]:
         return {}
 
 
-def _cut_conflict_changed(job_dir: str, wf_cut: float, ec_cut: float) -> bool:
-    st = _read_cut_conflict(job_dir)
-    if not st.get("notified"):
+def _cut_conflict_changed(job_dir: str, kind: str, wf_cut: float, ec_cut: float) -> bool:
+    prev = _read_cut_conflict(job_dir).get(kind)
+    if not isinstance(prev, dict) or not prev.get("done"):
         return True
-    return not (st.get("wf_cut") == wf_cut and st.get("ec_cut") == ec_cut)
+    return not (prev.get("wf_cut") == wf_cut and prev.get("ec_cut") == ec_cut)
 
 
-def _record_cut_conflict(job_dir: str, wf_cut: float, ec_cut: float) -> None:
-    data = {"wf_cut": wf_cut, "ec_cut": ec_cut, "notified": True,
-            "notified_at": jm.now_iso()}
+def _record_cut_conflict(job_dir: str, kind: str, wf_cut: float, ec_cut: float) -> None:
+    data = _read_cut_conflict(job_dir)
+    data[kind] = {"wf_cut": wf_cut, "ec_cut": ec_cut, "done": True, "at": jm.now_iso()}
     path = os.path.join(job_dir, CUT_CONFLICT_NAME)
     tmp = path + ".tmp"
     try:
@@ -405,14 +407,15 @@ def _record_cut_conflict(job_dir: str, wf_cut: float, ec_cut: float) -> None:
 
 
 def _effective_cut(wf: dict[str, Any], job: dict[str, Any], job_dir: str,
-                   notify: bool = True) -> Optional[float]:
+                   notify: bool = True, write_log: bool = True) -> Optional[float]:
     """cut 解析（以 intent_revision 分界）：
 
     - rev==0（未经人工确认）：export_config.json（更新的人工动作）> workflow.cut_s（dispatch 归并）> video.cut_s
     - rev>0（人工已确认）：workflow.cut_s 最高 > export_config > video.cut_s
-    workflow 与 export_config 分歧时禁止静默忽略：
-      - 预览/只读路径（notify=False：plan/--dry-run/--hold/--once）只打印，不弹 toast、不落日志；
-      - 真实 watcher 轮次（notify=True）且冲突相比上次通知有变化时：写 watcher.log + 桌面通知 + 落盘去重。
+    workflow 与 export_config 分歧时禁止静默忽略，按路径分三档：
+      - 预览/只读（notify=False, write_log=False：plan/--dry-run/--hold）只打印，不弹通知、不落日志；
+      - --once 真实执行（notify=False, write_log=True）：写 watcher.log（同值不重复刷），不弹通知；
+      - 持续 watcher 真实轮次（notify=True, write_log=True）：日志 + 桌面通知，各自「值变化才再做」。
     export_config 必须在 edit 阶段就被消费（裁剪是构建草稿时生效的）。
     """
     def _pos(v: Any) -> Optional[float]:
@@ -438,17 +441,25 @@ def _effective_cut(wf: dict[str, Any], job: dict[str, Any], job_dir: str,
         branch = "rev>0：workflow 优先" if rev > 0 else "rev=0：export_config 优先"
         msg = (f"cut 分歧: {name} workflow.cut_s={wf_cut} vs export_config.cut_s={ec_cut}"
                f" → 采用 {cut}（{branch}）")
-        if notify and _cut_conflict_changed(job_dir, wf_cut, ec_cut):
-            # 真实轮次且冲突有变化：落 watcher.log + 桌面通知 + 持久化去重
+        changed_log = _cut_conflict_changed(job_dir, "logged", wf_cut, ec_cut)
+        changed_notify = _cut_conflict_changed(job_dir, "notified", wf_cut, ec_cut)
+        did_log = False
+        did_notify = False
+        if write_log and changed_log:
+            # 真实执行轮次：落 watcher.log；同一对值不重复刷
             _log(job_dir, "⚠️ " + msg)
-            _record_cut_conflict(job_dir, wf_cut, ec_cut)
+            _record_cut_conflict(job_dir, "logged", wf_cut, ec_cut)
+            did_log = True
+        if notify and changed_notify:
+            _record_cut_conflict(job_dir, "notified", wf_cut, ec_cut)
             try:
                 toast("⚠️ 裁剪意图分歧",
                       f"{name}：workflow={wf_cut} export_config={ec_cut} → 采用 {cut}（{branch}）")
             except Exception:
                 pass
-        else:
-            # 预览/只读路径，或与上次通知相同：只打印，不弹 toast、不落日志
+            did_notify = True
+        if not (did_log or did_notify):
+            # 预览/只读路径，或与上次记录相同：只打印
             print("  ⚠️ " + msg)
     return cut
 
@@ -470,10 +481,11 @@ def _effective_derive(wf: dict[str, Any], cfg: dict[str, Any],
 
 def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
                pending_edit: int, phase_override: Optional[str] = None,
-               notify: bool = True) -> dict[str, Any]:
+               notify: bool = True, write_log: bool = True) -> dict[str, Any]:
     """推导单个剧的计划：{action: edit|export|blocked, reason, draft, intent...}
 
-    notify=False 为预览/只读路径（plan/--dry-run/--hold/--once）：cut 分歧只打印不弹通知。
+    notify/write_log 透传给 _effective_cut：预览传 (False, False)；
+    --once 真实执行传 (False, True)；持续 watcher 传 (True, True)。
     """
     series_dir = os.path.dirname(job_dir)
     name = os.path.basename(series_dir.rstrip("\\/"))
@@ -485,7 +497,7 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
     plan: dict[str, Any] = {"job_dir": job_dir, "name": name, "draft": draft,
                             "intent": wf, "policy": policy,
                             "action": "blocked", "reason": "", "cmd": ""}
-    cut = _effective_cut(wf, job, job_dir, notify=notify)
+    cut = _effective_cut(wf, job, job_dir, notify=notify, write_log=write_log)
 
     def _edit_cmd() -> list[str]:
         cmd = [sys.executable, _BATCH_RUNNER, series_dir, "--force", "--no-export"]
@@ -887,12 +899,12 @@ def _collect_jobs(args: argparse.Namespace, cfg: dict[str, Any]) -> tuple[list[s
 def _eval_round(args: argparse.Namespace, cfg: dict[str, Any],
                 jobs: list[str], done: set[str],
                 intent_states: dict[str, dict[str, Any]],
-                notify: bool = True) -> list[dict[str, Any]]:
+                notify: bool = True, write_log: bool = True) -> list[dict[str, Any]]:
     """一轮评估：意图同步 + 触发判定 + 计划推导。返回候选计划列表（未执行）。
 
     两遍推导：第一遍数出待剪辑队列（pending_edit），第二遍用它套策略门槛，
     保证 after_edit_queue_drained 基于本轮全局编辑队列生效。
-    notify 透传给 build_plan/_effective_cut：预览/只读路径传 False（cut 分歧不弹通知）。
+    notify/write_log 透传给 build_plan/_effective_cut（见 _round_flags 的三档语义）。
     """
     qualified: list[str] = []
     for job_dir in jobs:
@@ -935,7 +947,7 @@ def _eval_round(args: argparse.Namespace, cfg: dict[str, Any],
                 pass  # dispatch 非法：按现有 workflow 出计划，ingest 时会告警
         plans.append(build_plan(j, job, cfg, pending_edit=pending_edit,
                                 phase_override=getattr(args, "phase", None),
-                                notify=notify))
+                                notify=notify, write_log=write_log))
     return plans
 
 
@@ -948,6 +960,17 @@ def _pick(candidates: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
                                    -int(p["intent"].get("priority") or 0),
                                    p["job_dir"].lower()))
     return actionable[0]
+
+
+def _round_flags(args: argparse.Namespace, hold_on: bool) -> tuple[bool, bool]:
+    """本轮 (notify, write_log) 三档语义：
+      预览（--dry-run / --hold / 配置 hold:true）：(False, False) 只打印；
+      --once 真实执行：(False, True) 记日志、不弹通知；
+      持续 watcher 真实轮次：(True, True) 日志 + 通知。
+    """
+    if getattr(args, "dry_run", False) or hold_on:
+        return False, False
+    return (not getattr(args, "once", False)), True
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -965,7 +988,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     args.verbose = False
     args.once = True
     args.phase = getattr(args, "phase", None)
-    candidates = _eval_round(args, cfg, jobs, set(), states, notify=False)
+    candidates = _eval_round(args, cfg, jobs, set(), states, notify=False, write_log=False)
     cand_by_dir = {p["job_dir"]: p for p in candidates}
     for job_dir in jobs:
         name = os.path.basename(os.path.dirname(job_dir).rstrip("\\/"))
@@ -1025,9 +1048,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
             print(f"[new] 自动发现任务: {j}")
             known.add(j.lower())
 
-        # 仅「持续 watcher 真实轮次」允许弹通知；plan/--dry-run/--hold/--once 一律只打印
-        notify = not (args.once or args.dry_run or hold_on)
-        candidates = _eval_round(args, cfg, jobs, done, intent_states, notify=notify)
+        # 仅「持续 watcher 真实轮次」弹通知；--once 真实执行记日志不弹；预览两者都不做
+        notify, write_log = _round_flags(args, hold_on)
+        candidates = _eval_round(args, cfg, jobs, done, intent_states,
+                                 notify=notify, write_log=write_log)
         if hold_on or args.dry_run:
             # 只列计划不执行：全部候选（含被挡原因）
             for p in candidates:

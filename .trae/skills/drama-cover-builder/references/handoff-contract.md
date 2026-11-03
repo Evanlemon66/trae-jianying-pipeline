@@ -380,9 +380,9 @@ python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先补算豆�
 ### 7.2 裁剪分歧通知（`workflow.cut_s` vs `export_config.cut_s`）
 
 - **触发条件**：`workflow.cut_s` 与 `export_config.cut_s` 均非空且不等（`_effective_cut`）。
-- **预览/只读路径不弹通知**：`plan`、`--dry-run`、`--hold`、`--once` 一律只打印，不弹桌面通知、不落日志；只有**持续 watcher 的真实轮次**才可能弹。
-- **日志落点**：真实轮次触发时写该剧 `cover_job/watcher.log`，内容含剧名、两来源值、最终采用值、优先级分支（rev=0 / rev>0）。
-- **去重持久化**：已通知状态落盘在 `cover_job/.cut_conflict.json`（原子写，记 `wf_cut`/`ec_cut`/`notified_at`）。语义为「**冲突状态相比上次通知发生变化才再次通知**」——同一对值重复出现（含进程重启）不再弹，任一值变了才再弹。
+- **三档语义**（`_round_flags`）：预览/只读（`plan`、`--dry-run`、`--hold`）**只打印**，不弹通知、不落日志；`--once` 真实执行**只落日志、不弹通知**；持续 watcher 真实轮次**落日志 + 弹通知**。
+- **日志落点**：真实执行轮次（持续 watcher 与 `--once`）触发时写该剧 `cover_job/watcher.log`，内容含剧名、两来源值、最终采用值、优先级分支（rev=0 / rev>0）；同一对值不重复刷日志。
+- **去重持久化**：落盘在 `cover_job/.cut_conflict.json`（原子写），分 `logged` 与 `notified` 两个独立通道，各记 `wf_cut`/`ec_cut`/`at`。语义为「**值相比上次做过该动作发生变化才再做一次**」：同一对值重复出现（含进程重启）不重复写日志、不重复弹通知；任一值变了才各自再触发。分通道是为了让 `--once` 记日志不吞掉连续 watcher 的首轮通知。
 - 该文件仅是通知去重态，不是导出状态真源（真源仍为 `.export_state.json`，见 §7.1）。
 
 ## 8. 各阶段产物与意义
