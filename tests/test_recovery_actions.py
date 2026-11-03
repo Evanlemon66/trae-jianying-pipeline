@@ -26,13 +26,25 @@ def check(name, cond, extra=""):
         fails.append(name)
 
 
+class _FakeBackend:
+    def rebind_window(self):
+        return None
+
+
 class FakeMgr:
-    def __init__(self):
+    def __init__(self, ready=True):
+        self.backend = _FakeBackend()
         self.restart_calls = 0
+        self.go_home_calls = 0
+        self.ready = ready
 
     def restart(self, timeout=90):
         self.restart_calls += 1
         return True
+
+    def go_home(self, timeout=60, allow_restart=True):
+        self.go_home_calls += 1
+        return self.ready
 
 
 class FakeExporter:
@@ -68,14 +80,27 @@ check("返回 soft_home", ret == "soft_home", ret)
 check("走了软关 switch_to_home", fe2.switch_calls == 1, fe2.switch_calls)
 check("未走管理器 kill", fm2.restart_calls == 0, fm2.restart_calls)
 
-print("\n== dismiss_retry（version_dialog）→ 先关弹窗再软关 ==")
-fm3, fe3 = FakeMgr(), FakeExporter()
+print("\n== dismiss_retry：弹窗关掉且就绪 → 只软回（dismiss）==")
+fm3, fe3 = FakeMgr(ready=True), FakeExporter()
 rae._get_manager = lambda ex: fm3
 ret = rae._do_recovery("dismiss_retry", exporter=fe3)
 check("返回 dismiss", ret == "dismiss", ret)
 check("关了弹窗", fe3.dismiss_calls == 1, fe3.dismiss_calls)
-check("随后也走了软关", fe3.switch_calls == 1, fe3.switch_calls)
-check("未走管理器 kill", fm3.restart_calls == 0, fm3.restart_calls)
+check("做了就绪判断 go_home", fm3.go_home_calls == 1, fm3.go_home_calls)
+check("就绪则不强杀（restart=0）", fm3.restart_calls == 0, fm3.restart_calls)
+check("不走 switch_to_home", fe3.switch_calls == 0, fe3.switch_calls)
+check("_TASK.recovery_action=dismiss", rae._TASK["recovery_action"] == "dismiss")
+
+print("\n== dismiss_retry：弹窗关掉但仍未就绪 → 当轮升级强杀（dismiss_then_kill）==")
+fm3b, fe3b = FakeMgr(ready=False), FakeExporter()
+rae._get_manager = lambda ex: fm3b
+ret = rae._do_recovery("dismiss_retry", exporter=fe3b)
+check("返回 dismiss_then_kill", ret == "dismiss_then_kill", ret)
+check("关了弹窗", fe3b.dismiss_calls == 1, fe3b.dismiss_calls)
+check("就绪判断未就绪", fm3b.go_home_calls == 1, fm3b.go_home_calls)
+check("当轮升级强杀（restart=1）", fm3b.restart_calls == 1, fm3b.restart_calls)
+check("_TASK.recovery_action=dismiss_then_kill",
+      rae._TASK["recovery_action"] == "dismiss_then_kill")
 
 print("\n== 分类 → 动作 → 执行分支 端到端 ==")
 c, a = fc.classify("导出卡死：产物 180s 无增长（12.0MB）")

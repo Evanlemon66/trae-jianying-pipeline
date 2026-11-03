@@ -1014,12 +1014,15 @@ def _classify_failure(reason):
 
 
 def _do_recovery(action, exporter=None):
-    """按策略动作自愈，返回实际执行的动作（soft_home / kill_restart / dismiss）。
+    """按策略动作自愈，返回实际执行的动作。
 
+    返回值：soft_home / kill_restart / dismiss / dismiss_then_kill / none。
     - kill_retry（export_timeout）：**强制经管理器 kill → launch → wait_ready(home)**，
       不走软关按钮路径；仅在确已判定 export_timeout 且需重试时才杀进程。
     - restart / unknown：软关优先（switch_to_home，只在关闭按钮失败时才重启兜底）。
-    - dismiss_retry：先关阻挡弹窗，再按 restart（软关优先）路径走。
+    - dismiss_retry（version_dialog）：先关阻挡弹窗，再做就绪判断（墙钟上限 40s，
+      软关优先、不重启）；到期仍未就绪则**当轮直接升级为强杀重启**，记
+      dismiss_then_kill，不拖到下一轮。
 
     杀进程只经 jy_instance.kill()（管理器），本函数不直接 taskkill。
     实际动作写入 _TASK["recovery_action"] → progress sidecar + 日志行，供追溯/统计。
@@ -1035,17 +1038,29 @@ def _do_recovery(action, exporter=None):
         if action == "kill_retry":
             dprint("自愈动作：kill_restart（强制杀进程 → 拉起 → 等首页）")
             _get_manager(exporter).restart(90)
+            _rebind_from_manager(exporter)
             executed = "kill_restart"
+        elif action == "dismiss_retry":
+            dprint("自愈动作：dismiss（先关阻挡弹窗，再做就绪判断）")
+            try:
+                exporter.dismiss_blocking_dialogs()
+            except Exception:
+                pass
+            mgr = _get_manager(exporter)
+            # 就绪判断：墙钟上限，软关优先且不重启；到期未就绪则当轮升级强杀
+            ready = mgr.go_home(timeout=40, allow_restart=False)
+            if ready:
+                _rebind_from_manager(exporter)
+                executed = "dismiss"
+            else:
+                dprint("⚠️ 关闭弹窗后仍未就绪，当轮升级强杀重启（dismiss_then_kill）")
+                mgr.restart(90)
+                _rebind_from_manager(exporter)
+                executed = "dismiss_then_kill"
         else:
-            if action == "dismiss_retry":
-                dprint("自愈动作：dismiss（先关闭阻挡弹窗）")
-                try:
-                    exporter.dismiss_blocking_dialogs()
-                    executed = "dismiss"
-                except Exception:
-                    pass
-            # restart / dismiss_retry / unknown：软关优先，失败才重启兜底
+            # restart / unknown：软关优先，失败才重启兜底
             exporter.switch_to_home()
+            executed = "soft_home"
     except Exception as e2:
         dprint(f"⚠️ 自愈恢复失败（仍将继续重试）: {e2}")
     _TASK["recovery_action"] = executed
