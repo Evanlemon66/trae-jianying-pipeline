@@ -29,7 +29,11 @@
 配套文件：
   <repo>/pipeline/presets.json  watch 段（每轮热加载）：
       {"roots":[...], "jobs":[], "exclude":[], "settle":30, "interval":5,
-       "export_policy":"immediate", "hold":false, "derive":[]}
+       "export_policy":"immediate", "hold":false, "derive":[],
+       "cold_start":true, "export_stall_timeout":1800, "retry_pause_after":5}
+      cold_start：每部剧导出前冷启动剪映（默认 true；手动用剪映时建议设 false）
+      export_stall_timeout：导出无进展判定卡死的秒数（进度 json 每 30s 刷新一次）
+      retry_pause_after：连续失败多少次后暂停该剧（默认 5，退避 1/2/4/8/16/30 分钟）
   <cover_job>/dispatch.json     豆包侧意图声明（ingest 归并进 job.json.workflow）
   <cover_job>/export_config.json 旧版一句话偏好（仍兼容：cut_s/derive）
 """
@@ -186,6 +190,67 @@ def _log(job_dir: str, msg: str) -> None:
         pass
 
 
+# ── 导出失败退避 / 暂停 ──────────────────────────────────────────
+
+RETRY_NAME = ".export_retry.json"
+_BACKOFF_S = (60, 120, 240, 480, 960, 1800)  # 1 / 2 / 4 / 8 / 16 / 30 分钟
+RETRY_PAUSE_AFTER = 5
+
+
+def read_retry(job_dir: str) -> dict[str, Any]:
+    try:
+        with open(os.path.join(job_dir, RETRY_NAME), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_retry(job_dir: str, data: dict[str, Any]) -> None:
+    try:
+        with open(os.path.join(job_dir, RETRY_NAME), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def retry_gate(job_dir: str, phase_override: Optional[str] = None) -> Optional[str]:
+    """导出闸门：返回等待/暂停原因；None 表示可导。--phase export 为人工强制放行。"""
+    if phase_override == "export":
+        return None
+    st = read_retry(job_dir)
+    if st.get("paused"):
+        return (f"连续 {st.get('fails')} 次导出失败已暂停（人工排查后删除 "
+                f"{RETRY_NAME} 或 --phase export 强制放行）")
+    nxt = float(st.get("next_ts") or 0)
+    if nxt > time.time():
+        return f"导出失败退避中（{int(nxt - time.time())}s 后重试，已失败 {st.get('fails')} 次）"
+    return None
+
+
+def note_export_result(job_dir: str, name: str, ok: bool, *,
+                       pause_after: int = RETRY_PAUSE_AFTER) -> None:
+    """记录导出结果：成功清零；失败按 1/2/4/8/16/30 分钟退避，连续超限则暂停该剧并告警。"""
+    if ok:
+        if read_retry(job_dir):
+            _write_retry(job_dir, {"fails": 0, "next_ts": 0, "paused": False})
+        return
+    fails = int(read_retry(job_dir).get("fails") or 0) + 1
+    delay = _BACKOFF_S[min(fails - 1, len(_BACKOFF_S) - 1)]
+    paused = fails >= max(1, pause_after)
+    _write_retry(job_dir, {"fails": fails, "paused": paused,
+                           "next_ts": 0 if paused else time.time() + delay,
+                           "last_fail_at": jm.now_iso()})
+    _log(job_dir, f"export 失败第 {fails} 次" + ("（已暂停该剧）" if paused else f"，{delay}s 后重试"))
+    try:
+        if paused:
+            toast("⛔ 导出连续失败已暂停", f"{name}：连续 {fails} 次失败，需人工排查", icon="error")
+        else:
+            toast("⚠️ 导出失败，将退避重试", f"{name}：第 {fails} 次失败，{delay}s 后重试",
+                  icon="warning")
+    except Exception:
+        pass
+
+
 # ── 意图与计划推导 ──────────────────────────────────────────────
 
 def _draft_root() -> str:
@@ -290,9 +355,12 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
 
     def _export_cmd() -> list[str]:
         dn = os.path.basename(draft.rstrip("\\/"))
-        return [sys.executable, os.path.join(_REPO, ".trae", "skills", "jianying-editor",
-                                             "examples", "robust_auto_export.py"),
-                dn, pc.export_mp4_path(dn), "--move", "--fallback-dir", pc.get_export_dir()]
+        cmd = [sys.executable, os.path.join(_REPO, ".trae", "skills", "jianying-editor",
+                                            "examples", "robust_auto_export.py"),
+               dn, pc.export_mp4_path(dn), "--move", "--fallback-dir", pc.get_export_dir()]
+        if cfg.get("cold_start", True):
+            cmd.append("--cold-start")
+        return cmd
 
     if phase_override == "edit":
         plan.update(action="edit", reason="--phase edit 强制", cmd=_edit_cmd())
@@ -315,6 +383,10 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
         return plan
     if policy == "after_edit_queue_drained" and pending_edit > 0:
         plan.update(reason=f"export_policy=after_edit_queue_drained：还有 {pending_edit} 部待剪辑")
+        return plan
+    gate = retry_gate(job_dir, phase_override)
+    if gate:
+        plan.update(reason=gate)
         return plan
     plan.update(action="export", reason=f"草稿就绪 + mode=full + policy={policy}",
                 cmd=_export_cmd())
@@ -467,10 +539,14 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
         return False
     _write_lock(job_dir, "export")
     try:
-        ok = sr._run_export(draft_name, timeout=1800)
+        ok = sr._run_export(draft_name,
+                            timeout=float(cfg.get("export_stall_timeout", 1800)),
+                            cold_start=bool(cfg.get("cold_start", True)))
     finally:
         export_lock.release()
     _log(job_dir, f"export {'ok' if ok else '失败'}")
+    note_export_result(job_dir, name, ok,
+                       pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)))
     if not ok:
         toast("❌ 导出失败", name, icon="error")
         return False

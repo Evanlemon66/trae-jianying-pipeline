@@ -8,6 +8,9 @@
     "watch.derive: 全局派生平台列表，默认 []（不派生）；剧级声明优先走 cover_job/dispatch.json（ingest 归并进 job.json.workflow）。旧配置 true=全平台/false=不派生仍兼容。",
     "watch.export_policy: immediate（默认，剪完即导）/ after_edit_queue_drained（全部剧剪辑完成后才按序导出）/ manual（等 --phase export 放行）。",
     "watch.hold: true 时 watcher 只列计划不执行（等价命令行 --hold），供先核对 job.json 意图再放行。",
+    "watch.cold_start: 每部剧导出前冷启动剪映（杀进程→拉起→等首页，默认 true）。连续导出时上一部刚导完、剪映 UI 未就绪会让首试假死；手动同时用剪映时设为 false。",
+    "watch.export_stall_timeout: 导出「无进展」判定卡死的秒数（默认 1800）。进度 json 每 30s 刷新一次，导出慢但仍在写盘不会被误杀。",
+    "watch.retry_pause_after: 连续导出失败多少次后暂停该剧（默认 5），退避间隔 1/2/4/8/16/30 分钟；恢复办法：删除 cover_job/.export_retry.json 或 --phase export 强制放行。",
     "presets: 剪映「我的预设」里的组合预设名，必须与预设库完全一致（可用 pipeline.py --list-presets 查看）。",
     "alpha 为可选的滤镜透明度（0~1），仅对滤镜类预设生效，普通贴纸/logo 预设不用填。",
     "不配 presets 字段时，预设库中 pipeline_ 开头的预设会被自动启用。",
@@ -26,7 +29,10 @@
     "interval": 5,
     "derive": [],
     "export_policy": "immediate",
-    "hold": false
+    "hold": false,
+    "cold_start": true,
+    "export_stall_timeout": 1800,
+    "retry_pause_after": 5
   },
   "presets": [
     { "name": "我的logo" },

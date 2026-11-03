@@ -189,8 +189,26 @@ def _consolidate_bundle(draft_name: str, out_mp4: str) -> None:
         print(f"  🧹 清理残留目录: {p}")
 
 
-def _run_export(draft_name: str, timeout: float) -> bool:
-    """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。"""
+def _progress_mtime(out_mp4: str) -> float:
+    """导出进度文件 mtime（心跳）：运行中在剧名目录同级，完成后在 mp4 旁。"""
+    out_dir = os.path.dirname(os.path.abspath(out_mp4))
+    side = os.path.join(os.path.dirname(out_dir), os.path.basename(out_dir) + ".progress.json")
+    ts = 0.0
+    for p in (side, out_mp4 + ".progress.json"):
+        try:
+            ts = max(ts, os.path.getmtime(p))
+        except OSError:
+            pass
+    return ts
+
+
+def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = False) -> bool:
+    """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。
+
+    timeout 按「无进展」计：进度 json 每 30s 刷新一次，超过 timeout 秒没有任何刷新
+    才判定卡死并杀进程（导出慢但一直在写盘不会被误杀）。
+    cold_start: 导出前冷启动剪映（每部剧一次，规避上一部刚导完时的 UI 假死）。
+    """
     out_mp4 = export_mp4_path(draft_name)
     out_dir = os.path.dirname(out_mp4)
     # 只建父目录：剧名目录留给剪映自己创建，否则剪映会把成品写进「剧名(1)」
@@ -198,7 +216,22 @@ def _run_export(draft_name: str, timeout: float) -> bool:
     _preclean_bundles(draft_name, out_dir)
     cmd = [sys.executable, "-u", AUTO_EXPORTER, draft_name, out_mp4, "--move",
            "--fallback-dir", get_export_dir()]
-    proc = subprocess.run(cmd, cwd=_ROOT)
+    if cold_start:
+        cmd.append("--cold-start")
+
+    proc = subprocess.Popen(cmd, cwd=_ROOT)
+    last_beat = time.time()
+    while proc.poll() is None:
+        time.sleep(5)
+        beat = _progress_mtime(out_mp4)
+        if beat:
+            last_beat = max(last_beat, beat)
+        if time.time() - last_beat > timeout:
+            print(f"  ⏱️ 导出 {timeout:.0f}s 无任何进展，判定卡死并终止子进程")
+            proc.kill()
+            proc.wait()
+            break
+
     if proc.returncode == 0:
         _consolidate_bundle(draft_name, out_mp4)
     else:

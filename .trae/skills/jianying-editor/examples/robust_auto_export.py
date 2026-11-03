@@ -8,6 +8,7 @@ import shutil
 import argparse
 import traceback
 import ctypes
+import threading
 import psutil
 import subprocess
 import winreg
@@ -348,6 +349,70 @@ def _find_export_in_dir(search_dir, safe_name, min_mtime=None):
     return newest
 
 
+def _poll_with_timeout(fn, timeout):
+    """在 daemon 线程里执行一次 UI 探测，超时判定为失败。
+
+    剪映假死时 UIA 调用会无限阻塞（实测：名义 60s 的等待循环实挂 41 分钟），
+    所以每次探测必须有独立的墙钟上限；daemon 线程不阻塞进程退出。
+    """
+    result = {}
+
+    def _runner():
+        try:
+            result["value"] = fn()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive() or "value" not in result:
+        return False, None
+    return True, result["value"]
+
+
+def _jianying_running():
+    """剪映进程是否还在（冷启动前等旧进程真正退出）。"""
+    try:
+        for p in psutil.process_iter(["name"]):
+            if (p.info.get("name") or "").lower() == "jianyingpro.exe":
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _cold_start_jianying(exporter, wait_home=90):
+    """冷启动剪映：杀掉旧实例 → 拉起 → 等首页就绪（全程墙钟上限）。
+
+    每部剧导出前执行，避开"上一部刚导完 / 进程刚拉起"时窗口存在但 UI 未就绪
+    （此时 open_draft 会假死在草稿查找或加载阶段）。
+    """
+    dprint("冷启动剪映：关闭现有实例...")
+    _flow("冷启动剪映：关闭旧实例并等待首页就绪")
+    jy_path = exporter._find_jianying_path()
+    subprocess.run(["taskkill", "/F", "/IM", "JianyingPro.exe"], capture_output=True)
+    deadline = time.time() + 15
+    while time.time() < deadline and _jianying_running():
+        time.sleep(1)
+    time.sleep(2)
+    if not jy_path:
+        raise Exception("未找到【剪映专业版】窗口且无法定位安装路径，冷启动失败")
+    dprint(f"启动: {jy_path}")
+    subprocess.Popen([jy_path])
+    deadline = time.time() + wait_home
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            win = uia.WindowControl(searchDepth=1, SubName="剪映")
+            if win.Exists(1) and "HomePage" in (win.ClassName or ""):
+                dprint("✅ 剪映冷启动完成，已停在首页")
+                return
+        except Exception:
+            pass
+    dprint("⚠️ 冷启动未在限定时间内看到首页，继续尝试打开草稿（open_draft 有墙钟上限）")
+
+
 class ControlFinder:
     """控件查找逻辑 (移植自 pyJianYingDraft)"""
     
@@ -550,40 +615,47 @@ class Exporter:
         # 使用 Description 查找草稿标题
         target_desc = f"HomePageDraftTitle:{draft_name}"
         
-        # 2. 增强查找循环
+        # 2. 增强查找循环（墙钟 40s 上限；每次 UIA 探测另有独立超时）
         draft_card = None
         dprint("开始进入草稿查找轮询...")
-        for attempt in range(12): # 延长到 24 秒等待首页渲染
+
+        def _find_card():
             # 策略 A: 精确 Description 匹配
             draft_text = self.window.TextControl(searchDepth=6, Compare=ControlFinder.desc_matcher(target_desc, exact=True))
             if draft_text.Exists(0):
-                draft_card = draft_text.GetParentControl()
-                dprint(f"✅ 匹配成功 (Desc): {draft_name}")
-                break
-            
-            # 策略 B: Name 模糊匹配
+                return draft_text.GetParentControl(), "Desc"
+            # 策略 B: Name 精确匹配
             draft_text = self.window.TextControl(searchDepth=6, Name=draft_name)
             if draft_text.Exists(0):
-                draft_card = draft_text.GetParentControl()
-                dprint(f"✅ 匹配成功 (Name): {draft_name}")
-                break
-                
+                return draft_text.GetParentControl(), "Name"
+
             # 策略 C: 部分匹配 (包含)
             def partial_matcher(control, depth):
                 try: return draft_name in control.Name
                 except: return False
-            
+
             draft_text = self.window.TextControl(searchDepth=6, Compare=partial_matcher)
             if draft_text.Exists(0):
-                draft_card = draft_text.GetParentControl()
-                dprint(f"✅ 匹配成功 (模糊): {draft_text.Name}")
+                return draft_text.GetParentControl(), f"模糊:{draft_text.Name}"
+            return None, ""
+
+        find_start = time.time()
+        attempt = 0
+        while time.time() - find_start < 40:
+            attempt += 1
+            ok, found = _poll_with_timeout(_find_card, timeout=10)
+            if ok and found and found[0] is not None:
+                draft_card, how = found
+                dprint(f"✅ 匹配成功 ({how}): {draft_name}")
                 break
-            
             time.sleep(2)
-            if attempt == 5:
+            if attempt == 6:
                 # 尝试点击一下首页空白处，激活列表滚动
                 dprint("尝试刷新首页状态...")
-                self.window.Click(ratioX=0.5, ratioY=0.5, simulateMove=False)
+                try:
+                    self.window.Click(ratioX=0.5, ratioY=0.5, simulateMove=False)
+                except Exception:
+                    pass
 
         if not draft_card:
              # 打印首页前 10 个文本块帮助调试
@@ -599,21 +671,21 @@ class Exporter:
         # 剪映首页草稿通常在点击后会有短暂的“正在打开”状态
         draft_card.Click(simulateMove=False)
         
-        # 等待加载编辑页 (延长到 60s，并增加异常容错)
+        # 等待加载编辑页（墙钟 60s 上限；每次 UIA 探测另有 8s 超时，避免假死时无限挂起）
         dprint("正在加载编辑器 (可能需要较长时间)...")
-        for i in range(60):
+        load_start = time.time()
+        while time.time() - load_start < 60:
             time.sleep(1)
-            try:
-                # 在窗口切换过程中，可能会有短暂的窗口丢失，忽略连接错误
-                self.connect(retry=False) 
-                if self.is_edit_page():
-                    dprint(f"成功进入编辑页 (耗时 {i+1}s)。")
-                    # 额外等待渲染完成
-                    time.sleep(3)
-                    return
-            except:
-                # 忽略加载过程中的连接失败，继续轮询
-                continue
+            def _poll_edit_page():
+                self.connect(retry=False)
+                return self.is_edit_page()
+
+            ok, is_edit = _poll_with_timeout(_poll_edit_page, timeout=8)
+            if ok and is_edit:
+                dprint(f"成功进入编辑页 (耗时 {int(time.time() - load_start)}s)。")
+                # 额外等待渲染完成
+                time.sleep(3)
+                return
         raise Exception("打开草稿超时，未能进入编辑界面。请确认是否手动干预或程序卡死。")
 
     def export(self, output_path, draft_name, resolution="1080P", framerate=None,
@@ -1238,7 +1310,7 @@ def _restore_streams_from_backup(draft_name):
 
 
 def run(draft_name, output_path, move_output=False, expected_duration=None,
-        keep_open=False, fallback_dir=None):
+        keep_open=False, fallback_dir=None, cold_start=False):
     _TASK.update(draft=draft_name, output=output_path, move=move_output,
                  status="running", stage="准备", start_time=time.time(),
                  expected_duration=expected_duration, real_file=None)
@@ -1266,8 +1338,15 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
 
     exporter = Exporter()
 
-    # 2. 确保在首页
-    if exporter.is_edit_page():
+    # 2. 确保在首页：--cold-start 时先冷启动（每部剧一次，避开"刚导完上一部"的
+    #    窗口存在但未就绪状态）；否则按原逻辑切回首页
+    if cold_start:
+        _cold_start_jianying(exporter)
+        try:
+            exporter.connect(retry=False)
+        except Exception as e:
+            dprint(f"⚠️ 冷启动后绑定窗口失败（open_draft 会再尝试）: {e}")
+    elif exporter.is_edit_page():
         dprint("检测到在编辑页，将尝试先导出当前草稿（如果名字匹配）或切回首页")
         # 这里简单处理：切回首页重来，确保状态一致
         exporter.switch_to_home()
@@ -1331,6 +1410,8 @@ if __name__ == "__main__":
                         help="成品抢救时的额外搜索目录（默认自动包含目标目录的父目录）")
     parser.add_argument("--retries", type=int, default=2,
                         help="UI 类失败重试次数（默认 2，即共 3 次尝试；非 UI 错误不重试）")
+    parser.add_argument("--cold-start", action="store_true",
+                        help="导出前冷启动剪映（杀进程→拉起→等首页），避免上一部刚导完时 UI 假死")
 
     args = parser.parse_args()
 
@@ -1345,7 +1426,8 @@ if __name__ == "__main__":
                 _flow(f"开始第 {attempt}/{attempts} 次尝试")
             run(args.draft_name, args.output_path,
                 move_output=args.move, expected_duration=args.expect_duration,
-                keep_open=args.keep_open, fallback_dir=args.fallback_dir)
+                keep_open=args.keep_open, fallback_dir=args.fallback_dir,
+                cold_start=args.cold_start and attempt == 1)
             sys.exit(0)
         except Exception as e:
             reason = str(e)
