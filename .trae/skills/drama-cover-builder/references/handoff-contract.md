@@ -350,6 +350,8 @@ python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先补算豆�
 | `updated_at` / `writer` | 最近写入时间 / 写入者 pid |
 | `phase` | 当前子阶段（`cold_start`/`export`/`verify`），供追溯 |
 | `failure_class` | 失败分类（见下），默认 `unknown` |
+| `last_recovery_action` | 最近一次自愈动作（`soft_home`/`kill_restart`/`dismiss`/`dismiss_then_kill`），只留最近一次 |
+| `last_recovery_at` | 最近一次自愈动作时间（ISO） |
 
 **崩溃恢复**：`exporting` 且心跳超过 180s 无更新 → 判定上次导出崩溃，回收为 `retrying`。心跳 = `max(heartbeat_ts, .progress.json mtime)`，子进程仍在写盘则不误杀。
 
@@ -361,10 +363,10 @@ python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先补算豆�
 | `asset_missing` | **否** | 直接终态 `failed` + 通知 | 否 |
 | `disk_full` | **否** | 直接终态 `failed` + 通知 | 否 |
 | `export_timeout` | 是 | **强制杀进程重启**（经管理器，不走软关）重试 | 是 |
-| `version_dialog` | 是 | 先关弹窗，再软关回首页重试 | 是 |
+| `version_dialog` | 是 | 先关弹窗做就绪判断，就绪即软回；**未就绪即升级强杀重启** | 是 |
 | `unknown` | 是 | 软关回首页（失败才重启）重试 | 是 |
 
-实际执行的自愈动作（`soft_home` / `kill_restart` / `dismiss`）记入导出进度侧写 `.progress.json` 的 `recovery_action` 字段与流程日志，可追溯「这次是软回还是真杀」；杀进程只经 `jy_instance.kill()`。
+实际执行的自愈动作（`soft_home` / `kill_restart` / `dismiss` / `dismiss_then_kill`）由导出子进程写入进度侧写 `.progress.json` 的 `recovery_action` 与流程日志；`cover_watch` 在导出收尾时从 sidecar **读回**，经 `export_state.py` 写入真源 `last_recovery_action`/`last_recovery_at`（**唯一写者仍是 `export_state.py`**，sidecar 无该字段则不写）。可追溯「这次是软回还是真杀」；杀进程只经 `jy_instance.kill()`。
 
 **迁移优先级**（真源缺失时按旧数据一次性推断，并把 `.export_retry.json` 备份为 `.bak`）：
 1. `job.json` `video.status=="done"` 或 `stage=="video_ready"` → `done`（已导出事实不可回退）
