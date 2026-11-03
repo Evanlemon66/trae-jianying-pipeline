@@ -226,7 +226,7 @@ _last_progress_toast = [0.0]
 _TASK = {"draft": None, "output": None, "move": False, "attempt": 1, "attempts_max": 1,
          "status": "running", "stage": None, "start_time": None, "expected_duration": None,
          "real_file": None, "errors": [],
-         "phase": None, "failure_class": None}
+         "phase": None, "failure_class": None, "recovery_action": None}
 _FLOW = []
 _PREFLIGHT_DONE = [False]
 
@@ -298,6 +298,7 @@ def _write_progress(output_path, real_export_file, expected_duration, start_time
         "errors": list(_TASK.get("errors") or []),
         "phase": _TASK.get("phase"),
         "failure_class": _TASK.get("failure_class"),
+        "recovery_action": _TASK.get("recovery_action"),
     }
     if done and final_file:
         try:
@@ -1012,20 +1013,44 @@ def _classify_failure(reason):
     return ("unknown", {"retryable": ui_fail, "action": "restart", "counts": True})
 
 
-def _do_recovery(action):
-    """按策略动作自愈（第 2 项管理器落地后，restart/kill 统一经管理器执行）。
+def _do_recovery(action, exporter=None):
+    """按策略动作自愈，返回实际执行的动作（soft_home / kill_restart / dismiss）。
 
-    dismiss_retry：先关阻挡弹窗再回首页；其余可重试动作：回首页（内部失败自动重启兜底）。
+    - kill_retry（export_timeout）：**强制经管理器 kill → launch → wait_ready(home)**，
+      不走软关按钮路径；仅在确已判定 export_timeout 且需重试时才杀进程。
+    - restart / unknown：软关优先（switch_to_home，只在关闭按钮失败时才重启兜底）。
+    - dismiss_retry：先关阻挡弹窗，再按 restart（软关优先）路径走。
+
+    杀进程只经 jy_instance.kill()（管理器），本函数不直接 taskkill。
+    实际动作写入 _TASK["recovery_action"] → progress sidecar + 日志行，供追溯/统计。
     """
     try:
-        if action == "dismiss_retry":
-            try:
-                Exporter().dismiss_blocking_dialogs()
-            except Exception:
-                pass
-        Exporter().switch_to_home()  # 新实例重绑窗口；内部失败自动重启剪映兜底
+        exporter = exporter or Exporter()
+    except Exception as e:
+        dprint(f"⚠️ 自愈实例创建失败（仍将继续重试）: {e}")
+        _TASK["recovery_action"] = "none"
+        return "none"
+    executed = "soft_home"
+    try:
+        if action == "kill_retry":
+            dprint("自愈动作：kill_restart（强制杀进程 → 拉起 → 等首页）")
+            _get_manager(exporter).restart(90)
+            executed = "kill_restart"
+        else:
+            if action == "dismiss_retry":
+                dprint("自愈动作：dismiss（先关闭阻挡弹窗）")
+                try:
+                    exporter.dismiss_blocking_dialogs()
+                    executed = "dismiss"
+                except Exception:
+                    pass
+            # restart / dismiss_retry / unknown：软关优先，失败才重启兜底
+            exporter.switch_to_home()
     except Exception as e2:
-        dprint(f"⚠️ 自愈回首页失败（仍将继续重试）: {e2}")
+        dprint(f"⚠️ 自愈恢复失败（仍将继续重试）: {e2}")
+    _TASK["recovery_action"] = executed
+    _flow(f"自愈动作执行: {executed}（策略动作={action}）")
+    return executed
 
 
 def _record_export_manifest(draft_name, export_file):
