@@ -36,6 +36,9 @@
       retry_pause_after：连续失败多少次后暂停该剧（默认 5，退避 1/2/4/8/16/30 分钟）
   <cover_job>/dispatch.json     豆包侧意图声明（ingest 归并进 job.json.workflow）
   <cover_job>/export_config.json 旧版一句话偏好（仍兼容：cut_s/derive）
+  <cover_job>/.export_state.json 导出状态机单一真源（lib/export_state.py 唯一写者：
+      status/attempts/consecutive_failures/next_retry_at/progress/phase/failure_class；
+      旧的 .export_retry.json 首次读取时一次性迁入并备份，video.status 由它派生）
 """
 from __future__ import annotations
 
@@ -51,6 +54,7 @@ from typing import Any, Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import job_manifest as jm  # noqa: E402
 import export_lock  # noqa: E402
+import export_state as es  # noqa: E402  # 导出状态机单一真源（.export_state.json）
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BATCH_RUNNER = os.path.join(_REPO, "pipeline", "batch_runner.py")
@@ -190,61 +194,53 @@ def _log(job_dir: str, msg: str) -> None:
         pass
 
 
-# ── 导出失败退避 / 暂停 ──────────────────────────────────────────
+# ── 导出失败退避 / 暂停（单一真源适配层）──────────────────────────
+# 真源是 cover_job/.export_state.json（lib/export_state.py 唯一写者）。
+# 旧的 .export_retry.json 只作为迁移来源，首次读取时一次性迁移并备份，之后不再写。
+# 下面三个函数保留旧签名，全部改为读写真源，保证既有调用方与回归用例不变。
 
-RETRY_NAME = ".export_retry.json"
-_BACKOFF_S = (60, 120, 240, 480, 960, 1800)  # 1 / 2 / 4 / 8 / 16 / 30 分钟
-RETRY_PAUSE_AFTER = 5
+RETRY_NAME = es.LEGACY_RETRY_NAME          # ".export_retry.json"（仅迁移读取）
+_BACKOFF_S = es.BACKOFF_S                  # 1 / 2 / 4 / 8 / 16 / 30 分钟
+RETRY_PAUSE_AFTER = es.DEFAULT_PAUSE_AFTER
 
 
 def read_retry(job_dir: str) -> dict[str, Any]:
-    try:
-        with open(os.path.join(job_dir, RETRY_NAME), encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
+    """兼容读：把真源映射成旧 {fails, next_ts, paused} 形状。"""
+    st = es.load(job_dir)
+    return {"fails": int(st.get("consecutive_failures") or 0),
+            "next_ts": float(st.get("next_retry_at") or 0),
+            "paused": st.get("status") == "paused"}
 
 
-def _write_retry(job_dir: str, data: dict[str, Any]) -> None:
-    try:
-        with open(os.path.join(job_dir, RETRY_NAME), "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
-
-
-def retry_gate(job_dir: str, phase_override: Optional[str] = None) -> Optional[str]:
-    """导出闸门：返回等待/暂停原因；None 表示可导。--phase export 为人工强制放行。"""
-    if phase_override == "export":
-        return None
-    st = read_retry(job_dir)
-    if st.get("paused"):
-        return (f"连续 {st.get('fails')} 次导出失败已暂停（人工排查后删除 "
-                f"{RETRY_NAME} 或 --phase export 强制放行）")
-    nxt = float(st.get("next_ts") or 0)
-    if nxt > time.time():
-        return f"导出失败退避中（{int(nxt - time.time())}s 后重试，已失败 {st.get('fails')} 次）"
-    return None
+def retry_gate(job_dir: str, phase_override: Optional[str] = None,
+               progress_mtime: float = 0.0,
+               migrate_ctx: Optional[dict[str, Any]] = None) -> Optional[str]:
+    """导出闸门（读真源）：返回等待/暂停原因；None 表示可导。--phase export 人工放行。"""
+    return es.gate(job_dir, phase_override=phase_override,
+                   progress_mtime=progress_mtime, migrate_ctx=migrate_ctx)
 
 
 def note_export_result(job_dir: str, name: str, ok: bool, *,
-                       pause_after: int = RETRY_PAUSE_AFTER) -> None:
-    """记录导出结果：成功清零；失败按 1/2/4/8/16/30 分钟退避，连续超限则暂停该剧并告警。"""
+                       pause_after: int = RETRY_PAUSE_AFTER,
+                       error: Optional[str] = None) -> None:
+    """记录导出结果（写真源）：成功置 done 并清零；失败退避/暂停并告警。"""
     if ok:
-        if read_retry(job_dir):
-            _write_retry(job_dir, {"fails": 0, "next_ts": 0, "paused": False})
+        es.succeed(job_dir)
+        _log(job_dir, "export ok（真源置 done，计数清零）")
         return
-    fails = int(read_retry(job_dir).get("fails") or 0) + 1
-    delay = _BACKOFF_S[min(fails - 1, len(_BACKOFF_S) - 1)]
-    paused = fails >= max(1, pause_after)
-    _write_retry(job_dir, {"fails": fails, "paused": paused,
-                           "next_ts": 0 if paused else time.time() + delay,
-                           "last_fail_at": jm.now_iso()})
-    _log(job_dir, f"export 失败第 {fails} 次" + ("（已暂停该剧）" if paused else f"，{delay}s 后重试"))
+    st = es.fail(job_dir, error, pause_after=pause_after)
+    fails = int(st.get("consecutive_failures") or 0)
+    paused = st.get("status") == "paused"
+    if paused:
+        _log(job_dir, f"export 失败第 {fails} 次（已暂停该剧）")
+    else:
+        delay = es.BACKOFF_S[min(fails - 1, len(es.BACKOFF_S) - 1)]
+        _log(job_dir, f"export 失败第 {fails} 次，{delay}s 后重试")
     try:
         if paused:
             toast("⛔ 导出连续失败已暂停", f"{name}：连续 {fails} 次失败，需人工排查", icon="error")
         else:
+            delay = es.BACKOFF_S[min(fails - 1, len(es.BACKOFF_S) - 1)]
             toast("⚠️ 导出失败，将退避重试", f"{name}：第 {fails} 次失败，{delay}s 后重试",
                   icon="warning")
     except Exception:
@@ -273,6 +269,38 @@ def _intent_of(job: dict[str, Any]) -> dict[str, Any]:
     for k, v in jm.WORKFLOW_DEFAULTS.items():
         wf.setdefault(k, v)
     return wf
+
+
+def _progress_info(out_mp4: str) -> tuple[float, Optional[str], Optional[int]]:
+    """读导出进度侧写 .progress.json：返回 (mtime, status, percent)。
+
+    运行中在剧名目录同级（side），完成后在 mp4 旁（final）；取较新的一份。
+    该文件是剪映导出子进程的运行时产物，只作真源的心跳/进度输入，不是真源本身。
+    """
+    out_dir = os.path.dirname(os.path.abspath(out_mp4))
+    side = os.path.join(os.path.dirname(out_dir),
+                        os.path.basename(out_dir) + ".progress.json")
+    final = out_mp4 + ".progress.json"
+    cands = [p for p in (final, side) if os.path.isfile(p)]
+    if not cands:
+        return 0.0, None, None
+    p = max(cands, key=os.path.getmtime)
+    try:
+        mtime = os.path.getmtime(p)
+    except OSError:
+        return 0.0, None, None
+    try:
+        with open(p, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return mtime, None, None
+    return mtime, rec.get("status"), es.parse_percent(rec.get("percent"))
+
+
+def _migrate_ctx(job: dict[str, Any]) -> dict[str, Any]:
+    """真源缺失时的迁移上下文：从 job.json 提取已导/阶段信号（只读）。"""
+    return {"video_status": (job.get("video") or {}).get("status"),
+            "stage": job.get("stage")}
 
 
 _CUT_CONFLICT_NOTIFIED: set[str] = set()  # 分歧 toast 每剧一次，避免每轮刷屏
@@ -384,7 +412,12 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
     if policy == "after_edit_queue_drained" and pending_edit > 0:
         plan.update(reason=f"export_policy=after_edit_queue_drained：还有 {pending_edit} 部待剪辑")
         return plan
-    gate = retry_gate(job_dir, phase_override)
+    # 导出闸门读单一真源：带上 .progress.json 心跳（判 exporting 是否 stale）与迁移上下文
+    dn = os.path.basename(draft.rstrip("\\/"))
+    pm, p_status, p_pct = _progress_info(pc.export_mp4_path(dn))
+    ctx = _migrate_ctx(job)
+    ctx.update({"progress_status": p_status, "progress_pct": p_pct})
+    gate = retry_gate(job_dir, phase_override, progress_mtime=pm, migrate_ctx=ctx)
     if gate:
         plan.update(reason=gate)
         return plan
@@ -513,15 +546,22 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
 
 def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
                *, dry_run: bool, verify: bool = True, no_derive: bool = False) -> bool:
-    """export 阶段：export_config(旧) → 导出 → 质检 → record-video → derive。"""
+    """export 阶段：reap(崩溃回收) → begin(exporting) → 导出 → verify → record-video
+    → succeed(done) → 派生 video.status → derive。导出状态全程读写单一真源
+    .export_state.json（lib/export_state.py），video.status 由真源派生。"""
     name = plan["name"]
     draft_name = os.path.basename(plan["draft"].rstrip("\\/"))
+    out_mp4 = pc.export_mp4_path(draft_name)
     if dry_run:
         print(_plan_line(plan))
-        print(f"        export: {draft_name} → {pc.export_mp4_path(draft_name)}")
+        print(f"        export: {draft_name} → {out_mp4}")
         return True
     toast("📤 导出阶段开始", f"{name}", icon="info")
     _log(job_dir, "export start")
+    # 崩溃恢复（不假设优雅退出）：上次 exporting 且心跳超时 → 回收为 retrying 再走本轮
+    pm, _, _ = _progress_info(out_mp4)
+    if es.reap_stale(job_dir, progress_mtime=pm):
+        _log(job_dir, "真源回收：上次导出心跳超时（stale），转重试")
     try:
         legacy_override = apply_export_config(job_dir)
     except Exception as e:
@@ -538,6 +578,7 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
                       f"owner={holder.get('owner')}），稍后重试")
         return False
     _write_lock(job_dir, "export")
+    es.begin(job_dir, phase="export")  # 真源进入 exporting（唯一写者经 export_state）
     try:
         ok = sr._run_export(draft_name,
                             timeout=float(cfg.get("export_stall_timeout", 1800)),
@@ -545,13 +586,14 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     finally:
         export_lock.release()
     _log(job_dir, f"export {'ok' if ok else '失败'}")
-    note_export_result(job_dir, name, ok,
-                       pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)))
     if not ok:
+        note_export_result(job_dir, name, False,
+                           pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
+                           error="robust_auto_export 返回非 0")
         toast("❌ 导出失败", name, icon="error")
         return False
     # 质检（与 batch_runner 默认行为一致；--no-verify 关闭）
-    out_mp4 = pc.export_mp4_path(draft_name)
+    es.heartbeat(job_dir, phase="verify")
     verify_script = os.path.join(_REPO, "pipeline", "verify_export.py")
     if verify and os.path.isfile(verify_script):
         _log(job_dir, "verify start")
@@ -566,6 +608,9 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     except Exception as e:
         _log(job_dir, f"record-video 失败: {e}")
         toast("⚠️ 导出完成但登记失败", f"{name} record-video: {e}", icon="warning")
+    # 真源终态 done（计数清零），随后把 video.status 由真源派生落 job.json
+    note_export_result(job_dir, name, True)
+    _derive_video_status(job_dir)
     if platforms:
         try:
             rep = jm.derive_covers(job_dir, platforms)
@@ -579,6 +624,30 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     toast("✅ mp4 导出完成", f"{name}\n{export_dir}", icon="success")
     _log(job_dir, "chain done")
     return True
+
+
+def _derive_video_status(job_dir: str) -> None:
+    """video.status 由真源派生（唯一写入口）：真源 done → job.json video.status=done。
+
+    video.status 是展示/契约字段，任何地方不得绕过真源直接改它。
+    """
+    try:
+        st = es.load(job_dir)
+    except Exception:
+        return
+    if st.get("status") != "done":
+        return
+    try:
+        job = jm.load_job(os.path.join(job_dir, "job.json"))
+    except Exception:
+        return
+    if (job.get("video") or {}).get("status") == "done":
+        return
+    try:
+        jm.update_job(job_dir, {"video": {"status": "done"}},
+                      event="export_state", detail="video.status 由真源派生")
+    except Exception as e:
+        _log(job_dir, f"video.status 派生失败: {e}")
 
 
 def _sync_intent(job_dir: str, name: str, state: dict[str, Any]) -> None:
