@@ -10,11 +10,13 @@
   python pipeline/stream_manifest.py clean --all [--dry-run]                # 清理所有记录
   python pipeline/stream_manifest.py clean --job "<草稿名>" --require-receipts   # 严格模式
   python pipeline/stream_manifest.py clean --job "<草稿名>" --include-drafts     # 连 C 盘草稿一起删
+  python pipeline/stream_manifest.py clean --job "<草稿名>" --intermediates-only # 只清中间产物
 
 默认行为（信任"用户让清理＝已发布"，发布流程尚未自动化）：
   清理 ① __jycache__ ② _work_* 工作目录 ③ 导出成品目录（mp4+封面+progress.json 整体）；
   **默认不删 C 盘剪映草稿**，需显式 --include-drafts。
   --require-receipts 严格模式：必须有成功回执（06_publish/receipts 或 platform json 标 published+url/id），否则整剧跳过。
+  --intermediates-only 只清 ① __jycache__ ② _work_*，成品目录与草稿一律不动（不受 include_drafts 影响）。
   --dry-run 只打印计划与大小，不做任何删除、不改 manifest。
 
 安全约束：绝不清理 source_dir（用户源视频目录本体）；保护区（_broken / cover_job / s2·s3·ss.mp4 /
@@ -194,12 +196,14 @@ def receipts_status(source_dir):
     return False, "无成功回执（receipts 为空、platform json 未标 published/url）"
 
 
-def _plan(paths, draft_name, include_drafts):
+def _plan(paths, draft_name, include_drafts, intermediates_only=False):
     """清理计划：中间产物 → 成品 →（可选）草稿。返回 [(label, kind, path)]。"""
     items = []
     for kind in ("jycache_dir", "workdir"):
         if paths.get(kind):
             items.append((kind, kind, paths[kind]))
+    if intermediates_only:
+        return items
     ef = paths.get("export_file")
     if ef:
         parent = os.path.dirname(os.path.abspath(ef))
@@ -217,8 +221,11 @@ def _plan(paths, draft_name, include_drafts):
     return items
 
 
-def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=False):
+def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=False,
+          intermediates_only=False):
     """清理一部剧的串流残留。默认信任"已发布"，不删草稿（除非 include_drafts）。
+
+    intermediates_only=True 时只清 __jycache__ 与 _work_*，成品目录与草稿都不动。
 
     返回 0=已执行或计划完成；1=记录不存在或被严格模式跳过。
     """
@@ -241,7 +248,9 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
 
     total = 0
     ready = []
-    for label, kind, p in _plan(paths, title, include_drafts):
+    if intermediates_only:
+        print("  [模式] intermediates-only：只清 __jycache__ / _work_*，成品与草稿一律不动")
+    for label, kind, p in _plan(paths, title, include_drafts, intermediates_only):
         why = _blocked_reason(p, source_dir)
         if why:
             print(f"  [受保护] {label}: {p}（{why}），跳过")
@@ -292,9 +301,10 @@ def _manifest_names():
 
 
 def _parse_clean_args(args):
-    """解析 clean 子命令：--job/--all/--dry-run/--require-receipts/--include-drafts，兼容裸名字与 all。"""
+    """解析 clean 子命令：--job/--all/--dry-run/--require-receipts/--include-drafts/--intermediates-only。"""
     opt = {"job": None, "all": False, "dry_run": False,
-           "require_receipts": False, "include_drafts": False}
+           "require_receipts": False, "include_drafts": False,
+           "intermediates_only": False}
     i = 0
     while i < len(args):
         a = args[i]
@@ -306,6 +316,8 @@ def _parse_clean_args(args):
             opt["require_receipts"] = True
         elif a == "--include-drafts":
             opt["include_drafts"] = True
+        elif a == "--intermediates-only":
+            opt["intermediates_only"] = True
         elif a in ("--job", "-j") and i + 1 < len(args):
             i += 1
             opt["job"] = args[i]
@@ -339,7 +351,8 @@ def main():
         for n in names:
             rc = clean(n, dry_run=opt["dry_run"],
                        include_drafts=opt["include_drafts"],
-                       require_receipts=opt["require_receipts"])
+                       require_receipts=opt["require_receipts"],
+                       intermediates_only=opt["intermediates_only"])
             if rc != 0:
                 skipped.append(n)
             print()

@@ -1659,6 +1659,119 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
     return report
 
 
+PUBLISH_PLATFORMS = ("youtube", "tiktok")
+# job.json 里平台状态用校验允许的枚举（pending/uploading/succeeded/failed/blocked）；
+# 06_publish/<platform>.json 与回执文件里按契约写 status=published。
+PLATFORM_OK_STATUS = "succeeded"
+
+
+def _publish_key(series: str, platform: str, video_id: Optional[str],
+                 url: Optional[str]) -> str:
+    raw = f"{series}|{platform}|{video_id or ''}|{url or ''}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _write_json(path: str, data: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def publish_record(
+    job_dir: str,
+    platform: str,
+    *,
+    video_id: Optional[str] = None,
+    url: Optional[str] = None,
+    uploaded_at: Optional[str] = None,
+    cover_file: Optional[str] = None,
+    note: Optional[str] = None,
+) -> dict[str, Any]:
+    """手工登记一条发布回执（发布流程尚未自动化时的正式入口）。
+
+    写 `06_publish/<platform>.json` + `06_publish/receipts/<platform>-<时间戳>.json`，
+    并把 `job.json` 的 `publish.platforms` / `publish.receipts` 补齐；至少一个平台成功即
+    `publish.status=published`。stage 不强推，仅当已处于 publish_ready/published 时才置 published。
+    同平台同 video_id（无 id 时同 url）重复登记不重复追加，返回 duplicate=True、不改 revision。
+    """
+    platform = (platform or "").strip().lower()
+    if not platform:
+        raise ValueError("platform 不能为空")
+    video_id = (video_id or "").strip() or None
+    url = (url or "").strip() or None
+    if not video_id and not url:
+        raise ValueError("--video-id 与 --url 至少提供一个")
+
+    job = load_job(os.path.join(job_dir, "job.json"))
+    series = job.get("series") or ""
+    stamp = uploaded_at or now_iso()
+    key = _publish_key(series, platform, video_id, url)
+
+    publish = job.get("publish") or {}
+    platforms = list(publish.get("platforms") or [])
+    for p in platforms:
+        same_name = str(p.get("name") or "").lower() == platform
+        if not same_name:
+            continue
+        if video_id and str(p.get("video_id") or "") == video_id:
+            return {"duplicate": True, "platform": platform, "video_id": video_id,
+                    "revision": job.get("revision"), "stage": job.get("stage"),
+                    "files": []}
+        if not video_id and url and str(p.get("url") or "") == url:
+            return {"duplicate": True, "platform": platform, "video_id": None,
+                    "revision": job.get("revision"), "stage": job.get("stage"),
+                    "files": []}
+
+    receipts_dir = os.path.join(job_dir, "06_publish", "receipts")
+    os.makedirs(receipts_dir, exist_ok=True)
+    base_name = f"{platform}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    receipt_name = f"{base_name}.json"
+    n = 2
+    while os.path.exists(os.path.join(receipts_dir, receipt_name)):
+        receipt_name = f"{base_name}-{n}.json"
+        n += 1
+    receipt_rel = f"06_publish/receipts/{receipt_name}"
+    platform_rel = f"06_publish/{platform}.json"
+
+    entry = {
+        "name": platform,
+        "status": PLATFORM_OK_STATUS,
+        "video_id": video_id,
+        "url": url,
+        "cover_file": rel_path(cover_file, job_dir) if cover_file else None,
+        "attempts": 1,
+        "error": None,
+        "uploaded_at": stamp,
+        "note": note,
+    }
+    platforms.append(entry)
+    receipts = list(publish.get("receipts") or [])
+    receipts.append({"platform": platform, "file": receipt_rel,
+                     "video_id": video_id, "url": url,
+                     "uploaded_at": stamp, "idempotency_key": key})
+
+    patch: dict[str, Any] = {
+        "publish": {"status": "published", "platforms": platforms,
+                    "receipts": receipts}
+    }
+    cur_stage = job.get("stage")
+    if cur_stage in ("publish_ready", "published"):
+        patch["stage"] = "published"
+    job = update_job(job_dir, patch, event="publish_record",
+                     detail=f"{platform} video_id={video_id or '-'} url={url or '-'}")
+
+    payload = {"version": 1, "name": platform, "status": "published",
+               "video_id": video_id, "url": url,
+               "cover_file": entry["cover_file"], "attempts": 1,
+               "uploaded_at": stamp, "note": note,
+               "idempotency_key": key, "recorded_at": now_iso()}
+    _write_json(os.path.join(job_dir, platform_rel), payload)
+    _write_json(os.path.join(job_dir, receipt_rel), payload)
+    return {"duplicate": False, "platform": platform, "video_id": video_id,
+            "url": url, "revision": job["revision"], "stage": job["stage"],
+            "idempotency_key": key, "files": [platform_rel, receipt_rel]}
+
+
 def create_job(
     *,
     series: Optional[str] = None,
@@ -1834,6 +1947,18 @@ def _main(argv: Optional[list[str]] = None) -> int:
     p_cut.add_argument("--cut", required=True,
                        help="正数秒数（≤ duration_s）；传 0 或 null 清除为不裁剪")
 
+    p_pub = sub.add_parser("publish-record",
+                           help="手工登记发布回执（写 06_publish/<platform>.json + receipts/）")
+    p_pub.add_argument("--job", required=True)
+    p_pub.add_argument("--platform", required=True,
+                       choices=list(PUBLISH_PLATFORMS))
+    p_pub.add_argument("--video-id", default=None, help="平台视频 id")
+    p_pub.add_argument("--url", default=None, help="平台视频链接")
+    p_pub.add_argument("--uploaded-at", default=None,
+                       help="ISO 时间，缺省为当前时间")
+    p_pub.add_argument("--cover-file", default=None, help="该平台实际使用的封面")
+    p_pub.add_argument("--note", default=None, help="备注")
+
     args = ap.parse_args(argv)
     job_dir = os.path.dirname(os.path.abspath(args.job))
     if os.path.isdir(args.job):
@@ -1970,6 +2095,25 @@ def _main(argv: Optional[list[str]] = None) -> int:
             print(f"[FAIL] {e}")
             return 1
         print(f"[OK] revision={job['revision']} video.cut_s={job['video']['cut_s']}")
+        return 0
+
+    if args.command == "publish-record":
+        try:
+            result = publish_record(job_dir, args.platform,
+                                    video_id=args.video_id, url=args.url,
+                                    uploaded_at=args.uploaded_at,
+                                    cover_file=args.cover_file, note=args.note)
+        except (ValueError, FileNotFoundError) as e:
+            print(f"[FAIL] {e}")
+            return 1
+        if result["duplicate"]:
+            print(f"[SKIP] 已登记过（{result['platform']} video_id={result['video_id']}"
+                  f"），未重复追加，revision={result['revision']} 未变")
+            return 0
+        print(f"[OK] revision={result['revision']} stage={result['stage']} "
+              f"publish.status=published idempotency_key={result['idempotency_key']}")
+        for f in result["files"]:
+            print(f"  {f}")
         return 0
 
     return 1

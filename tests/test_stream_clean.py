@@ -7,6 +7,7 @@
   ③ --require-receipts：缺回执整剧跳过；有回执才放行
   ④ --dry-run：零删除，清单与合计正确
   ⑤ 保护区断言：源目录 / _broken / cover_job 路径被跳过并告警
+  ⑥ --intermediates-only：只清中间产物，成品与草稿都不动（成品存在/不存在两态）
 
 运行：python tests\\test_stream_clean.py
 """
@@ -138,6 +139,32 @@ check("告警：等于源视频目录", "等于源视频目录" in out, out)
 check("告警：_broken", "_broken" in out, out)
 check("告警：cover_job", "cover_job 正式产物区" in out, out)
 check("无任何 [已删]", "[已删]" not in out, out)
+
+print("\n== ⑥ --intermediates-only：成品与草稿都不删 ==")
+p = make_series("showG")
+rc, out = run_clean("showG", intermediates_only=True)
+check("返回 0", rc == 0, rc)
+check("jycache 已删", not os.path.exists(p["jy"]))
+check("workdir 已删", not os.path.exists(p["work"]))
+check("成品保留", os.path.exists(p["bundle"]))
+check("草稿保留", os.path.exists(p["draft"]))
+check("输出含模式说明", "intermediates-only" in out, out)
+check("无成品删除行", "[已删] export_bundle" not in out, out)
+check("仅删 2 项", out.count("[已删]") == 2, out.count("[已删]"))
+
+p = make_series("showH")
+shutil.rmtree(p["bundle"])
+rc, out = run_clean("showH", intermediates_only=True)
+check("成品不存在仍返回 0", rc == 0, rc)
+check("jycache 已删", not os.path.exists(p["jy"]))
+check("workdir 已删", not os.path.exists(p["work"]))
+check("草稿保留", os.path.exists(p["draft"]))
+check("无成品相关行", "export_bundle" not in out, out)
+
+p = make_series("showI")
+rc, out = run_clean("showI", intermediates_only=True, include_drafts=True)
+check("intermediates-only 压过 include-drafts：草稿保留", os.path.exists(p["draft"]))
+check("成品保留", os.path.exists(p["bundle"]))
 
 print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
 sys.exit(1 if fails else 0)

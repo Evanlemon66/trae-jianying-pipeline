@@ -220,6 +220,21 @@ Stage 2 的标准取数入口是 `resolve`（一条命令返回标题 + 参考�
 
 平台封面不是同一张：YouTube 缩略图要求 16:9（1280×720，小于 2MB），用横版派生；TikTok 用竖版。派生文件放 `04_covers/derived/`，用 `derive --platform ...` 从契约原图生成（易变产物，不写 job.json、不参与 hash 校验）。
 
+### 手工发布回执 `publish-record`
+
+发布流程尚未自动化，手工上传后用一条命令把结果写进契约文件（不手写 job.json）：
+
+```powershell
+python lib/job_manifest.py publish-record --job "<cover_job>" `
+  --platform youtube --video-id "dQw4w9WgXcQ" --url "https://youtu.be/dQw4w9WgXcQ" `
+  [--uploaded-at "2026-11-04T12:00:00+08:00"] [--cover-file "04_covers/derived/youtube.jpg"] [--note "手工上传"]
+```
+
+- `--platform` 只接受 `youtube` / `tiktok`；`--video-id` 与 `--url` **至少给一个**，全缺直接报错。
+- 产物：`06_publish/<platform>.json` 与 `06_publish/receipts/<platform>-<时间戳>.json`，字段为 `name` / `status=published` / `video_id` / `url` / `cover_file` / `attempts` / `uploaded_at` / `idempotency_key`（外加可选 `note` 与 `recorded_at`）。
+- `job.json`：平台条目追加进 `publish.platforms`（**status 用校验枚举 `succeeded`**，文件侧才是 `published`）、回执条目追加进 `publish.receipts`，`publish.status=published`；stage **不强推**，只有当前已是 `publish_ready`/`published` 时才置 `published`。
+- 幂等：同平台同 `video_id`（无 id 时同 `url`）重复登记直接跳过，不追加、不涨 `revision`；不同 id 才追加一条并 `revision+1`。
+
 `cleanup` 规则：
 
 - `status`：`blocked` / `eligible` / `done` / `skipped`。
@@ -233,7 +248,7 @@ Stage 2 的标准取数入口是 `resolve`（一条命令返回标题 + 参考�
 {"tool": "pipeline/stream_manifest.py",
  "draft_name": "重生八零，打猎卖货养妻女_第01-80集串流",
  "manifest": "pipeline/_stream_manifests/<名>.json",
- "command": "python pipeline/stream_manifest.py clean --job \"<draft_name>\" [--dry-run] [--require-receipts] [--include-drafts]",
+ "command": "python pipeline/stream_manifest.py clean --job \"<draft_name>\" [--dry-run] [--require-receipts] [--include-drafts] [--intermediates-only]",
  "scope": ["jycache_dir", "workdir", "export_bundle(mp4+封面+progress)", "draft_dir(仅 --include-drafts)"],
  "deletes_final_mp4": true,
  "status": "pending"}
@@ -252,10 +267,11 @@ Stage 2 的标准取数入口是 `resolve`（一条命令返回标题 + 参考�
 | `--dry-run` | 关 | 只打印「将删路径 + 各自大小 + 合计」，**零删除、不改记录** |
 | `--require-receipts` | 关 | 严格模式：必须有成功回执（`06_publish/receipts/` 内文件，或 `06_publish/<platform>.json` 标 `published` 且 `url`/`video_id` 非空），否则整剧跳过并列入"跳过清单" |
 | `--include-drafts` | 关 | 额外删除 C 盘剪映草稿目录（唯一可再导出入口，删后只能重跑 pipeline） |
+| `--intermediates-only` | 关 | **只清** `__jycache__` + `_work_*`，导出成品目录与草稿一律不动；与 `--include-drafts` 同时给出时以本开关为准 |
 
 - 删除顺序：中间产物（jycache、workdir）→ 成品 →（可选）草稿；缺失项跳过并记录。
 - 保护区断言（命中即跳过并告警）：等于/包含 `<series_dir>` 源目录、位于 `_broken`、位于 `cover_job`、`s2.mp4`/`s3.mp4`/`ss.mp4`、`pipeline/_work` 旧状态目录；`.stream_manifests` 记录本身永不删除。
-- ⚠️ **风险**：默认行为会删除成品 mp4 与整个导出目录，**不可恢复**；只想清中间产物时先用 `--dry-run` 核对清单（"只清中间产物"的独立开关尚未提供）。
+- ⚠️ **风险**：默认行为会删除成品 mp4 与整个导出目录，**不可恢复**；只想清中间产物时用 `--intermediates-only`（成品与草稿都保留），或先 `--dry-run` 核对清单。
 
 ## 7. 写入与校验
 

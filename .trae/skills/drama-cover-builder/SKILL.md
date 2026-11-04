@@ -257,7 +257,9 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 | `art-from-video` | ffmpeg select+thumbnail 抽最佳帧 |
 | `compose-pillow` | Pillow 合成，4 样式 × 2 尺寸族，标题可选 |
 
-串流残留清理（发布流程未自动化，默认信任"已发布"）：`python pipeline/stream_manifest.py clean --job "<草稿名>" --dry-run` 先核对，去掉 `--dry-run` 才真删；默认删 `__jycache__`/`_work_*`/成品目录、**不删 C 盘草稿**（连草稿加 `--include-drafts`），严格模式加 `--require-receipts`。
+串流残留清理（发布流程未自动化，默认信任"已发布"）：`python pipeline/stream_manifest.py clean --job "<草稿名>" --dry-run` 先核对，去掉 `--dry-run` 才真删；默认删 `__jycache__`/`_work_*`/成品目录、**不删 C 盘草稿**（连草稿加 `--include-drafts`），严格模式加 `--require-receipts`，**只想清中间产物、保留成品与草稿**用 `--intermediates-only`。
+
+手工发布回执（不手写 job.json）：`python lib/job_manifest.py publish-record --job "<cover_job>" --platform youtube --video-id "<id>" --url "<url>"`，自动写 `06_publish/<platform>.json` + `receipts/<platform>-<时间戳>.json` 并补齐 `job.json.publish`；同平台同 `video_id` 重复登记自动跳过。
 
 剪映草稿封面写入（`draft_cover.jpg` + 原生 composition）已下沉为共享库 `lib/jy_cover.py`，由 pipeline 在导出链路调用，**不属于本 skill**：
 
