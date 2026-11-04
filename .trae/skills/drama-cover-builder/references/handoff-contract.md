@@ -69,11 +69,11 @@ D:\短剧\<剧名>\
 | `sizes` | object | `horizontal` / `vertical` 精确像素 |
 | `titles.file` | string | `02_titles/titles.json` |
 | `titles.count` | number | 固定 12 |
-| `titles.gate` | string | `pending` / `done` |
+| `titles.gate` | string | 枚举只有 `pending` / `done` 两值；禁止自造（如 `selected`），违规用 `validate --fix` 修复 |
 | `titles.prompt_file` | string \| null | `02_titles/prompt.txt`，实际发出的提示词 |
 | `titles.prompt_sha256` | string \| null | 提示词快照校验 |
 | `titles.prompt_version` | string | 默认 `title-spec-v4.1` |
-| `titles.selected` | array | 门禁后三条：`{slot, title_id, title}` |
+| `titles.selected` | array | 门禁后三条：`{slot, title_id, title}` 对象数组；禁止字符串/数字数组，违规用 `validate --fix` 修复 |
 | `titles.selected_at` | string \| null | 门禁时间 |
 | `titles.selected_by` | string \| null | `user`（人工门禁）/ `auto`（兜底自动选分，见 §5） |
 | `titles.auto_mode` | string \| null | 兜底模式：`recommended`（推荐池优先，默认）/ `score`（全量评分）；仅 `selected_by=auto` 时有值，人工选置 null |
@@ -193,6 +193,7 @@ D:\短剧\<剧名>\
 
 - `prepare` 按 **1-1 / 2-2 / 3-3** 预填 `title_id`，`title` 为 `null`。
 - 门禁完成后写 `titles.selected`（3 项 `{slot,title_id}`），并回填 `cover_map[].title_id` / `title`，`gate=done`。
+- **硬约束**：`titles.gate` 只能是 `pending` / `done`，禁止自造枚举（把「已选定」写成 `gate="selected"` 是常见错误）；`titles.selected` 必须是 3 个对象 `{slot,title_id,title}`，禁止字符串/数字数组。已落盘的违规形态用 `validate --job <cover_job> --fix` 修复（规范化 gate/selected、记一条 `validate_fix` history），不要手改文件。
 - 三条横版必须与标题一一对应；竖版标 `role=video_cover`。
 - 竖版绑定：门禁（`select`）或收口（`ingest`）时，自动绑定 `selected` 三条中评分最高的一条（平分按总分→推荐优先→内容兑现→信息缺口→情绪峰值，与兜底同序）；无评分数据则保持 `title_id=null`。
 - 门禁后 `selected` 冻结；改选必须显式操作，`revision` 递增，Stage 2 发现 revision 不一致要把旧图标 `stale`。
@@ -311,7 +312,7 @@ python lib/job_manifest.py update --job "<cover_job>" --patch-file patch.json `
 
 # 校验
 python lib/job_manifest.py validate --job "<cover_job>"
-python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先补算豆包侧写为 null 的 hash 再校验
+python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先修复 gate/selected 非法形态并补算 null hash 再校验
 ```
 
 并发保护：同一任务同一时间只允许一个阶段写；如需并行，先加 `cover_job/.lock` 并在写完删除。

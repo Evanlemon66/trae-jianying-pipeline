@@ -1101,13 +1101,8 @@ def record_video(job_dir: str, *, export_dir: Optional[str] = None,
     return update_job(job_dir, patch, event="video_recorded", detail=detail)
 
 
-def backfill_hashes(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
-    """补算无执行环境宿主（豆包）写为 null 的 hash 字段。
-
-    覆盖：input.reference_sha256、titles.prompt_sha256、cover_map[].image_sha256、
-    vertical_cover.image_sha256。仅当字段为 None 且对应文件存在时补算。
-    """
-    job = load_job(os.path.join(job_dir, "job.json"))
+def _backfill_hashes_inplace(job: dict[str, Any], job_dir: str) -> list[str]:
+    """在内存 job 上原位补算 null hash，返回补算字段列表（不落盘）。"""
     filled: list[str] = []
 
     def _fill(container: dict[str, Any], path_key: str, hash_key: str, label: str) -> None:
@@ -1126,6 +1121,17 @@ def backfill_hashes(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
         _fill(item, "image", "image_sha256", f"cover_map[{item.get('slot')}].image_sha256")
     _fill(job.setdefault("vertical_cover", {}), "image", "image_sha256",
           "vertical_cover.image_sha256")
+    return filled
+
+
+def backfill_hashes(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
+    """补算无执行环境宿主（豆包）写为 null 的 hash 字段。
+
+    覆盖：input.reference_sha256、titles.prompt_sha256、cover_map[].image_sha256、
+    vertical_cover.image_sha256。仅当字段为 None 且对应文件存在时补算。
+    """
+    job = load_job(os.path.join(job_dir, "job.json"))
+    filled = _backfill_hashes_inplace(job, job_dir)
 
     if dry_run or not filled:
         return {"dry_run": dry_run, "filled": filled, "changed": bool(filled)}
@@ -1141,6 +1147,104 @@ def backfill_hashes(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
     save_job(job, job_dir)
     return {"dry_run": False, "filled": filled, "changed": True,
             "revision": job["revision"]}
+
+
+GATE_ENUM = ("pending", "done")
+
+
+def _selected_shape_desc(entries: list[Any]) -> str:
+    """描述 selected 旧形态，用于修复报告（如：字符串数组 3 条 ['T3','T5','T12']）。"""
+    if not entries:
+        return "空数组"
+    kinds: list[str] = []
+    for e in entries:
+        k = "对象" if isinstance(e, dict) else (
+            "字符串" if isinstance(e, str) else (
+                "数字" if isinstance(e, int) else type(e).__name__))
+        if k not in kinds:
+            kinds.append(k)
+    desc = "/".join(kinds) + f"数组 {len(entries)} 条"
+    if len(entries) <= 3 and all(isinstance(e, (str, int)) for e in entries):
+        desc += f" {entries}"
+    return desc
+
+
+def fix_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
+    """validate --fix：规范化常见不合规字段后校验写盘。
+
+    修复范围（不动其它字段）：
+      1. titles.selected：字符串/数字/纯文本/缺字段对象 → [{slot,title_id,title}]
+         （复用 _normalize_selected；title 文本取不到则留 None 并告警）；
+      2. titles.gate：非枚举值（如 "selected"）→ selected 齐 3 条归 done，
+         不足 3 条归 pending（不完整 selected 与 pending 不自洽，一并清空）；
+      3. hash 字段：null 且文件存在 → 补算（同 backfill_hashes）。
+
+    单一写者纪律：所有修改经 validate_job 通过后由 save_job 一次写盘，
+    revision+1 并记一条 history（event=validate_fix）；无可修复项则完全不写盘。
+    注意：gate 为合法枚举但内容不自洽（如 gate=done 而 selected 不足 3 条）
+    不在修复范围，由最终校验报出，人工处理。
+    """
+    job = load_job(os.path.join(job_dir, "job.json"))
+    fixes: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    titles = job.setdefault("titles", {})
+    old_sel = list(titles.get("selected") or [])
+    old_gate = titles.get("gate")
+
+    if old_gate not in GATE_ENUM and len(old_sel) != 3:
+        # 非枚举 gate + 不完整 selected → 归 pending；不完整 selected 与
+        # pending 不自洽（validate 要求空或 3 项），一并清空
+        if old_sel:
+            fixes.append({"field": "titles.selected",
+                          "old": _selected_shape_desc(old_sel), "new": "空数组",
+                          "reason": f"仅 {len(old_sel)} 条，pending 门禁下不保留"})
+            titles["selected"] = []
+        fixes.append({"field": "titles.gate", "old": repr(old_gate), "new": "pending",
+                      "reason": f"非枚举值；selected 不足 3 条（{len(old_sel)}）→ pending"})
+        titles["gate"] = "pending"
+    else:
+        # 齐 3 条（或 gate 已是合法枚举）：只做 selected 形态规范化
+        if old_sel:
+            new_sel, notes = _normalize_selected(job_dir, titles.get("file"), old_sel)
+            if new_sel != old_sel:
+                fixes.append({
+                    "field": "titles.selected",
+                    "old": _selected_shape_desc(old_sel),
+                    "new": f"{len(new_sel)} 个对象 {{slot,title_id,title}}",
+                    "reason": "；".join(notes) if notes else "形态规范化"})
+                titles["selected"] = new_sel
+        if old_gate not in GATE_ENUM:  # 此处必然是齐 3 条
+            fixes.append({"field": "titles.gate", "old": repr(old_gate), "new": "done",
+                          "reason": "非枚举值；selected 齐 3 条 → done"})
+            titles["gate"] = "done"
+
+    for i, e in enumerate(titles.get("selected") or []):
+        if isinstance(e, dict) and e.get("title") is None:
+            warnings.append(f"selected[{i}]（{e.get('title_id')}）title 文本未取到，留空")
+
+    # 3) hash 补算
+    for label in _backfill_hashes_inplace(job, job_dir):
+        fixes.append({"field": label, "old": "null", "new": "已补算",
+                      "reason": "文件存在且 hash 为空"})
+
+    if not fixes:
+        return {"changed": False, "fixes": [], "warnings": warnings, "fixed": 0}
+    if dry_run:
+        return {"changed": True, "dry_run": True, "fixes": fixes,
+                "warnings": warnings, "fixed": len(fixes)}
+
+    job["revision"] = job.get("revision", 0) + 1
+    detail = "；".join(f"{x['field']}: {x['old']} → {x['new']}" for x in fixes)
+    job.setdefault("history", []).append({
+        "revision": job["revision"], "event": "validate_fix",
+        "detail": detail, "at": now_iso()})
+    errors = validate_job(job, job_dir)
+    if errors:
+        raise ValueError("修复后校验失败: " + "; ".join(errors))
+    save_job(job, job_dir)
+    return {"changed": True, "fixes": fixes, "warnings": warnings,
+            "fixed": len(fixes), "revision": job["revision"]}
 
 
 # 平台派生规格（契约 §6：derived 放平台用图；尺寸为建议值，核实后更新）
@@ -1659,7 +1763,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     p_val = sub.add_parser("validate", help="校验现有 job.json")
     p_val.add_argument("--job", required=True)
     p_val.add_argument("--fix", action="store_true",
-                       help="先补算 null 的 hash 字段再校验（豆包交接回 Trae 时用）")
+                       help="先修复常见不合规字段（gate/selected 规范化、补算 null hash）再校验")
 
     p_upd = sub.add_parser("update", help="深合并补丁并推进 stage")
     p_upd.add_argument("--job", required=True)
@@ -1723,15 +1827,16 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.command == "validate":
         if args.fix:
             try:
-                result = backfill_hashes(job_dir)
+                result = fix_job(job_dir)
             except ValueError as e:
                 print(f"[FAIL] {e}")
                 return 1
-            if result["filled"]:
-                print(f"[OK] 补算 {len(result['filled'])} 个 hash: "
-                      + ", ".join(result["filled"]))
-            else:
-                print("[OK] 无需补算的 hash")
+            for item in result["fixes"]:
+                reason = f"（{item['reason']}）" if item.get("reason") else ""
+                print(f"[fix] {item['field']}: {item['old']} → {item['new']}{reason}")
+            for w in result["warnings"]:
+                print(f"[warn] {w}")
+            print(f"fixed: {result['fixed']}")
         job = load_job(os.path.join(job_dir, "job.json"))
         errors = validate_job(job, job_dir)
         if errors:
