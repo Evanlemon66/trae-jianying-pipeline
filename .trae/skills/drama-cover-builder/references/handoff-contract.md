@@ -39,13 +39,13 @@ D:\短剧\<剧名>\
     └── 06_publish\
         ├── youtube.json
         ├── tiktok.json
-        └── receipts\
+        └── receipts\                  # 占位目录：由 prepare 预建，内容由 Stage 3 写入；缺失不阻断前序阶段（见 §8）
 ```
 
 规则：
 
 - `--out` 可覆盖默认目录；未传时：有 `--series-dir` → `<剧集目录>/cover_job`，否则 `./jobs/<剧名>`。
-- 目录由 `prepare` 一次建全，后续阶段**只写自己的子目录**。
+- 目录由 `prepare` 一次建全（含占位目录 `06_publish/receipts`），后续阶段**只写自己的子目录**。占位目录允许为空；`06_publish/receipts` 缺失**不阻断前序阶段**，只在 `publish_ready` / `published` 校验时要求存在（见 §8）。
 - 所有路径写入 `job.json` 时使用相对任务目录的正斜杠路径，例如 `../封面.png`。
 - 文件名一律 ASCII；剧名、标题只存在于 `job.json` 和 md 文件里。
 
@@ -411,4 +411,4 @@ edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读�
 | Stage 1.5 | `03_prompts/` | `prompts.json` / `prompts.md` | 4 条出图提示词，豆包/火山/Trae 三渠道共用 |
 | Stage 2 | `04_covers/` | 3 横版 + 1 竖版 + `derived/` | 平台用图；derived 放 YouTube 16:9 等派生尺寸 |
 | pipeline | 只写 `job.json` | `video.export_dir/export_file/draft_name/companions` | 只记录导出位置（允许绝对路径），不复制 mp4；`05_video/` 留作需要副本时的可选目录 |
-| Stage 3 | `06_publish/` | `<platform>.json` + `receipts/` | 每平台状态与回执，驱动 `cleanup` 判定 |
+| Stage 3 | `06_publish/` | `<platform>.json` + `receipts/` | 每平台状态与回执，驱动 `cleanup` 判定；`receipts/` 由 `prepare` 预建占位，内容（回执）只在 Stage 3 首次写入时落盘，缺失不阻断前序阶段 |

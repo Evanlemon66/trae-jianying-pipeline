@@ -22,15 +22,24 @@ from typing import Any, Optional
 
 SCHEMA_VERSION = "1.1"
 
-JOB_DIRS = (
+# 全阶段必需目录（prepared 起就必须存在）
+BASE_DIRS = (
     "01_input",
     "02_titles",
     "03_prompts",
     "04_covers",
     "05_video",
     "06_publish",
+)
+
+# 发布阶段目录：prepare 仍预建作占位（契约 §1「一次建全」），
+# 但校验只在 publish_ready / published 阶段要求存在——缺失不阻断前序阶段。
+PUBLISH_DIRS = (
     "06_publish/receipts",
 )
+
+# prepare 建剧时预建的完整目录集（含发布阶段占位目录）
+JOB_DIRS = BASE_DIRS + PUBLISH_DIRS
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 EXCLUDE_TOKENS = ("draft_cover", "best_frame", "监审", "monitor", "提示词", "prompt")
@@ -475,9 +484,15 @@ def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str
             errors.append(f"cleanup.external 状态非法: {ext.get('status')}")
 
     if job_dir:
-        for rel in JOB_DIRS:
+        # 基础目录：任何阶段都必须存在
+        for rel in BASE_DIRS:
             if not os.path.isdir(os.path.join(job_dir, rel)):
                 errors.append(f"缺少目录: {rel}")
+        # 发布目录：只有进入发布阶段才要求（covers_ready 等前序阶段允许缺失）
+        if job.get("stage") in ("publish_ready", "published"):
+            for rel in PUBLISH_DIRS:
+                if not os.path.isdir(os.path.join(job_dir, rel)):
+                    errors.append(f"缺少目录: {rel}")
         synopsis = (job.get("input") or {}).get("synopsis")
         if not synopsis or not os.path.isfile(os.path.join(job_dir, synopsis)):
             errors.append("简介文件不存在")

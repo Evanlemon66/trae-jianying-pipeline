@@ -73,7 +73,7 @@ python scripts/drama_cover.py prepare --series-dir "D:\短剧\重生八零，打
 | 规则 | 说明 |
 | --- | --- |
 | 默认目录 | `<剧集目录>/cover_job`；`--out` 可覆盖 |
-| 目录一次建全 | `01_input` / `02_titles` / `03_prompts` / `04_covers` / `05_video` / `06_publish` |
+| 目录一次建全 | `01_input` / `02_titles` / `03_prompts` / `04_covers` / `05_video` / `06_publish` / `06_publish/receipts`（receipts 为占位目录，Stage 3 才写内容，缺失不阻断前序阶段） |
 | 自动找输入 | 简介按 `简介.txt → synopsis.txt → 详细简介.txt`；参考图按契约 §5；mp4 唯一时才记 `video.path`，多个则只记数量与命名规律 |
 | 简介只认原文 | 写入 `01_input/synopsis.txt`，Stage 1 只从这里读，不沿用聊天里的改写版 |
 | 参考图只复制 | 复制为 `01_input/reference.*`，并记 `reference_original` 与 `reference_sha256`，原图不动；找不到也继续建目录 |

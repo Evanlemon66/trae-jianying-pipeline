@@ -75,15 +75,15 @@ check("闸门拦截硬失败", "硬失败" in (eds.gate(jd) or ""), eds.gate(jd)
 print("\n== ④ 缺目录自动补齐、不占额度、立即重试 ==")
 jd = fresh("自愈")
 eds.begin(jd)  # 模拟一次 edit 尝试
-err = "ingest 后校验失败: 缺少目录: 06_publish/receipts"
-check("解析出缺失目录", cw._parse_missing_dirs(err) == ["06_publish/receipts"])
+err = "ingest 后校验失败: 缺少目录: 05_video"
+check("解析出缺失目录", cw._parse_missing_dirs(err) == ["05_video"])
 check("越界路径被过滤", cw._parse_missing_dirs("缺少目录: ../evil") == [])
 check("首次自愈成功", cw._try_heal_missing_dirs(jd, err, "自愈") is True)
-check("目录已补齐", os.path.isdir(os.path.join(jd, "06_publish", "receipts")))
+check("目录已补齐", os.path.isdir(os.path.join(jd, "05_video")))
 st = eds.load(jd)
 check("不递增失败计数", st["consecutive_failures"] == 0, st)
 check("状态回 pending（立即可重试）", st["status"] == "pending", st)
-check("healed_dirs 已记录", st["healed_dirs"] == ["06_publish/receipts"], st)
+check("healed_dirs 已记录", st["healed_dirs"] == ["05_video"], st)
 check("自愈日志已写", "已自动补齐缺失目录" in
       open(os.path.join(jd, "watcher.log"), encoding="utf-8").read())
 check("闸门放行（立即重试）", eds.gate(jd) is None, eds.gate(jd))
