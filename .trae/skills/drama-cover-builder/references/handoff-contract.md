@@ -233,13 +233,29 @@ Stage 2 的标准取数入口是 `resolve`（一条命令返回标题 + 参考�
 {"tool": "pipeline/stream_manifest.py",
  "draft_name": "重生八零，打猎卖货养妻女_第01-80集串流",
  "manifest": "pipeline/_stream_manifests/<名>.json",
- "command": "python pipeline/stream_manifest.py clean \"<draft_name>\"",
- "scope": ["export_bundle(mp4+封面+progress)", "draft_dir", "jycache_dir", "workdir"],
+ "command": "python pipeline/stream_manifest.py clean --job \"<draft_name>\" [--dry-run] [--require-receipts] [--include-drafts]",
+ "scope": ["jycache_dir", "workdir", "export_bundle(mp4+封面+progress)", "draft_dir(仅 --include-drafts)"],
  "deletes_final_mp4": true,
  "status": "pending"}
 ```
 
-⚠️ `stream_manifest.py clean` 会**连同最终 mp4 一起删除**（`deletes_final_mp4: true`）。所以：cover_job 的 `cleanup.eligible` 只管任务目录内部残留；外部 pipeline 残留是否清理由用户单独决定，执行后把 `external[].status` 改为 `done`，永不自动执行。
+⚠️ `stream_manifest.py clean` 默认会**连同最终 mp4 一起删除**（`deletes_final_mp4: true`）。所以：cover_job 的 `cleanup.eligible` 只管任务目录内部残留；外部 pipeline 残留是否清理由用户单独决定，执行后把 `external[].status` 改为 `done`，永不自动执行。
+
+### `stream_manifest.py clean` 开关（默认信任"已发布"）
+
+发布流程尚未自动化，`clean` 默认**信任"用户让清理＝已发布"**：
+
+| 开关 | 默认 | 语义 |
+| --- | --- | --- |
+| （无参） | 开 | 依次清理 `__jycache__` → `_work_*` → 导出成品目录（mp4 + `-封面.jpg` + `.progress.json` 整体）；**不删 C 盘剪映草稿** |
+| `--job "<草稿名>"` / `--all` | 单剧 | 只清一部 / 遍历所有记录 |
+| `--dry-run` | 关 | 只打印「将删路径 + 各自大小 + 合计」，**零删除、不改记录** |
+| `--require-receipts` | 关 | 严格模式：必须有成功回执（`06_publish/receipts/` 内文件，或 `06_publish/<platform>.json` 标 `published` 且 `url`/`video_id` 非空），否则整剧跳过并列入"跳过清单" |
+| `--include-drafts` | 关 | 额外删除 C 盘剪映草稿目录（唯一可再导出入口，删后只能重跑 pipeline） |
+
+- 删除顺序：中间产物（jycache、workdir）→ 成品 →（可选）草稿；缺失项跳过并记录。
+- 保护区断言（命中即跳过并告警）：等于/包含 `<series_dir>` 源目录、位于 `_broken`、位于 `cover_job`、`s2.mp4`/`s3.mp4`/`ss.mp4`、`pipeline/_work` 旧状态目录；`.stream_manifests` 记录本身永不删除。
+- ⚠️ **风险**：默认行为会删除成品 mp4 与整个导出目录，**不可恢复**；只想清中间产物时先用 `--dry-run` 核对清单（"只清中间产物"的独立开关尚未提供）。
 
 ## 7. 写入与校验
 
