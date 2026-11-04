@@ -261,6 +261,8 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 
 手工发布回执（不手写 job.json）：`python lib/job_manifest.py publish-record --job "<cover_job>" --platform youtube --video-id "<id>" --url "<url>"`，自动写 `06_publish/<platform>.json` + `receipts/<platform>-<时间戳>.json` 并补齐 `job.json.publish`；同平台同 `video_id` 重复登记自动跳过。
 
+`job.json.video.export_state` 记录成品生命周期（`null`/`exported`/`cleaned`）：`record_video` 置 `exported`，clean 真正删成品后自动置 `cleaned`（`--dry-run`/`--intermediates-only` 不回写），不改 `stage`。
+
 剪映草稿封面写入（`draft_cover.jpg` + 原生 composition）已下沉为共享库 `lib/jy_cover.py`，由 pipeline 在导出链路调用，**不属于本 skill**：
 
 ```python

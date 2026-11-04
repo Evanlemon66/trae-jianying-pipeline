@@ -18,6 +18,7 @@
   --require-receipts 严格模式：必须有成功回执（06_publish/receipts 或 platform json 标 published+url/id），否则整剧跳过。
   --intermediates-only 只清 ① __jycache__ ② _work_*，成品目录与草稿一律不动（不受 include_drafts 影响）。
   --dry-run 只打印计划与大小，不做任何删除、不改 manifest。
+  真正删除导出成品后，回写该剧 job.json 的 video.export_state="cleaned"（dry-run / --intermediates-only 不写）。
 
 安全约束：绝不清理 source_dir（用户源视频目录本体）；保护区（_broken / cover_job / s2·s3·ss.mp4 /
 pipeline/_work 旧状态文件）命中即跳过；manifest 记录本身永不删除。
@@ -221,6 +222,30 @@ def _plan(paths, draft_name, include_drafts, intermediates_only=False):
     return items
 
 
+def _mark_export_cleaned(source_dir, deleted):
+    """成品目录真正删除后回写 job.json.video.export_state=cleaned（失败只告警）。"""
+    if not source_dir:
+        print("  [warn] 记录无 source_dir，未回写 job.json")
+        return
+    job_dir = os.path.join(source_dir, "cover_job")
+    if not os.path.isfile(os.path.join(job_dir, "job.json")):
+        print(f"  [skip] 无 job.json，未回写: {job_dir}")
+        return
+    total = sum(s for _, s in deleted)
+    detail = "成品目录已被 clean 删除，路径：" + "；".join(p for p, _ in deleted) \
+             + f"（释放 {_fmt(total)}）"
+    try:
+        lib = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        import job_manifest as jm
+        job = jm.update_job(job_dir, {"video": {"export_state": "cleaned"}},
+                            event="export_cleaned", detail=detail)
+        print(f"  [回写] job.json video.export_state=cleaned revision={job['revision']}")
+    except (ValueError, OSError, ImportError) as e:
+        print(f"  [warn] 回写 job.json 失败（不影响已完成的删除）: {e}")
+
+
 def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=False,
           intermediates_only=False):
     """清理一部剧的串流残留。默认信任"已发布"，不删草稿（除非 include_drafts）。
@@ -267,6 +292,7 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
         print("  （dry-run：未执行任何删除，记录未改动）")
     else:
         print("  （非 dry-run：即将实际删除，可先用 --dry-run 复核）")
+        cleaned = []
         for label, kind, p, size in ready:
             if os.path.isdir(p):
                 shutil.rmtree(p, ignore_errors=True)
@@ -278,8 +304,12 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
                     continue
             if not os.path.exists(p):
                 print(f"  [已删] {label}: {p} ({_fmt(size)})")
+                if kind == "export_bundle" or (kind == "export_file" and label == "export_file"):
+                    cleaned.append((p, size))
             else:
                 print(f"  [失败] {label}: {p}")
+        if cleaned:
+            _mark_export_cleaned(source_dir, cleaned)
     # source_dir 只提示，永不清理；manifest 记录本身也永不删除
     if source_dir:
         print(f"  （源视频目录保留不动: {source_dir}）")

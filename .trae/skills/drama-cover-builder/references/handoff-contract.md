@@ -95,6 +95,7 @@ D:\短剧\<剧名>\
 | `video.export_file` | string \| null | 最终成品 mp4 完整路径 |
 | `video.draft_name` | string \| null | 串流草稿名，关联 `pipeline/_stream_manifests/<名>.json` |
 | `video.companions` | array | 成品旁的脚本产物（`.progress.json`、`-封面.jpg`） |
+| `video.export_state` | string \| null | 成品生命周期：`null`=从未导出 / `exported`=已导出且成品在 / `cleaned`=导出过但成品已被清理。写入者：`record_video` 置 `exported`，`stream_manifest.py clean` 真正删除成品后置 `cleaned`（`--dry-run` / `--intermediates-only` 不写）。只记录状态，不改变 `stage` 与 `video.status` |
 | `workflow.mode` | string | `full`（剪辑+导出，默认）/ `edit_only`（只剪辑停在草稿） |
 | `workflow.cut_s` | number \| null | 开头裁剪秒数（正数；`0`/null=不裁）；优先级高于 `video.cut_s` |
 | `workflow.derive` | array | 派生平台列表（`[]`=不派生）；支持 `all`/别名 `ig`、`facebook` |
@@ -271,6 +272,7 @@ python lib/job_manifest.py publish-record --job "<cover_job>" `
 
 - 删除顺序：中间产物（jycache、workdir）→ 成品 →（可选）草稿；缺失项跳过并记录。
 - 保护区断言（命中即跳过并告警）：等于/包含 `<series_dir>` 源目录、位于 `_broken`、位于 `cover_job`、`s2.mp4`/`s3.mp4`/`ss.mp4`、`pipeline/_work` 旧状态目录；`.stream_manifests` 记录本身永不删除。
+- 成品真正删除后回写该剧 `job.json`：`video.export_state=cleaned`（`revision+1`，history 记 `export_cleaned`，detail 含路径与释放大小）；无 job.json 时跳过并记录。`--dry-run` 与 `--intermediates-only` 不回写。
 - ⚠️ **风险**：默认行为会删除成品 mp4 与整个导出目录，**不可恢复**；只想清中间产物时用 `--intermediates-only`（成品与草稿都保留），或先 `--dry-run` 核对清单。
 
 ## 7. 写入与校验
@@ -442,5 +444,5 @@ edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读�
 | 门禁 | 只写 `job.json` + 标注 `titles.json` | `titles.selected`、`selected_by`、`cover_map` 回填；`titles.json` 选中条加 `selected/slot`、顶层记 `gate/selected_at/selected_by` | 最终选定结果只此两处（job.json 为事实源，titles.json 原位标注不复制文本） |
 | Stage 1.5 | `03_prompts/` | `prompts.json` / `prompts.md` | 4 条出图提示词，豆包/火山/Trae 三渠道共用 |
 | Stage 2 | `04_covers/` | 3 横版 + 1 竖版 + `derived/` | 平台用图；derived 放 YouTube 16:9 等派生尺寸 |
-| pipeline | 只写 `job.json` | `video.export_dir/export_file/draft_name/companions` | 只记录导出位置（允许绝对路径），不复制 mp4；`05_video/` 留作需要副本时的可选目录 |
+| pipeline | 只写 `job.json` | `video.export_dir/export_file/draft_name/companions/export_state` | 只记录导出位置（允许绝对路径），不复制 mp4；`05_video/` 留作需要副本时的可选目录。`record_video` 置 `export_state=exported`；`stream_manifest.py clean` 真正删除成品后置 `cleaned`（history 记 `export_cleaned`） |
 | Stage 3 | `06_publish/` | `<platform>.json` + `receipts/` | 每平台状态与回执，驱动 `cleanup` 判定；`receipts/` 由 `prepare` 预建占位，内容（回执）只在 Stage 3 首次写入时落盘，缺失不阻断前序阶段 |

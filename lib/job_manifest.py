@@ -310,6 +310,7 @@ def build_job(series: str, *, host: str = "trae") -> dict[str, Any]:
                   "name_pattern": None, "duration_s": None, "cut_s": None,
                   "cover": None,
                   "export_dir": None, "export_file": None, "draft_name": None,
+                  "export_state": None,
                   "companions": []},
         "workflow": copy.deepcopy(WORKFLOW_DEFAULTS),
         "publish": {"status": "not_ready", "idempotency_key": None,
@@ -455,6 +456,9 @@ def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str
         errors.append("video.path 应为 mp4")
     if not isinstance(video.get("candidates_count", 0), int):
         errors.append("video.candidates_count 应为整数")
+    if video.get("export_state") not in (None, "exported", "cleaned"):
+        errors.append(f"video.export_state 非法: {video.get('export_state')}"
+                      "（只允许 null / exported / cleaned）")
     cut = video.get("cut_s")
     if cut is not None:
         dur = video.get("duration_s")
@@ -1084,6 +1088,7 @@ def record_video(job_dir: str, *, export_dir: Optional[str] = None,
         "export_dir": (export_dir or "").replace(os.sep, "/") or None,
         "export_file": (export_file or "").replace(os.sep, "/") or None,
         "draft_name": draft_name,
+        "export_state": "exported",
         "companions": [p.replace(os.sep, "/") for p in companions],
     }}
 

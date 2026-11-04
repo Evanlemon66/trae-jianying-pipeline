@@ -1,27 +1,23 @@
 # -*- coding: utf-8 -*-
-"""回归用例：导出状态机单一真源 cover_job/.export_state.json（lib/export_state.py）。
+"""回归用例：video.export_state（null / exported / cleaned）写入与回写。
 
 覆盖：
-  ① 初始 pending
-  ② 首次失败 → retrying + 退避时间
-  ③ 连续失败到阈值 → paused
-  ④ 成功 → done 且计数清零
-  ⑤ exporting 心跳超时 → stale 回收
-  ⑥ 旧文件迁移三种组合（paused / retrying / done）
-  ⑦ 重复写幂等
-  ⑧ 暂停状态下 plan 被拦、--phase export 放行
+  ① clean 真正删除成品后回写 cleaned（revision+1、history=export_cleaned）
+  ② --dry-run 不回写
+  ③ --intermediates-only 不回写（成品未删）
+  ④ record_video 置 exported
+  ⑤ validate 接受三值、拒绝非法值
+  ⑥ 无 job.json 时 clean 照常删除，回写链接跳过并记录
 
-运行：python tests\\test_export_state.py（无第三方依赖，不真导出）
+运行：python tests\\test_export_state.py（纯临时目录，不碰真实剧）
 """
-import json, os, shutil, sys, tempfile, time
+import contextlib, io, json, os, shutil, sys, tempfile
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "lib"))
 sys.path.insert(0, os.path.join(_ROOT, "pipeline"))
-import export_state as es  # noqa: E402
-import cover_watch as cw   # noqa: E402
-
-cw.toast = lambda *a, **k: None  # 用例里不打桌面通知
+import job_manifest as jm  # noqa: E402
+import stream_manifest as sm  # noqa: E402
 
 fails = []
 
@@ -32,138 +28,132 @@ def check(name, cond, extra=""):
         fails.append(name)
 
 
-def fresh(name):
-    d = os.path.join(TMP, name, "cover_job")
-    os.makedirs(d, exist_ok=True)
-    return d
+def run_clean(name, **kw):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = sm.clean(name, **kw)
+    return rc, buf.getvalue()
 
 
 TMP = os.path.join(tempfile.gettempdir(), "export_state_test")
 shutil.rmtree(TMP, ignore_errors=True)
+os.makedirs(TMP)
+sm.MANIFEST_DIR = os.path.join(TMP, "manifests")
 
-print("\n== ① 初始 pending ==")
-jd = fresh("初始")
-st = es.load(jd)
-check("无真源无旧数据 → pending", st["status"] == "pending", st)
-check("落盘了 .export_state.json", os.path.isfile(es.state_path(jd)))
-check("初始计数为 0", st["attempts"] == 0 and st["consecutive_failures"] == 0)
 
-print("\n== ② 首次失败 → retrying + 退避 ==")
-jd = fresh("首败")
-now = time.time()
-st = es.fail(jd, "boom", pause_after=5, now=now)
-check("status=retrying", st["status"] == "retrying", st)
-check("consecutive_failures=1", st["consecutive_failures"] == 1)
-check("退避≈60s", abs((st["next_retry_at"] - now) - 60) <= 2, st["next_retry_at"] - now)
-check("记录 last_error", st["last_error"] == "boom")
-check("闸门拦截（退避中）", (es.gate(jd) or "").startswith("导出失败退避中"))
+def make_series(name, *, with_job=True):
+    """源目录 + cover_job(+job.json) + jycache + workdir + 成品 bundle + 草稿。"""
+    src = os.path.join(TMP, name, "系列源目录")
+    os.makedirs(os.path.join(src, "cover_job"), exist_ok=True)
+    if with_job:
+        jd = os.path.join(src, "cover_job")
+        for rel in jm.JOB_DIRS:
+            os.makedirs(os.path.join(jd, *rel.split("/")), exist_ok=True)
+        with open(os.path.join(jd, "01_input", "synopsis.txt"), "w", encoding="utf-8") as f:
+            f.write("测试简介")
+        job = jm.build_job(name)
+        job["stage"] = "covers_ready"
+        jm.save_job(job, jd)
+    jy = os.path.join(src, "__jycache__")
+    os.makedirs(jy, exist_ok=True)
+    with open(os.path.join(jy, "a.bin"), "wb") as f:
+        f.write(b"x" * 4096)
+    work = os.path.join(TMP, f"pipeline/_work_{name}_deadbeef")
+    os.makedirs(work, exist_ok=True)
+    bundle = os.path.join(TMP, "L", name)
+    os.makedirs(bundle, exist_ok=True)
+    with open(os.path.join(bundle, f"{name}.mp4"), "wb") as f:
+        f.write(b"m" * 10240)
+    with open(os.path.join(bundle, f"{name}-封面.jpg"), "wb") as f:
+        f.write(b"c" * 1024)
+    with open(os.path.join(bundle, f"{name}.mp4.progress.json"), "w", encoding="utf-8") as f:
+        json.dump({"progress": 100}, f)
+    draft = os.path.join(TMP, "drafts", name)
+    os.makedirs(draft, exist_ok=True)
+    sm.record(name, source_dir=src, jycache_dir=jy, workdir=work,
+              export_file=os.path.join(bundle, f"{name}.mp4"), draft_dir=draft)
+    return {"src": src, "jd": os.path.join(src, "cover_job"), "jy": jy, "work": work,
+            "bundle": bundle, "draft": draft}
 
-print("\n== ③ 连续失败到阈值 → paused ==")
-jd = fresh("暂停")
-for i in range(4):
-    st = es.fail(jd, f"e{i}", pause_after=5)
-check("第 4 次仍 retrying", st["status"] == "retrying", st)
-st = es.fail(jd, "e5", pause_after=5)
-check("第 5 次触发 paused", st["status"] == "paused", st)
-check("paused 后 next_retry_at=0", st["next_retry_at"] == 0)
-check("闸门显示已暂停", "已暂停" in (es.gate(jd) or ""))
 
-print("\n== ④ 成功 → done 且计数清零 ==")
-st = es.succeed(jd)
-check("status=done", st["status"] == "done", st)
-check("计数清零", st["consecutive_failures"] == 0 and st["attempts"] == 0)
-check("progress=100", st["progress"] == 100)
-check("成功后闸门放行", es.gate(jd) is None)
+def read_job(jd):
+    return jm.load_job(os.path.join(jd, "job.json"))
 
-print("\n== ⑤ exporting 心跳超时 → stale 回收 ==")
-jd = fresh("崩溃回收")
-now = time.time()
-es.begin(jd, phase="export", now=now)
-check("begin 后 status=exporting", es.load(jd)["status"] == "exporting")
-# 心跳新鲜（刚 begin）→ 不回收
-check("心跳新鲜不回收", es.reap_stale(jd, progress_mtime=0.0, now=now + 10) is False)
-# 心跳超时（>180s）且无 progress → 回收
-check("心跳超时回收", es.reap_stale(jd, progress_mtime=0.0, now=now + 400) is True)
-check("回收后 status=retrying", es.load(jd)["status"] == "retrying")
-# progress_mtime 新鲜 → 即便 heartbeat 旧也不回收（子进程仍在写盘）
-jd2 = fresh("子进程仍活")
-es.begin(jd2, phase="export", now=now)
-check("progress 新鲜不回收",
-      es.reap_stale(jd2, progress_mtime=now + 390, now=now + 400) is False)
 
-print("\n== ⑥ 旧文件迁移三种组合 ==")
-# A: .export_retry.json paused=true → paused（且备份）
-jd = fresh("迁移A")
-with open(os.path.join(jd, es.LEGACY_RETRY_NAME), "w", encoding="utf-8") as f:
-    json.dump({"fails": 6, "paused": True, "next_ts": 0}, f)
-st = es.load(jd, migrate_ctx={"video_status": None, "stage": "covers_ready"})
-check("A 旧 paused → paused", st["status"] == "paused", st)
-check("A 继承失败计数", st["consecutive_failures"] == 6)
-check("A 备份 .bak 已生成", os.path.isfile(os.path.join(jd, es.LEGACY_RETRY_NAME + ".bak")))
-# B: fails>0 未暂停 → retrying（带计数与退避点）
-jd = fresh("迁移B")
-future = time.time() + 500
-with open(os.path.join(jd, es.LEGACY_RETRY_NAME), "w", encoding="utf-8") as f:
-    json.dump({"fails": 3, "paused": False, "next_ts": future}, f)
-st = es.load(jd, migrate_ctx={"video_status": None, "stage": "covers_ready"})
-check("B 旧 fails → retrying", st["status"] == "retrying", st)
-check("B 继承计数=3", st["consecutive_failures"] == 3)
-check("B 继承退避点", abs(st["next_retry_at"] - future) <= 2)
-# C: job video.status=done / stage=video_ready → done（最高优先，不回退）
-jd = fresh("迁移C")
-with open(os.path.join(jd, es.LEGACY_RETRY_NAME), "w", encoding="utf-8") as f:
-    json.dump({"fails": 2, "paused": False, "next_ts": 0}, f)  # 即便有失败记录
-st = es.load(jd, migrate_ctx={"video_status": "done", "stage": "video_ready"})
-check("C 已导出 → done（压过失败记录）", st["status"] == "done", st)
+print("\n== ① clean 删成品后回写 cleaned ==")
+p = make_series("esA")
+rev0 = read_job(p["jd"])["revision"]
+check("初始 export_state=null", read_job(p["jd"])["video"]["export_state"] is None)
+rc, out = run_clean("esA")
+check("返回 0", rc == 0, rc)
+check("成品已删", not os.path.exists(p["bundle"]))
+job = read_job(p["jd"])
+check("export_state=cleaned", job["video"]["export_state"] == "cleaned", job["video"])
+check("revision +1", job["revision"] == rev0 + 1, (rev0, job["revision"]))
+check("history 事件名", job["history"][-1]["event"] == "export_cleaned", job["history"][-1])
+check("detail 含路径与释放大小",
+      p["bundle"] in job["history"][-1]["detail"] and "释放" in job["history"][-1]["detail"],
+      job["history"][-1]["detail"])
+check("输出含回写行", "[回写]" in out, out)
+check("stage 未被改动", job["stage"] == "covers_ready", job["stage"])
 
-print("\n== ⑦ 重复写幂等 ==")
-jd = fresh("幂等")
-es.begin(jd, phase="export")
-a1 = es.load(jd)["attempts"]
-es.begin(jd, phase="export")  # 已在 exporting，不应重复计次
-a2 = es.load(jd)["attempts"]
-check("重复 begin 不重复计次", a1 == a2 == 1, f"a1={a1} a2={a2}")
-es.succeed(jd)
-snap1 = open(es.state_path(jd), encoding="utf-8").read()
-es.succeed(jd)  # 幂等
-snap2 = open(es.state_path(jd), encoding="utf-8").read()
-st = es.load(jd)
-check("重复 succeed 仍 done 且计数 0", st["status"] == "done" and st["attempts"] == 0)
-check("重复 succeed 内容不变", snap1 == snap2)
+print("\n== ② dry-run 不回写 ==")
+p = make_series("esB")
+rev0 = read_job(p["jd"])["revision"]
+rc, out = run_clean("esB", dry_run=True)
+check("返回 0", rc == 0, rc)
+check("成品仍在", os.path.exists(p["bundle"]))
+job = read_job(p["jd"])
+check("export_state 仍 null", job["video"]["export_state"] is None, job["video"])
+check("revision 不变", job["revision"] == rev0, (rev0, job["revision"]))
+check("输出无回写行", "[回写]" not in out, out)
 
-print("\n== ⑧ 暂停状态 plan 被拦 / --phase export 放行 ==")
-jd = fresh("计划门禁")
-for i in range(5):
-    es.fail(jd, f"e{i}", pause_after=5)  # → paused
-cw.find_stream_draft = lambda _name: os.path.join("D:", "fake", "测试剧串流")
-job = {"workflow": {"mode": "full", "cut_s": None, "derive": []},
-       "video": {}, "stage": "covers_ready"}
-plan_blocked = cw.build_plan(jd, job, {"cold_start": False}, pending_edit=0)
-check("paused 时 plan 被拦", plan_blocked["action"] == "blocked", plan_blocked["action"])
-check("拦截原因含已暂停", "已暂停" in plan_blocked["reason"], plan_blocked["reason"])
-plan_forced = cw.build_plan(jd, job, {"cold_start": False}, pending_edit=0,
-                            phase_override="export")
-check("--phase export 强制放行", plan_forced["action"] == "export", plan_forced["action"])
+print("\n== ③ --intermediates-only 不回写 ==")
+p = make_series("esC")
+rev0 = read_job(p["jd"])["revision"]
+rc, out = run_clean("esC", intermediates_only=True)
+check("返回 0", rc == 0, rc)
+check("jycache 已删", not os.path.exists(p["jy"]))
+check("workdir 已删", not os.path.exists(p["work"]))
+check("成品仍在", os.path.exists(p["bundle"]))
+job = read_job(p["jd"])
+check("export_state 仍 null", job["video"]["export_state"] is None, job["video"])
+check("revision 不变", job["revision"] == rev0, (rev0, job["revision"]))
+check("输出无回写行", "[回写]" not in out, out)
 
-print("\n== ⑨ record_recovery：sidecar 值 → 真源（唯一写者仍 export_state）==")
-jd = fresh("自愈记录")
-es.begin(jd, phase="export")  # 先有真源
-st = es.record_recovery(jd, "kill_restart")
-check("有值 → 写 last_recovery_action", st["last_recovery_action"] == "kill_restart", st)
-check("同时写 last_recovery_at", st["last_recovery_at"] is not None)
-check("无值(None) → 保持不写", es.record_recovery(jd, None)["last_recovery_action"] == "kill_restart")
-check("空串 → 保持不写", es.record_recovery(jd, "")["last_recovery_action"] == "kill_restart")
-snap1 = open(es.state_path(jd), encoding="utf-8").read()
-es.record_recovery(jd, "kill_restart")  # 幂等
-snap2 = open(es.state_path(jd), encoding="utf-8").read()
-check("重复写同一动作幂等（内容不变）", snap1 == snap2)
-check("不同动作覆盖（只留最近一次）",
-      es.record_recovery(jd, "dismiss_then_kill")["last_recovery_action"] == "dismiss_then_kill")
-jd_none = fresh("自愈无真源")
-check("真源不存在 → 不创建、返回 None",
-      es.record_recovery(jd_none, "kill_restart") is None
-      and not os.path.isfile(es.state_path(jd_none)))
+print("\n== ④ record_video 置 exported ==")
+p = make_series("esD")
+job = jm.record_video(p["jd"], export_dir=p["bundle"],
+                      export_file=os.path.join(p["bundle"], "esD.mp4"))
+check("export_state=exported", job["video"]["export_state"] == "exported", job["video"])
+check("video_ready", job["stage"] == "video_ready", job["stage"])
+check("export_file 已记录", job["video"]["export_file"].endswith("esD.mp4"), job["video"])
+check("history 事件名", job["history"][-1]["event"] == "video_recorded")
 
-shutil.rmtree(TMP, ignore_errors=True)
-print(f"\n{'='*40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
+print("\n== ⑤ validate 三值 ==")
+jd = os.path.join(TMP, "esE", "系列源目录", "cover_job")
+for rel in jm.JOB_DIRS:
+    os.makedirs(os.path.join(jd, *rel.split("/")), exist_ok=True)
+with open(os.path.join(jd, "01_input", "synopsis.txt"), "w", encoding="utf-8") as f:
+    f.write("测试简介")
+for value in (None, "exported", "cleaned"):
+    job = jm.build_job("esE")
+    job["stage"] = "video_ready"
+    job["video"]["export_state"] = value
+    check(f"接受 {value}", jm.validate_job(job, jd) == [], jm.validate_job(job, jd))
+job = jm.build_job("esE")
+job["stage"] = "video_ready"
+job["video"]["export_state"] = "bogus"
+errs = jm.validate_job(job, jd)
+check("拒绝非法值", any("video.export_state" in e for e in errs), errs)
+
+print("\n== ⑥ 无 job.json：照常删除、回写跳过并记录 ==")
+p = make_series("esF", with_job=False)
+rc, out = run_clean("esF")
+check("返回 0", rc == 0, rc)
+check("成品已删", not os.path.exists(p["bundle"]))
+check("输出含跳过原因", "无 job.json" in out, out)
+check("无回写行", "[回写]" not in out, out)
+
+print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
 sys.exit(1 if fails else 0)
