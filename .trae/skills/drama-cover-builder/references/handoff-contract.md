@@ -17,6 +17,7 @@ D:\短剧\<剧名>\
     ├── export_config.json              # 可选（旧版兼容）：导出偏好（cut_s / derive），见 §7
     ├── .export_state.json              # 运行态：导出状态机单一真源（进入导出闸门时 cover_watch 自动写，无需手工建），见 §7.1
     ├── .export_retry.json              # 运行态（旧版，仅迁移来源）：首次读真源时迁入 .export_state.json 并备份 .bak
+    ├── .edit_state.json                # 运行态：剪辑阶段失败退避/暂停状态机（首次 edit 闸门判定时自动写），见 §7.3
     ├── 01_input\
     │   ├── synopsis.txt
     │   └── reference.png
@@ -385,6 +386,20 @@ python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先修复 gate
 - **日志落点**：真实执行轮次（持续 watcher 与 `--once`）触发时写该剧 `cover_job/watcher.log`，内容含剧名、两来源值、最终采用值、优先级分支（rev=0 / rev>0）；同一对值不重复刷日志。
 - **去重持久化**：落盘在 `cover_job/.cut_conflict.json`（原子写），分 `logged` 与 `notified` 两个独立通道，各记 `wf_cut`/`ec_cut`/`at`。语义为「**值相比上次做过该动作发生变化才再做一次**」：同一对值重复出现（含进程重启）不重复写日志、不重复弹通知；任一值变了才各自再触发。分通道是为了让 `--once` 记日志不吞掉连续 watcher 的首轮通知。
 - 该文件仅是通知去重态，不是导出状态真源（真源仍为 `.export_state.json`，见 §7.1）。
+
+### 7.3 剪辑阶段状态机 `.edit_state.json`
+
+edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读这一份文件，与导出状态**互相独立**（剪辑失败不影响导出计数，反之亦然）。
+
+- **位置**：`<cover_job>/.edit_state.json`。运行态文件，首次 edit 闸门判定时自动创建，无需手工建。
+- **唯一写者**：`lib/edit_state.py`，且只由 `cover_watch` 的剪辑链路调用。`batch_runner`、`job_manifest` 都不写它；`stage` 等契约字段仍由 `job_manifest` 写，本文件不碰 `job.json`。
+- **状态**：`pending`（可剪辑）/ `editing`（batch_runner 执行中）/ `retrying`（退避窗口内）/ `paused`（连续失败暂停）/ `done`（草稿建成）/ `failed`（硬失败终态）。
+- **退避与暂停**：可重试失败按 1/2/4/8/16/30 分钟退避（与导出侧同一序列）；**连续 3 次**置 `paused` 并 toast（比导出侧的 5 次更早——剪辑失败多为数据问题，重试救不回来）。
+- **失败分类**：复用 `lib/failure_class.py`。`asset_missing` / `disk_full` 等不可重试类 → 直接 `failed` 终态、**不计数**、toast；其余按可重试走退避。
+- **可自愈失败（不占额度）**：「缺少目录: …」这类环境缺陷由 watcher 一次自动补齐标准目录（`job_manifest.JOB_DIRS` 模板），写 `watcher.log` 一行「已自动补齐缺失目录…不计入重试」，状态回 `pending` 下一轮立即重试；不递增 `consecutive_failures`、不进退避。同一目录只自愈一次（记录在 `healed_dirs`），补过仍缺按普通失败计数。
+- **闸门**：`build_plan` 的 edit 分支先过本闸门——`paused`/`failed`/退避窗口内 → 计划被挡并给出原因（格式与导出侧一致）；`--phase edit` 人工强制放行，**不清零**计数。`editing` 不拦截（watcher 串行 + `.watcher.lock` 已防并发，崩溃残留允许下一轮直接重试）。
+- **收尾**：剪辑成功 → `done` 并清零；之后无草稿才会再进 edit，届时重新计数。
+- **与 `.export_state.json` 的分工**：草稿建成前归本文件管，导出闸门之后归 §7.1 真源管；两文件同级并存、互不读写。
 
 ## 8. 各阶段产物与意义
 

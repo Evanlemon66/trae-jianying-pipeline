@@ -46,6 +46,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -55,6 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import job_manifest as jm  # noqa: E402
 import export_lock  # noqa: E402
 import export_state as es  # noqa: E402  # 导出状态机单一真源（.export_state.json）
+import edit_state as eds  # noqa: E402  # edit 阶段失败退避/暂停（.edit_state.json）
 import failure_class as fc  # noqa: E402  # 第 3 项：失败分类器 + 自愈策略表
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -525,6 +527,10 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
         return plan
 
     if draft is None:
+        g = eds.gate(job_dir, phase_override=phase_override)
+        if g:
+            plan.update(reason=g)
+            return plan
         plan.update(action="edit", reason="无串流草稿 → 剪辑阶段", cmd=_edit_cmd())
         return plan
     if wf.get("mode") == "edit_only":
@@ -615,21 +621,122 @@ def apply_export_config(job_dir: str) -> Optional[list[str]]:
 
 # ── 阶段执行 ──────────────────────────────────────────────
 
+# edit 阶段可自愈失败：validate_job 报「缺少目录: 06_publish/receipts」这类环境缺陷
+MISSING_DIR_RE = re.compile(r"缺少目录[:：]\s*([0-9A-Za-z_\-./\\]+)")
+
+
+def _parse_missing_dirs(error_text: str) -> list[str]:
+    """从错误文本提取「缺少目录: xxx」的相对目录列表（去重，过滤越界路径）。"""
+    out = []
+    for raw in MISSING_DIR_RE.findall(error_text or ""):
+        rel = raw.strip().strip("，；;,")
+        rel = rel.replace("\\", "/")
+        if not rel or rel.startswith("/") or ".." in rel.split("/"):
+            continue
+        out.append(rel)
+    return sorted(set(out))
+
+
+def _try_heal_missing_dirs(job_dir: str, error_text: str, name: str) -> bool:
+    """缺目录失败的自愈：一次自动补齐标准目录，不占额度，下一轮立即重试。
+
+    仅首次缺失可自愈；已补过仍缺（healed_dirs 已记录）说明是别的问题，
+    返回 False 让调用方按普通失败计数。补齐操作本身失败也算普通失败。
+    """
+    rels = _parse_missing_dirs(error_text)
+    if not rels or eds.already_healed(job_dir, rels):
+        return False
+    try:
+        for rel in rels:
+            os.makedirs(os.path.join(job_dir, *rel.split("/")), exist_ok=True)
+    except OSError as e:
+        _log(job_dir, f"⚠️ 自动补目录失败 {rels}: {e}（按普通失败计数）")
+        return False
+    eds.heal(job_dir, rels)
+    _log(job_dir, f"🔧 已自动补齐缺失目录 {', '.join(rels)}（{name}），不计入重试，立即重试")
+    return True
+
+
+def note_edit_result(job_dir: str, name: str, ok: bool, *,
+                     error: Optional[str] = None,
+                     failure_class: str = "unknown",
+                     retryable: bool = True) -> None:
+    """记录 edit 结果（写 .edit_state.json）：成功置 done 清零；失败按分类退避/暂停或终态。
+
+    与导出侧 note_export_result 同构；差异：暂停阈值 3 次，仅 paused/硬失败弹
+    toast，退避中的失败只写日志（edit 失败多为数据问题，避免通知轰炸）。
+    """
+    if ok:
+        eds.succeed(job_dir)
+        _log(job_dir, "edit 状态置 done（计数清零）")
+        return
+    st = eds.fail(job_dir, error, failure_class=failure_class,
+                  retryable=retryable, phase="edit")
+    fails = int(st.get("consecutive_failures") or 0)
+    if st.get("status") == "failed":
+        _log(job_dir, f"edit 硬失败[{failure_class}]，置终态不重试：{error}")
+        try:
+            toast("⛔ 剪辑硬失败（不重试）",
+                  f"{name}：{failure_class}，需人工处理\n{error or ''}", icon="error")
+        except Exception:
+            pass
+        return
+    if st.get("status") == "paused":
+        _log(job_dir, f"edit 失败第 {fails} 次（已暂停该剧）")
+        try:
+            toast("⛔ 剪辑连续失败已暂停",
+                  f"{name}：连续 {fails} 次失败，需人工排查", icon="error")
+        except Exception:
+            pass
+        return
+    delay = eds.BACKOFF_S[min(fails - 1, len(eds.BACKOFF_S) - 1)]
+    _log(job_dir, f"edit 失败第 {fails} 次[{failure_class}]，{delay}s 后重试")
+
+
+def _pipeline_log_tail(job_dir: str, n: int = 2000) -> str:
+    """读 06_publish/pipeline.log 末尾，用于 batch_runner 失败时的分类文本。"""
+    p = os.path.join(job_dir, "06_publish", "pipeline.log")
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return f.read()[-n:]
+    except OSError:
+        return ""
+
+
 def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
-    """edit 阶段：validate --fix → ingest（含 workflow 归并）→ batch_runner --no-export。"""
+    """edit 阶段：validate --fix → ingest（含 workflow 归并）→ batch_runner --no-export。
+
+    失败处理（.edit_state.json 单一真源，lib/edit_state.py）：
+      - 缺目录类失败一次自动补齐（不占额度、不退避，下一轮立即重试）；
+      - 其余按失败分类：可重试 → 1/2/4/8/16/30 分钟退避，连续 3 次暂停；
+        不可重试（asset_missing/disk_full）→ 终态 failed。
+    stage 等契约字段仍由 job_manifest 写，本链路不碰。
+    """
     name = plan["name"]
     if dry_run:
         print(_plan_line(plan))
         return True
     toast("🎬 剪辑阶段开始", f"{name}", icon="info")
     _log(job_dir, "edit start")
+    eds.begin(job_dir, phase="edit")
+
+    def _fail(err_text: str) -> bool:
+        """失败统一出口：先试缺目录自愈（不占额度），否则分类写状态机。"""
+        if _try_heal_missing_dirs(job_dir, err_text, name):
+            return False
+        category, _action = fc.classify(err_text, phase="edit")
+        note_edit_result(job_dir, name, False, error=err_text[-500:],
+                         failure_class=category,
+                         retryable=fc.is_retryable(category))
+        return False
+
     try:
         jm.backfill_hashes(job_dir)
         _log(job_dir, "validate --fix ok")
     except Exception as e:
         _log(job_dir, f"validate --fix 失败: {e}")
         toast("❌ 剪辑阶段失败", f"{name} validate --fix: {e}", icon="error")
-        return False
+        return _fail(str(e))
     try:
         rep = jm.ingest_job(job_dir)
         wfr = rep.get("workflow") or {}
@@ -642,14 +749,14 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     except Exception as e:
         _log(job_dir, f"ingest 失败: {e}")
         toast("❌ 剪辑阶段失败", f"{name} ingest: {e}", icon="error")
-        return False
+        return _fail(str(e))
     # 旧版 export_config 落盘（cut_s → video.cut_s 记账；derive 覆盖留到 export 阶段用）
     try:
         apply_export_config(job_dir)
     except Exception as e:
         _log(job_dir, f"export_config 失败: {e}")
         toast("❌ 剪辑阶段失败", f"{name} export_config: {e}", icon="error")
-        return False
+        return _fail(str(e))
     cmd = list(plan["cmd"])
     _log(job_dir, "pipeline start: " + " ".join(cmd))
     with open(os.path.join(job_dir, "06_publish", "pipeline.log"), "a",
@@ -662,7 +769,8 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     _log(job_dir, f"edit exit rc={rc}")
     if rc != 0:
         toast("❌ 剪辑失败", f"{name} rc={rc}，见 06_publish/pipeline.log", icon="error")
-        return False
+        return _fail(_pipeline_log_tail(job_dir) or f"batch_runner rc={rc}")
+    note_edit_result(job_dir, name, True)
     toast("✅ 草稿就绪", f"{name}（等待导出阶段）", icon="success")
     _log(job_dir, "edit done")
     return True
