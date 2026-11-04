@@ -13,6 +13,15 @@ def _norm_output_path(input_path: str) -> str:
     return os.path.join(cache_dir, f"{stem}.__jy_norm__.mp4")
 
 
+def _tmp_output_path(dst: str) -> str:
+    """转封装的临时输出路径。
+
+    必须以 .mp4 结尾：ffmpeg 靠扩展名推断封装格式，写成 `.part` 会直接报
+    “Unable to choose an output format”。
+    """
+    return dst + ".tmp.mp4"
+
+
 def _is_cache_fresh(src: str, dst: str) -> bool:
     if not os.path.exists(dst):
         return False
@@ -93,8 +102,9 @@ def normalize_video_for_jianying(input_path: str, force: bool = False) -> Option
     if _is_cache_fresh(src, dst):
         return dst
 
-    # 先写 .part 再原子改名：进程中途被 kill 时不会留下半截 __jy_norm__.mp4
-    tmp_dst = dst + ".part"
+    # 先写临时文件再原子改名：进程中途被 kill 时不会留下半截 __jy_norm__.mp4
+    # 注意临时名必须以 .mp4 结尾，否则 ffmpeg 无法按扩展名推断封装格式
+    tmp_dst = _tmp_output_path(dst)
     try:
         if os.path.exists(tmp_dst):
             os.remove(tmp_dst)

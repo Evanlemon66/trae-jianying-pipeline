@@ -110,6 +110,11 @@ src = _write("src.mp4", _ftyp())
 empty = _write("cached_empty.__jy_norm__.mp4", b"")
 check("0 字节缓存判为不新鲜", mn._is_cache_fresh(src, empty) is False)
 
+print("⑥ 转封装临时路径必须以 .mp4 结尾")
+tmp = mn._tmp_output_path(os.path.join(TMP, "x.__jy_norm__.mp4"))
+check("临时路径以 .mp4 结尾（否则 ffmpeg 无法推断格式）", tmp.endswith(".mp4"), tmp)
+check("临时路径与正式路径不同", tmp != os.path.join(TMP, "x.__jy_norm__.mp4"), tmp)
+
 print()
 if fails:
     print(f"❌ {len(fails)} 项失败: {fails}")
