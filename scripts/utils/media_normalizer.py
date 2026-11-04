@@ -17,6 +17,8 @@ def _is_cache_fresh(src: str, dst: str) -> bool:
     if not os.path.exists(dst):
         return False
     try:
+        if os.path.getsize(dst) <= 0:  # 0 字节残片一律视为不新鲜
+            return False
         return os.path.getmtime(dst) >= os.path.getmtime(src)
     except OSError:
         return False
@@ -91,6 +93,14 @@ def normalize_video_for_jianying(input_path: str, force: bool = False) -> Option
     if _is_cache_fresh(src, dst):
         return dst
 
+    # 先写 .part 再原子改名：进程中途被 kill 时不会留下半截 __jy_norm__.mp4
+    tmp_dst = dst + ".part"
+    try:
+        if os.path.exists(tmp_dst):
+            os.remove(tmp_dst)
+    except OSError:
+        pass
+
     info = _probe_video(src)
     w = int(info.get("width") or 0)
     h = int(info.get("height") or 0)
@@ -131,7 +141,7 @@ def normalize_video_for_jianying(input_path: str, force: bool = False) -> Option
         "192k",
         "-movflags",
         "+faststart",
-        dst,
+        tmp_dst,
     ]
 
     try:
@@ -143,11 +153,16 @@ def normalize_video_for_jianying(input_path: str, force: bool = False) -> Option
         print(f"❌ Video normalization failed: {e}")
         return None
 
-    if proc.returncode != 0 or not os.path.exists(dst):
+    if proc.returncode != 0 or not os.path.exists(tmp_dst):
         err = (proc.stderr or proc.stdout or "").strip()
         print(f"❌ Video normalization failed (ffmpeg={proc.returncode}): {err}")
+        try:
+            os.remove(tmp_dst)
+        except OSError:
+            pass
         return None
 
+    os.replace(tmp_dst, dst)
     return dst
 
 

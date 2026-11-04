@@ -1541,39 +1541,59 @@ def _parse_mp4_duration(path):
             f.seek(0)
 
             moov_offset = None
+            moov_end = None
             while f.tell() < size - 8:
+                box_start = f.tell()
                 header = f.read(8)
                 if len(header) < 8:
                     break
                 box_size = struct.unpack(">I", header[:4])[0]
                 box_type = header[4:8].decode("ascii", errors="replace")
                 if box_size == 1:
-                    box_size = struct.unpack(">Q", f.read(8))[0]
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    box_size = struct.unpack(">Q", ext)[0]
                     header_len = 16
                 else:
                     header_len = 8
 
+                # size=0 表示“延伸至文件末尾”，moov 不可能在其之后；
+                # size<header_len 为非法尺寸。旧实现直接相对 seek 会让游标回退，
+                # 遇到被 kill 的 ffmpeg 留下的半截 __jy_norm__.mp4（mdat size=0）时死循环。
+                if box_size == 0 or box_size < header_len:
+                    break
+
                 if box_type == "moov":
                     moov_offset = f.tell()
-                    moov_end = moov_offset + box_size - header_len
+                    moov_end = min(size, box_start + box_size)
                     break
-                f.seek(box_size - header_len, 1)
+                f.seek(box_start + box_size, 0)
 
-            if moov_offset is None:
+            if moov_offset is None or moov_end is None:
                 return None
 
             f.seek(moov_offset)
             while f.tell() < moov_end - 8:
+                box_start = f.tell()
                 header = f.read(8)
                 if len(header) < 8:
                     break
                 box_size = struct.unpack(">I", header[:4])[0]
                 box_type = header[4:8].decode("ascii", errors="replace")
                 if box_size == 1:
-                    box_size = struct.unpack(">Q", f.read(8))[0]
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    box_size = struct.unpack(">Q", ext)[0]
                     header_len = 16
                 else:
                     header_len = 8
+
+                if box_size == 0:  # 延伸到 moov 末尾
+                    box_size = moov_end - box_start
+                if box_size < header_len:  # 非法尺寸：防游标回退自旋
+                    break
 
                 if box_type == "mvhd":
                     data_start = f.tell()
@@ -1592,7 +1612,7 @@ def _parse_mp4_duration(path):
                     if timescale > 0 and duration > 0:
                         return int(duration / timescale * 1_000_000)
                     return None
-                f.seek(box_size - header_len, 1)
+                f.seek(box_start + box_size, 0)
     except Exception as e:
         print(f"  ⚠️ MP4 解析失败: {e}")
     return None
