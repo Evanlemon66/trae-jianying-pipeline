@@ -98,7 +98,7 @@ python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.c
 **Stage 1（12 条标题 + 门禁）**
 
 3. 用户回复“已建目录”后，读 `references/title-spec.md` 生成 12 条，把 `02_titles/prompt.txt`、`titles.json`、`titles.md` 三个文件**全文**输出给用户保存。**不需要输出 job.json**——`stage=titles_done` 由 Trae 侧 `record-titles` 登记。
-4. 停在门禁：用户回复 3 个编号后，只输出 `02_titles/selection.json`（`{"picks":["T9","T10","T7"],"selected_by":"user"}`）让用户保存。**不再手写 job.json**——`titles.selected`、`cover_map` 回填、`stage=titles_selected` 全部由 Trae 侧 `ingest`/`select` 生成。硬约束：`titles.gate` 只允许 `pending` / `done` 两值，`titles.selected` 必须是 3 个对象 `{slot,title_id,title}`——禁止自造枚举（如 `gate="selected"`）或字符串数组；已有违规形态由 Trae 侧 `validate --fix` 修复。
+4. 停在门禁：用户回复 3 个编号后，只输出 `02_titles/selection.json`（`{"picks":["T9","T10","T7"],"selected_by":"user"}`）让用户保存。**不再手写 job.json**——`titles.selected`、`cover_map` 回填、`stage=titles_selected` 全部由 Trae 侧 `ingest`/`select` 生成。竖版标题默认取 `selected` 三条中**总分最高**的一条，同分取 `selected` 中靠前的一条；若 `vertical_cover.title_id` 已被人工显式写入则优先保留。硬约束：`titles.gate` 只允许 `pending` / `done` 两值，`titles.selected` 必须是 3 个对象 `{slot,title_id,title}`——禁止自造枚举（如 `gate="selected"`）或字符串数组；已有违规形态由 Trae 侧 `validate --fix` 修复。
 
 **Stage 2（即梦出图）**
 

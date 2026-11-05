@@ -200,7 +200,7 @@ D:\短剧\<剧名>\
 - 门禁完成后写 `titles.selected`（3 项 `{slot,title_id}`），并回填 `cover_map[].title_id` / `title`，`gate=done`。
 - **硬约束**：`titles.gate` 只能是 `pending` / `done`，禁止自造枚举（把「已选定」写成 `gate="selected"` 是常见错误）；`titles.selected` 必须是 3 个对象 `{slot,title_id,title}`，禁止字符串/数字数组。已落盘的违规形态用 `validate --job <cover_job> --fix` 修复（规范化 gate/selected、记一条 `validate_fix` history），不要手改文件。
 - 三条横版必须与标题一一对应；竖版标 `role=video_cover`。
-- 竖版绑定：门禁（`select`）或收口（`ingest`）时，自动绑定 `selected` 三条中评分最高的一条（平分按总分→推荐优先→内容兑现→信息缺口→情绪峰值，与兜底同序）；无评分数据则保持 `title_id=null`。
+- 竖版绑定：门禁（`select`）或收口（`ingest`）时，默认绑定 `selected` 三条中**总分最高**的一条；**总分相同则按 `selected` 中出现的先后取靠前的一条**；无评分数据则保持 `title_id=null`。人工已显式指定 `vertical_cover.title_id`（经 `update` 写入或手改 job.json）时一律保留，不被默认绑定覆盖。
 - 门禁后 `selected` 冻结；改选必须显式操作，`revision` 递增，Stage 2 发现 revision 不一致要把旧图标 `stale`。
 - 文件名容错：`04_covers/` 内可用任意文件名（`cover_01_hit` / `封面图1` / `T2 封面` / `竖版` …），`ingest` 按「竖版宽高比/名称提示优先，横版按文件名编号 1/2/3，否则自然顺序」识别并**改名到契约名**，改名记录写入 `history` 与 `report.renamed`。
 

@@ -783,7 +783,8 @@ def _best_of_selected(job_dir: str, titles_file: Optional[str],
                       selected: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """从 selected 的 3 条里挑评分最高的一条，用于竖版绑定。
 
-    平分时与兜底同序：总分 → 推荐条目优先 → 内容兑现 → 信息缺口 → 情绪峰值。
+    默认取总分最高；总分相同则按 selected 中出现的先后取靠前的一条。
+    vertical_cover.title_id 已由人工指定时由调用方保留、不覆盖。
     评分数据缺失（titles.json 不在 / 条目无 score）时返回 None，不绑定。
     """
     if len(selected) != 3:
@@ -799,18 +800,16 @@ def _best_of_selected(job_dir: str, titles_file: Optional[str],
     items = data.get("titles") if isinstance(data, dict) else data
     if not isinstance(items, list):
         return None
-    rec_set = {str(x) for x in (((data.get("summary") or {}).get("recommended")) or [])} \
-        if isinstance(data, dict) else set()
     by_id = {str(it.get("id")): it for it in items if isinstance(it, dict)}
-    ranked: list[tuple] = []
+    best_entry, best_total = None, None
     for entry in selected:
         it = by_id.get(str(entry.get("title_id")))
         if not it or not isinstance(it.get("score"), dict):
             return None
-        st = _score_tuple(it)
-        ranked.append(((st[0], str(it.get("id")) in rec_set, *st[1:]), entry))
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return ranked[0][1]
+        total = _score_tuple(it)[0]
+        if best_total is None or total > best_total:
+            best_entry, best_total = entry, total
+    return best_entry
 
 
 def _annotate_titles_file(job_dir: str, job: dict[str, Any],
@@ -890,16 +889,19 @@ def select_titles(job_dir: str, picks: list[dict[str, Any]],
         },
         "cover_map": new_map,
     }
-    # 竖版绑定：selected 中评分最高的一条（无评分数据则保持 null）
+    # 竖版绑定：selected 中评分最高的一条；人工已指定则保留，无评分数据保持 null
     best = _best_of_selected(job_dir, (job.get("titles") or {}).get("file"), picks)
     event = "gate_select" if by == "user" else "gate_auto_select"
     mode_label = {"recommended": "推荐模式（推荐池优先）",
                   "score": "评分模式（全量取前 3）"}.get(auto_mode, "评分")
     detail = ("用户门禁选定 3 条标题" if by == "user"
               else f"兜底机制：用户未选，{mode_label}自动选定前 3 条")
-    if best:
+    explicit = (job.get("vertical_cover") or {}).get("title_id")
+    if best and explicit in (None, ""):
         patch["vertical_cover"] = {"title_id": best["title_id"], "title": best["title"]}
         detail += f"；竖版绑定最高分 {best['title_id']}"
+    elif explicit not in (None, ""):
+        detail += f"；竖版保留人工指定 {explicit}"
     job = update_job(job_dir, patch, event=event, detail=detail)
     _annotate_titles_file(job_dir, job, picks, by)
     return job
