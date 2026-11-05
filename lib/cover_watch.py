@@ -666,7 +666,8 @@ def _try_heal_missing_dirs(job_dir: str, error_text: str, name: str) -> bool:
 def note_edit_result(job_dir: str, name: str, ok: bool, *,
                      error: Optional[str] = None,
                      failure_class: str = "unknown",
-                     retryable: bool = True) -> None:
+                     retryable: bool = True,
+                     pause_after: Optional[int] = None) -> None:
     """记录 edit 结果（写 .edit_state.json）：成功置 done 清零；失败按分类退避/暂停或终态。
 
     与导出侧 note_export_result 同构；差异：暂停阈值 3 次，仅 paused/硬失败弹
@@ -676,8 +677,15 @@ def note_edit_result(job_dir: str, name: str, ok: bool, *,
         eds.succeed(job_dir)
         _log(job_dir, "edit 状态置 done（计数清零）")
         return
-    st = eds.fail(job_dir, error, failure_class=failure_class,
-                  retryable=retryable, phase="edit")
+    if pause_after is None:
+        # 阈值可由 presets.watch.edit_pause_after 覆盖（默认仍为 3，导出侧语义不受影响）
+        try:
+            pause_after = int(pc.get_watch_config().get("edit_pause_after",
+                                                        eds.DEFAULT_PAUSE_AFTER))
+        except Exception:
+            pause_after = eds.DEFAULT_PAUSE_AFTER
+    st = eds.fail(job_dir, error, pause_after=pause_after,
+                  failure_class=failure_class, retryable=retryable, phase="edit")
     fails = int(st.get("consecutive_failures") or 0)
     if st.get("status") == "failed":
         _log(job_dir, f"edit 硬失败[{failure_class}]，置终态不重试：{error}")
