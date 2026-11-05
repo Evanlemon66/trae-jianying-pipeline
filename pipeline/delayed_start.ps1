@@ -52,12 +52,17 @@ try {
     # 隐藏失败不影响主逻辑
 }
 
+# 统一时间戳格式：全脚本的日志与时间显示都走这里，避免多处格式串写法不一致
+function Format-Timestamp([datetime]$Time) {
+    return $Time.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Write-Log([string]$Message) {
     try {
         if (-not (Test-Path -LiteralPath $logDir)) {
             New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         }
-        $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+        $line = '[{0}] {1}' -f (Format-Timestamp (Get-Date)), $Message
         Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
     } catch {
     }
@@ -126,7 +131,7 @@ function Invoke-DelayedStart {
 
     # 1) 先等 DelayMinutes 分钟
     $wakeAt = (Get-Date).AddMinutes($DelayMinutes)
-    Write-Log ("开始等待 " + $DelayMinutes + " 分钟，预计 " + $wakeAt.ToString('yyyy-MM-dd HH:mm:ss') + " 开始检查")
+    Write-Log ("开始等待 " + $DelayMinutes + " 分钟，预计 " + (Format-Timestamp $wakeAt) + " 开始检查")
     Start-Sleep -Seconds ([int]($DelayMinutes * 60))
     Write-Log '等待结束，开始检查 job.json'
 
