@@ -11,6 +11,8 @@
     "watch.cold_start: 每部剧导出前冷启动剪映（杀进程→拉起→等首页，默认 true）。连续导出时上一部刚导完、剪映 UI 未就绪会让首试假死；手动同时用剪映时设为 false。",
     "watch.export_stall_timeout: 导出「无进展」判定卡死的秒数（默认 1800）。进度 json 每 30s 刷新一次，导出慢但仍在写盘不会被误杀。",
     "watch.retry_pause_after: 连续导出失败多少次后暂停该剧（默认 5），退避间隔 1/2/4/8/16/30 分钟；恢复办法：删除 cover_job/.export_state.json 或 --phase export 强制放行（放行不清零失败计数）。失败分类与状态见契约 §7.1。",
+    "watch.edit_stall_timeout_s: 剪辑阶段「心跳超时」判定卡死的秒数（默认 900，设 0 关闭看门狗）。watcher 每轮巡检 status=editing 的剧，超过该时长没有心跳更新即判残留；先校验 pid 命令行/父链确实指向这部剧才会 kill，校验不过只记日志不杀，随后按一次可重试失败走退避/暂停。",
+    "watch.new_job_grace_min: 新剧宽限期分钟数（默认 10，设 0 关闭）。仅对「首次被发现、history 里还没有任何执行记录」的新剧生效：距 job.json 创建时间不足该分钟数则本轮跳过；期间 job.json 被改过（mtime 变新，说明有人在配裁剪）视为放行，直接走原有静默防抖逻辑。已在队列中的剧不受影响。",
     "presets: 剪映「我的预设」里的组合预设名，必须与预设库完全一致（可用 pipeline.py --list-presets 查看）。",
     "alpha 为可选的滤镜透明度（0~1），仅对滤镜类预设生效，普通贴纸/logo 预设不用填。",
     "不配 presets 字段时，预设库中 pipeline_ 开头的预设会被自动启用。",
@@ -32,7 +34,9 @@
     "hold": false,
     "cold_start": true,
     "export_stall_timeout": 1800,
-    "retry_pause_after": 5
+    "retry_pause_after": 5,
+    "edit_stall_timeout_s": 900,
+    "new_job_grace_min": 10
   },
   "presets": [
     { "name": "我的logo" },

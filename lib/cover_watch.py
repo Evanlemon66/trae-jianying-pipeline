@@ -26,15 +26,19 @@
   python lib/cover_watch.py --phase export --once  # 单轮强制只推进导出阶段
   python lib/cover_watch.py status --job "<cover_job>"
   python lib/cover_watch.py inspect --job "<cover_job>"   # 只读聚合视图（不写任何文件）
+  python lib/cover_watch.py reopen --job "<cover_job>" --yes   # 人工重导（退回 covers_ready）
 
 配套文件：
   <repo>/pipeline/presets.json  watch 段（每轮热加载）：
       {"roots":[...], "jobs":[], "exclude":[], "settle":30, "interval":5,
        "export_policy":"immediate", "hold":false, "derive":[],
-       "cold_start":true, "export_stall_timeout":1800, "retry_pause_after":5}
+       "cold_start":true, "export_stall_timeout":1800, "retry_pause_after":5,
+       "edit_stall_timeout_s":900, "new_job_grace_min":10}
       cold_start：每部剧导出前冷启动剪映（默认 true；手动用剪映时建议设 false）
       export_stall_timeout：导出无进展判定卡死的秒数（进度 json 每 30s 刷新一次）
       retry_pause_after：连续失败多少次后暂停该剧（默认 5，退避 1/2/4/8/16/30 分钟）
+      edit_stall_timeout_s：edit 阶段心跳超时秒数（默认 900，0 关闭看门狗）
+      new_job_grace_min：新剧首次发现的宽限分钟数（默认 10，0 关闭）
   <cover_job>/dispatch.json     豆包侧意图声明（ingest 归并进 job.json.workflow）
   <cover_job>/export_config.json 旧版一句话偏好（仍兼容：cut_s/derive）
   <cover_job>/.export_state.json 导出状态机单一真源（lib/export_state.py 唯一写者：
@@ -51,6 +55,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -532,6 +537,16 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
         plan.update(action="export", reason="--phase export 强制", cmd=_export_cmd())
         return plan
 
+    # 导出标记参与调度（--phase 强制路径不受影响，故放在两个 override 之后）：
+    # exported = 已导出、只等清理；cleaned = 成品已清理，整部视为完成
+    export_state = str(((job.get("video") or {})).get("export_state") or "").strip().lower()
+    if export_state == "cleaned":
+        plan.update(reason="video.export_state=cleaned：成品已清理，视为完成（不再调度）")
+        return plan
+    if export_state == "exported":
+        plan.update(reason="video.export_state=exported：已导出，等待清理（不重复导出）")
+        return plan
+
     if draft is None:
         g = eds.gate(job_dir, phase_override=phase_override)
         if g:
@@ -717,6 +732,172 @@ def _pipeline_log_tail(job_dir: str, n: int = 2000) -> str:
         return ""
 
 
+def _norm_cmp_path(s: str) -> str:
+    return s.replace("\\", "/").rstrip("/").lower()
+
+
+def _edit_stall_timeout(cfg: Optional[dict[str, Any]] = None) -> float:
+    """watch.edit_stall_timeout_s，默认 900 秒；0 表示关闭看门狗。"""
+    try:
+        raw = (cfg or pc.get_watch_config() or {}).get("edit_stall_timeout_s", 900)
+        return float(raw)
+    except (TypeError, ValueError):
+        return 900.0
+
+
+def _kill_tree(pid: int) -> None:
+    """杀整棵进程树（编辑子进程是 batch_runner，可能再拉子进程）。"""
+    if pid <= 0:
+        return
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        print(f"  [WARN] taskkill pid={pid} 失败: {e}")
+
+
+def _pid_owned_by_job(pid: int, series_dir: str) -> bool:
+    """pid 或其父链的命令行是否指向这部剧（防止杀错进程）。
+
+    batch_runner 的启动命令带 series_dir；父链里 watcher 的命令行也可能带
+    cover_job 路径，两者都包含 series_dir，因此按 series_dir 子串判定即可。
+    查询失败一律返回 False（宁可不杀）。
+    """
+    if pid <= 0:
+        return False
+    series = _norm_cmp_path(os.path.abspath(series_dir))
+    if not series:
+        return False
+    ps = (
+        f"$p={int(pid)}; for($i=0; $i -lt 5 -and $p -ne 0; $i++) {{ "
+        f"$o=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $p) "
+        f"-ErrorAction SilentlyContinue; if(-not $o) {{ break }}; "
+        f"Write-Output ($o.CommandLine + '|' + $o.ParentProcessId); "
+        f"$p=[int]$o.ParentProcessId }}"
+    )
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                             capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return False
+    return series in _norm_cmp_path(out)
+
+
+def _wait_edit_with_watchdog(job_dir: str, proc: subprocess.Popen, name: str) -> int:
+    """等编辑子进程，按 pipeline.log 的进展刷新心跳；超时则校验归属后 kill。"""
+    timeout = _edit_stall_timeout()
+    log_path = os.path.join(job_dir, "06_publish", "pipeline.log")
+    try:
+        last_size = os.path.getsize(log_path)
+    except OSError:
+        last_size = 0
+    last_beat = time.time()
+    while True:
+        try:
+            return proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            size = os.path.getsize(log_path)
+        except OSError:
+            size = last_size
+        if size != last_size:
+            last_size = size
+            last_beat = time.time()
+            eds.heartbeat(job_dir, pid=proc.pid, now=last_beat)
+        if timeout > 0 and time.time() - last_beat >= timeout:
+            series_dir = os.path.dirname(job_dir.rstrip("\\/"))
+            _log(job_dir, f"edit 卡死：{int(timeout)}s 无日志进展，pid={proc.pid}")
+            if _pid_owned_by_job(proc.pid, series_dir):
+                _kill_tree(proc.pid)
+                _log(job_dir, f"edit 卡死：已终止 pid={proc.pid}（命令行校验通过）")
+            else:
+                _log(job_dir, f"edit 卡死：pid={proc.pid} 归属校验未通过，未 kill（避免误杀）")
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            note_edit_result(job_dir, name, False,
+                             error=f"edit 心跳超时（{int(timeout)}s 无进展）",
+                             failure_class="edit_stalled", retryable=True)
+            toast("⛔ 剪辑卡死", f"{name}：{int(timeout)}s 无进展，已按失败退避", icon="error")
+            return -999  # 已记过失败，调用方不要再走 _fail 重复计数
+
+
+def _reap_stalled_edit(job_dir: str, cfg: dict[str, Any], *, name: str) -> None:
+    """每轮巡检：editing 心跳超时 → 校验 pid 归属后 kill，并记一次失败退避。
+
+    与 run_edit 内的看门狗互补：这里处理上一轮崩溃/遗留的 editing。
+    """
+    timeout = _edit_stall_timeout(cfg)
+    if timeout <= 0:
+        return
+    st = eds.peek(job_dir)
+    if not st or st.get("status") != "editing":
+        return
+    hb = float(st.get("heartbeat_at") or 0)
+    if hb <= 0:  # 旧版状态没有心跳：用状态文件 mtime 兜底
+        try:
+            hb = os.path.getmtime(os.path.join(job_dir, eds.STATE_NAME))
+        except OSError:
+            hb = 0
+    if not hb or time.time() - hb < timeout:
+        return
+    pid = int(st.get("pid") or 0)
+    series_dir = os.path.dirname(job_dir.rstrip("\\/"))
+    alive = _pid_alive(pid)
+    if alive and _pid_owned_by_job(pid, series_dir):
+        _kill_tree(pid)
+        _log(job_dir, f"edit 卡死：pid={pid} 心跳 {int(time.time() - hb)}s 未更新，已终止")
+    elif alive:
+        _log(job_dir, f"edit 卡死：pid={pid} 归属校验未通过，未 kill（避免误杀）")
+    else:
+        _log(job_dir, f"edit 卡死：pid={pid} 已不存在，仅清理状态")
+    note_edit_result(job_dir, name, False,
+                     error=f"edit 心跳超时（{int(time.time() - hb)}s 未更新）",
+                     failure_class="edit_stalled", retryable=True)
+    toast("⛔ 剪辑卡死", f"{name}：心跳超时，已按失败退避", icon="error")
+
+
+def _job_created_ts(job_dir: str, job: dict[str, Any]) -> Optional[float]:
+    """job.json 的创建时间：优先 job.created_at（原子重写后 ctime 会重置，
+    created_at 才稳定），缺失/不可解析时退回文件 ctime。"""
+    raw = str(job.get("created_at") or "").strip()
+    if raw:
+        try:
+            return datetime.fromisoformat(raw).timestamp()
+        except ValueError:
+            pass
+    try:
+        return os.path.getctime(os.path.join(job_dir, "job.json"))
+    except OSError:
+        return None
+
+
+def _new_job_in_grace(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
+                      now: Optional[float] = None) -> bool:
+    """新剧宽限期：从未执行过、job.json 未被改过、创建不足 N 分钟 → 本轮跳过。"""
+    try:
+        grace_min = float(cfg.get("new_job_grace_min", 10) or 0)
+    except (TypeError, ValueError):
+        grace_min = 10.0
+    if grace_min <= 0:
+        return False
+    events = {str((h or {}).get("event") or "") for h in (job.get("history") or [])}
+    if events & _EXEC_HISTORY_EVENTS:
+        return False
+    created = _job_created_ts(job_dir, job)
+    if created is None:
+        return False
+    try:
+        mtime = os.path.getmtime(os.path.join(job_dir, "job.json"))
+    except OSError:
+        return False
+    if mtime > created + 1.0:  # 创建后被改过（有人在配裁剪）→ 放行
+        return False
+    return ((now if now is not None else time.time()) - created) < grace_min * 60
+
+
 def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     """edit 阶段：validate --fix → ingest（含 workflow 归并）→ batch_runner --no-export。
 
@@ -779,8 +960,11 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
         lf.flush()
         proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, cwd=_REPO)
     _write_lock(job_dir, "edit", pipeline_pid=proc.pid)
-    rc = proc.wait()
+    eds.heartbeat(job_dir, pid=proc.pid)
+    rc = _wait_edit_with_watchdog(job_dir, proc, name)
     _log(job_dir, f"edit exit rc={rc}")
+    if rc == -999:
+        return False  # 看门狗已记一次 edit_stalled 失败，不再重复计数
     if rc != 0:
         toast("❌ 剪辑失败", f"{name} rc={rc}，见 06_publish/pipeline.log", icon="error")
         return _fail(_pipeline_log_tail(job_dir) or f"batch_runner rc={rc}")
@@ -936,6 +1120,102 @@ def _sync_intent(job_dir: str, name: str, state: dict[str, Any]) -> None:
 
 
 # ── 命令 ──────────────────────────────────────────────
+
+_REOPEN_SOURCE_STAGES = ("video_ready", "publish_ready", "published")
+_EXEC_HISTORY_EVENTS = {"ingest", "edit", "export", "record_video",
+                        "publish_record", "cleanup", "reopen"}
+
+
+def _export_state_file_status(job_dir: str) -> Optional[str]:
+    """只读 .export_state.json 的 status（不创建、不迁移、不改写）。"""
+    try:
+        with open(os.path.join(job_dir, ".export_state.json"), encoding="utf-8") as f:
+            return str((json.load(f) or {}).get("status") or "")
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_reopen(args: argparse.Namespace) -> int:
+    """人工重导：stage 退回 covers_ready（或 --to），清空 video 导出标记。
+
+    只允许在需要重导的状态下使用；archived / 活锁 / exporting 一律拒绝。
+    故意不走 jm.update_job（它禁止 stage 回退），这里显式放宽并记 history；
+    不自动触发任何调度，下一轮是否重跑仍由 watcher 按常规规则决定。
+    """
+    job_dir = _norm_job_dir(args.job)
+    jf = os.path.join(job_dir, "job.json")
+    if not os.path.isfile(jf):
+        print(f"[FAIL] 找不到 job.json: {jf}")
+        return 1
+    try:
+        job = jm.load_job(jf)
+    except Exception as e:
+        print(f"[FAIL] job.json 不可解析: {e}")
+        return 1
+    old = jm.canon_stage(job.get("stage")) or ""
+    target = args.to or "covers_ready"
+    if target not in jm.STAGES or target == "archived":
+        print(f"[FAIL] 非法目标 stage: {target}")
+        return 1
+    if old == "archived":
+        print("[FAIL] stage=archived：已归档剧不允许 reopen（需先人工移回归档区）")
+        return 1
+    video = job.get("video") or {}
+    export_state = str(video.get("export_state") or "")
+    needs = (old in _REOPEN_SOURCE_STAGES or video.get("status") == "done"
+             or export_state in ("exported", "cleaned"))
+    if not needs:
+        print(f"[FAIL] 当前 stage={old} / video.status={video.get('status')} / "
+              f"export_state={export_state or '-'}，不处于需要重导的状态")
+        return 1
+    if jm._stage_index(target) >= jm._stage_index(old):
+        print(f"[FAIL] --to={target} 必须早于当前 stage={old}")
+        return 1
+    if lock_alive(job_dir):
+        print("[FAIL] 剧正在跑（.watcher.lock pid 存活），请等本轮结束后再 reopen")
+        return 1
+    if _export_state_file_status(job_dir) == "exporting":
+        print("[FAIL] .export_state.json status=exporting：导出进行中，拒绝 reopen")
+        return 1
+    print(f"reopen 计划（{job_dir}）：")
+    print(f"  - stage: {old} → {target}")
+    print(f"  - video.status: {video.get('status')} → None")
+    print(f"  - video.export_state: {export_state or '-'} → None")
+    print("  - 删除 cover_job/.export_state.json（若存在），避免下一轮派生回 done")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("[FAIL] 非交互场景必须显式加 --yes")
+            return 1
+        if input("确认执行? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("已取消")
+            return 1
+    if not acquire_lock(job_dir, phase="reopen"):
+        print("[FAIL] 获取 .watcher.lock 失败（可能刚被 watcher 占用），请重试")
+        return 1
+    try:
+        job["stage"] = target
+        video = job.setdefault("video", {})
+        video["status"] = None
+        video["export_state"] = None
+        job["revision"] = int(job.get("revision") or 0) + 1
+        job.setdefault("history", []).append({
+            "at": jm.now_iso(), "event": "reopen",
+            "detail": f"人工重导：{old} → {target}，清空 video.status/export_state"})
+        jm.save_job(job, job_dir)
+        sf = os.path.join(job_dir, ".export_state.json")
+        if os.path.exists(sf):
+            os.remove(sf)
+            print("  已删除 .export_state.json")
+        errs = jm.validate_job(jm.load_job(jf), job_dir)
+        if errs:
+            print(f"[WARN] reopen 后 validate 报 {len(errs)} 项问题（已写入，请人工复核）: "
+                  f"{'；'.join(errs[:3])}")
+        print(f"[OK] 已 reopen：stage={target}，video.status/export_state 已清空；"
+              f"本次不触发调度")
+        return 0
+    finally:
+        release_lock(job_dir)
+
 
 def cmd_status(args: argparse.Namespace) -> int:
     for j in args.job:
@@ -1139,6 +1419,10 @@ def _eval_round(args: argparse.Namespace, cfg: dict[str, Any],
     for job_dir in jobs:
         if job_dir in done:
             continue
+        name = os.path.basename(os.path.dirname(job_dir.rstrip("\\/")))
+        if write_log:
+            # 只在真正跑轮次时回收卡死的 editing；plan/dry-run 一律只读
+            _reap_stalled_edit(job_dir, cfg, name=name)
         if lock_alive(job_dir):
             if args.verbose:
                 print(f"[skip] {job_dir}: 活锁存在（链在跑）")
@@ -1148,16 +1432,25 @@ def _eval_round(args: argparse.Namespace, cfg: dict[str, Any],
             if getattr(args, "once", False) or args.verbose:
                 print(f"[skip] {job_dir}: {'；'.join(reasons)}")
             continue
-        name = os.path.basename(os.path.dirname(job_dir).rstrip("\\/"))
+        job = jm.load_job(os.path.join(job_dir, "job.json"))
+        if _new_job_in_grace(job_dir, job, cfg):
+            grace = cfg.get("new_job_grace_min", 10)
+            print(f"[wait] {job_dir}: 新剧宽限期内（<{grace}min 且 job.json 未被改动，本轮跳过）")
+            continue
         _sync_intent(job_dir, name, intent_states.setdefault(job_dir.lower(), {}))
         idle = time.time() - last_change_ts(job_dir)
         if idle < args._settle:
             print(f"[wait] {job_dir}: 条件满足，静默确认中（{idle:.0f}/{args._settle:.0f}s）")
             continue
         qualified.append(job_dir)
-    pending_edit = sum(
-        1 for j in qualified
-        if find_stream_draft(os.path.basename(os.path.dirname(j).rstrip("\\/"))) is None)
+    pending_edit = 0
+    for j in qualified:
+        job = jm.load_job(os.path.join(j, "job.json"))
+        export_state = str(((job.get("video") or {})).get("export_state") or "").lower()
+        if export_state in ("exported", "cleaned"):
+            continue  # 已导出/已清理的剧不再计入待剪辑队列（否则会拖住导出闸门）
+        if find_stream_draft(os.path.basename(os.path.dirname(j).rstrip("\\/"))) is None:
+            pending_edit += 1
     plans: list[dict[str, Any]] = []
     for j in qualified:
         job = jm.load_job(os.path.join(j, "job.json"))
@@ -1356,6 +1649,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_pl.add_argument("--root", action="append", default=None)
     p_pl.add_argument("--config", default=None)
     p_pl.add_argument("--phase", choices=["edit", "export"], default=None)
+    p_ro = sub.add_parser("reopen", help="人工重导：退回 covers_ready 并清空导出标记（不触发调度）")
+    p_ro.add_argument("--job", required=True, help="cover_job 目录或其中的 job.json")
+    p_ro.add_argument("--to", default="covers_ready",
+                      help="目标 stage（默认 covers_ready，必须早于当前 stage）")
+    p_ro.add_argument("--yes", action="store_true", help="非交互场景必填，跳过确认")
     args = ap.parse_args(argv)
     if args.command == "status":
         return cmd_status(args)
@@ -1363,6 +1661,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_inspect(args)
     if args.command == "plan":
         return cmd_plan(args)
+    if args.command == "reopen":
+        return cmd_reopen(args)
     return cmd_watch(args)
 
 

@@ -72,6 +72,8 @@ def _default() -> dict[str, Any]:
         "failure_class": None,
         "phase": None,
         "healed_dirs": [],           # 已自动补齐过的目录（正斜杠），同一目录只自愈一次
+        "pid": None,                 # 发起编辑的子进程 pid（看门狗校验归属用）
+        "heartbeat_at": 0,           # epoch；编辑子进程最近一次有日志进展的时间
         "updated_at": None,
         "writer": None,
     }
@@ -103,18 +105,39 @@ def load(job_dir: str) -> dict[str, Any]:
 
 # ── 状态转移 ─────────────────────────────────────────────────────
 
-def begin(job_dir: str, *, phase: Optional[str] = "edit",
+def begin(job_dir: str, *, phase: Optional[str] = "edit", pid: Optional[int] = None,
           now: Optional[float] = None) -> dict[str, Any]:
     """→ editing。已在 editing 时只刷新（幂等，不重复计次）。"""
+    now = now if now is not None else _now()
     st = _read_raw(job_dir) or _default()
     st = dict(st)
     if st.get("status") != "editing":
         st["attempts"] = int(st.get("attempts") or 0) + 1
     st["status"] = "editing"
     st["next_retry_at"] = 0
+    st["pid"] = int(pid) if pid else None
+    st["heartbeat_at"] = now
     if phase:
         st["phase"] = phase
     return _save_if_changed(job_dir, st)
+
+
+def heartbeat(job_dir: str, *, pid: Optional[int] = None,
+              now: Optional[float] = None) -> Optional[dict[str, Any]]:
+    """编辑子进程有进展时刷新心跳；仅 editing 生效，不改变状态。"""
+    st = _read_raw(job_dir)
+    if not st or st.get("status") != "editing":
+        return st
+    st = dict(st)
+    st["heartbeat_at"] = now if now is not None else _now()
+    if pid:
+        st["pid"] = int(pid)
+    return _save_if_changed(job_dir, st)
+
+
+def peek(job_dir: str) -> Optional[dict[str, Any]]:
+    """只读状态；缺失返回 None（不创建文件，供看门狗轮询用）。"""
+    return _read_raw(job_dir)
 
 
 def succeed(job_dir: str) -> dict[str, Any]:
@@ -128,6 +151,7 @@ def succeed(job_dir: str) -> dict[str, Any]:
     st["consecutive_failures"] = 0
     st["next_retry_at"] = 0
     st["last_error"] = None
+    st["pid"] = None
     return _save_if_changed(job_dir, st)
 
 
@@ -147,6 +171,7 @@ def fail(job_dir: str, error: Optional[str] = None, *,
     now = now if now is not None else _now()
     st = _read_raw(job_dir) or _default()
     st = dict(st)
+    st["pid"] = None
     st["last_error"] = error
     st["failure_class"] = failure_class
     if phase:
@@ -201,8 +226,8 @@ def gate(job_dir: str, *, phase_override: Optional[str] = None,
     """edit 闸门：返回等待/暂停原因；None 表示可剪辑。--phase edit 人工强制放行
     （不清零计数）。格式与导出侧 retry_gate 一致。
 
-    editing 不拦截：watcher 串行 + .watcher.lock 防并发；崩溃残留的 editing
-    允许下一轮直接重试（无子进程心跳可判，不做 stale 回收）。
+    editing 不拦截：watcher 串行 + .watcher.lock 防并发；残留的 editing 由
+    cover_watch 的看门狗按心跳超时回收（超过 watch.edit_stall_timeout_s 无进展）。
     """
     if phase_override == "edit":
         return None
