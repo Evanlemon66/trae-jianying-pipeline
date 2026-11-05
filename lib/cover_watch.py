@@ -25,6 +25,7 @@
   python lib/cover_watch.py --hold                 # 只列计划不执行（同配置 hold:true）
   python lib/cover_watch.py --phase export --once  # 单轮强制只推进导出阶段
   python lib/cover_watch.py status --job "<cover_job>"
+  python lib/cover_watch.py inspect --job "<cover_job>"   # 只读聚合视图（不写任何文件）
 
 配套文件：
   <repo>/pipeline/presets.json  watch 段（每轮热加载）：
@@ -57,6 +58,7 @@ import job_manifest as jm  # noqa: E402
 import export_lock  # noqa: E402
 import export_state as es  # noqa: E402  # 导出状态机单一真源（.export_state.json）
 import edit_state as eds  # noqa: E402  # edit 阶段失败退避/暂停（.edit_state.json）
+import state_io as _sio  # noqa: E402  # 状态文件公共读写（只读查看用）
 import failure_class as fc  # noqa: E402  # 第 3 项：失败分类器 + 自愈策略表
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -945,6 +947,113 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_json_readonly(path: str) -> Optional[dict[str, Any]]:
+    """只读 JSON（缺失/损坏 → None）：inspect 专用，绝不创建或修复文件。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _fmt_val(v: Any) -> str:
+    return "缺失" if v is None else str(v)
+
+
+def _fmt_ts(v: Any, now: float) -> str:
+    """epoch 秒 → ISO（相对 now 的可读提示）；缺失/0 分别标注。"""
+    if v is None:
+        return "缺失"
+    try:
+        ts = float(v)
+    except (TypeError, ValueError):
+        return _fmt_val(v)
+    if ts <= 0:
+        return "0（立即可重试）"
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
+    delta = int(ts - now)
+    rel = f"{delta}s 后" if delta > 0 else f"已过期 {-delta}s"
+    return f"{iso}（{rel}）"
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    """只读聚合视图：intent / edit / export 三个来源一次打印。
+
+    纯只读：不读写锁、不落盘、不迁移、不 reap、不触发调度；缺文件显示「缺失」。
+    """
+    for j in args.job:
+        job_dir = _norm_job_dir(j)
+        now = time.time()
+        print(f"{job_dir}")
+
+        job = _read_json_readonly(os.path.join(job_dir, "job.json"))
+        if job is None:
+            print("  intent：缺失（job.json 不存在或不可读）")
+        else:
+            wf = dict(job.get("workflow") or {})
+            ec = _read_json_readonly(os.path.join(job_dir, EXPORT_CONFIG_NAME)) or {}
+            vid = job.get("video") or {}
+            print("  intent（job.json）")
+            print(f"    stage={_fmt_val(job.get('stage'))} "
+                  f"mode={_fmt_val(wf.get('mode'))} "
+                  f"export_policy={_fmt_val(wf.get('export_policy'))} "
+                  f"intent_revision={_fmt_val(wf.get('intent_revision'))} "
+                  f"intent_source={_fmt_val(wf.get('intent_source'))}")
+            print(f"    cut_s: workflow={_fmt_val(wf.get('cut_s'))} "
+                  f"export_config={_fmt_val(ec.get('cut_s'))} "
+                  f"video={_fmt_val(vid.get('cut_s'))}")
+
+        est = _sio.read_raw(job_dir, eds.STATE_NAME)
+        if est is None:
+            print(f"  edit（{eds.STATE_NAME}）：缺失")
+        else:
+            pause = "paused" if est.get("status") == "paused" else "未暂停"
+            print(f"  edit（{eds.STATE_NAME}）")
+            print(f"    version={_fmt_val(est.get('version'))} "
+                  f"status={_fmt_val(est.get('status'))} "
+                  f"attempts={_fmt_val(est.get('attempts'))} "
+                  f"连续失败={_fmt_val(est.get('consecutive_failures'))}（{pause}）")
+            print(f"    next_retry_at={_fmt_ts(est.get('next_retry_at'), now)} "
+                  f"phase={_fmt_val(est.get('phase'))} "
+                  f"failure_class={_fmt_val(est.get('failure_class'))}")
+            print(f"    last_error={_fmt_val(est.get('last_error'))} "
+                  f"healed_dirs={_fmt_val(est.get('healed_dirs'))} "
+                  f"updated_at={_fmt_val(est.get('updated_at'))} "
+                  f"writer={_fmt_val(est.get('writer'))}")
+
+        xst = _sio.read_raw(job_dir, es.STATE_NAME)
+        if xst is None:
+            print(f"  export（{es.STATE_NAME}）：缺失")
+        else:
+            hb = xst.get("heartbeat_ts")
+            try:
+                hb_age = now - float(hb or 0)
+            except (TypeError, ValueError):
+                hb_age = None
+            age_txt = "缺失" if hb_age is None else f"{int(hb_age)}s 前"
+            print(f"  export（{es.STATE_NAME}）")
+            print(f"    version={_fmt_val(xst.get('version'))} "
+                  f"status={_fmt_val(xst.get('status'))} "
+                  f"attempts={_fmt_val(xst.get('attempts'))} "
+                  f"连续失败={_fmt_val(xst.get('consecutive_failures'))}")
+            print(f"    next_retry_at={_fmt_ts(xst.get('next_retry_at'), now)} "
+                  f"progress={_fmt_val(xst.get('progress'))} "
+                  f"phase={_fmt_val(xst.get('phase'))} "
+                  f"failure_class={_fmt_val(xst.get('failure_class'))}")
+            print(f"    heartbeat_ts={_fmt_val(hb)}（{age_txt}） "
+                  f"last_error={_fmt_val(xst.get('last_error'))}")
+            print(f"    last_recovery_action={_fmt_val(xst.get('last_recovery_action'))} "
+                  f"last_recovery_at={_fmt_val(xst.get('last_recovery_at'))} "
+                  f"updated_at={_fmt_val(xst.get('updated_at'))} "
+                  f"writer={_fmt_val(xst.get('writer'))}")
+            if (xst.get("status") == "exporting" and age_txt != "缺失"
+                    and hb_age is not None and hb_age > es.STALE_AFTER_S):
+                print(f"    ⚠️ 心跳超过 {es.STALE_AFTER_S}s：只读推导为 stale"
+                      f"（未回收；回收落盘由导出链 reap_stale 执行）")
+    return 0
+
+
 def _load_watch_config(path: Optional[str], *, quiet: bool = False) -> dict[str, Any]:
     """监听配置来源：--config 显式文件 > pipeline/presets.json 的 watch 段（每轮热加载）。"""
     if path:
@@ -1227,6 +1336,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub = ap.add_subparsers(dest="command")
     p_st = sub.add_parser("status", help="查看锁与进度")
     p_st.add_argument("--job", action="append", required=True)
+    p_in = sub.add_parser("inspect", help="只读聚合视图：intent / edit / export（不写文件、不触发调度）")
+    p_in.add_argument("--job", action="append", required=True,
+                      help="cover_job 目录或其中的 job.json")
     p_pl = sub.add_parser("plan", help="查看所有剧的阶段/意图/下一步/被挡原因（不执行）")
     p_pl.add_argument("--job", action="append", default=None)
     p_pl.add_argument("--root", action="append", default=None)
@@ -1235,6 +1347,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = ap.parse_args(argv)
     if args.command == "status":
         return cmd_status(args)
+    if args.command == "inspect":
+        return cmd_inspect(args)
     if args.command == "plan":
         return cmd_plan(args)
     return cmd_watch(args)

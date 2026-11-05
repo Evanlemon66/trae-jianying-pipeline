@@ -35,12 +35,12 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import time
 from typing import Any, Optional
 
 import export_state as _es  # 复用导出侧退避序列，保证两阶段一致
+import state_io as _sio  # 原子写/幂等落盘/version 的公共实现
 
 STATE_NAME = ".edit_state.json"
 
@@ -78,53 +78,16 @@ def _default() -> dict[str, Any]:
 
 
 def _atomic_write(job_dir: str, data: dict[str, Any]) -> None:
-    data = dict(data)
-    data["updated_at"] = _iso()
-    data["writer"] = os.getpid()
-    path = state_path(job_dir)
-    tmp = path + ".tmp"
-    try:
-        os.makedirs(job_dir, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        # Windows 上目标文件可能被杀软/索引短暂占用，os.replace 偶发 PermissionError；
-        # 原子替换必须成功才算写入，故短重试而不是静默吞掉（同 export_state）。
-        for i in range(5):
-            try:
-                os.replace(tmp, path)
-                return
-            except OSError:
-                if i == 4:
-                    raise
-                time.sleep(0.05 * (i + 1))
-    except OSError:
-        try:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
+    _sio.atomic_write(job_dir, STATE_NAME, data)
 
 
 def _read_raw(job_dir: str) -> Optional[dict[str, Any]]:
-    try:
-        with open(state_path(job_dir), encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else None
-    except (OSError, ValueError):
-        return None
+    return _sio.read_raw(job_dir, STATE_NAME)
 
 
 def _save_if_changed(job_dir: str, new: dict[str, Any]) -> dict[str, Any]:
     """幂等落盘：与现内容一致则跳过（不刷 mtime、不产生副作用）。"""
-    cur = _read_raw(job_dir)
-    if cur is not None:
-        same = all(cur.get(k) == v for k, v in new.items()
-                   if k not in ("updated_at", "writer"))
-        if same:
-            return cur
-    _atomic_write(job_dir, new)
-    return new
+    return _sio.save_if_changed(job_dir, STATE_NAME, new)
 
 
 # ── 读取 ─────────────────────────────────────────────────────────
