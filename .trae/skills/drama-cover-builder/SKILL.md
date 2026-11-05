@@ -1,11 +1,11 @@
 ---
 name: drama-cover-builder
-description: 中文短剧封面全链路：从简介生成封面标题（3 方案 × 4 版本 = 12 条，编号 T1—T12）、按选定标题生成横/竖封面图、从视频抽帧。触发词：短剧封面、做封面、生成短剧标题、抽帧、合成封面。不用于非短剧封面、通用海报、剧本正文或分镜、日历选题、图片精修、剪映草稿写入（那是 pipeline/lib/jy_cover 的事）。默认先出 12 条标题并停在用户选择门禁，不得自动进入出图阶段。
+description: 中文短剧封面全链路：从简介生成封面标题（3 方案 × 4 版本 = 12 条，编号 T1—T12）、按选定标题生成横/竖封面图、从视频抽帧。触发词：短剧封面、做封面、生成短剧标题、抽帧、合成封面。不用于非短剧封面、通用海报、剧本正文或分镜、日历选题、图片精修；pipeline 侧调度/导出不归本 skill（草稿封面写入用本 skill 的 `write-draft`）。默认先出 12 条标题并停在用户选择门禁，不得自动进入出图阶段。
 ---
 
 # Drama Cover Builder（短剧封面流水线）
 
-阶段模块：Stage 0 建任务目录与 `job.json` → Stage 1 标题生成（核心）→ 用户门禁 → Stage 2 AI 封面生成（核心）→ Stage 2b Pillow 兜底。每阶段可独立调用：既能直接走 CLI，也能 import Python API；阶段之间只通过目录与 `job.json` 交接。剪映草稿封面写入不属于本 skill，由 pipeline 调 `lib/jy_cover.py` 完成。
+阶段模块：Stage 0 建任务目录与 `job.json` → Stage 1 标题生成（核心）→ 用户门禁 → Stage 2 AI 封面生成（核心）→ Stage 2b Pillow 兜底。每阶段可独立调用：既能直接走 CLI，也能 import Python API；阶段之间只通过目录与 `job.json` 交接。剪映草稿封面写入已内置到本 skill（`scripts/drama_cover.py write-draft`：`draft_cover.jpg` + 原生 `composition`），不再依赖 `lib/jy_cover.py`。
 
 ## 文件结构与读取路由
 
@@ -45,7 +45,7 @@ description: 中文短剧封面全链路：从简介生成封面标题（3 方�
 
 | 输入状态 | 必须采取的动作 | 禁止行为 |
 | --- | --- | --- |
-| 剧名 + 简介 + 剧集目录，且要求落盘 | 先执行 Stage 0 `prepare`，再进 Stage 1 | 跳过目录与 `job.json` 直接开写 |
+| 剧名 + 简介 + 剧集目录，且要求落盘 | 先走 Stage 0 建任务目录（Trae 侧 `job_manifest.create_job()`），再进 Stage 1 | 跳过目录与 `job.json` 直接开写 |
 | 只有简介 | 先出素材卡片 → 生成 12 条标题 → 停在门禁 | 自动进入 Stage 2/3 |
 | 简介 + 底图 | 同上；底图仅登记为身份锚点 | 直接把文字压在底图上交付 |
 | 只有视频 | 只抽帧，给 3 个候选帧 | 顺手生成标题或写草稿 |
@@ -53,7 +53,7 @@ description: 中文短剧封面全链路：从简介生成封面标题（3 方�
 | 已选定 3 条标题 | 进入 Stage 2，按版位锁构图 | 重新发散、替换用户已选标题 |
 | 用户自带 3 条自定义标题 | 直接进 Stage 2，不改写、不评分（除非用户要求） | 擅自改写用户的标题 |
 | 只要 1 张竖版投流图 | 只做竖版 1080×1920 | 顺带产出 3 张横版 |
-| 只要写入草稿 | 转交 pipeline（`lib/jy_cover.py`），本 skill 不执行 | 在本 skill 里重写草稿写入逻辑 |
+| 只要写入草稿 | 用 `scripts/drama_cover.py write-draft`（本 skill 内置，写 `draft_cover.jpg` + 原生 composition） | 只写 jpg 不写 composition（剪映会拿首帧覆盖） |
 | 非短剧 / 海报 / 剧本 / 日历 | 说明边界并给转化选项 | 硬套 3×4 结构 |
 
 ### 1.4 追问规则
@@ -66,21 +66,26 @@ description: 中文短剧封面全链路：从简介生成封面标题（3 方�
 
 读取 `references/handoff-contract.md`。这一步只做三件事：建目录、落简介、定参考图。
 
+Stage 0 的建目录入口已从脚本迁到 **Trae 侧库函数** `lib/job_manifest.py::create_job()`（没有 CLI 子命令；`scripts/drama_cover.py` 已移除 `prepare`）：
+
 ```powershell
-python scripts/drama_cover.py prepare --series-dir "D:\短剧\重生八零，打猎卖货养妻女"
+python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.create_job(series_dir=r'D:\短剧\重生八零，打猎卖货养妻女')"
 ```
+
+- 返回 `{job_dir, job_path, job, reference, synopsis, video}`；`job.json` 已存在时抛 `FileExistsError`，需要 `force=True` 重建（对应历史 `history` 事件仍记 `prepare`）。
+- `out_dir` 可覆盖 `cover_job` 的位置；`host` 默认 `trae`。
 
 | 规则 | 说明 |
 | --- | --- |
-| 默认目录 | `<剧集目录>/cover_job`；`--out` 可覆盖 |
+| 默认目录 | `<剧集目录>/cover_job`；`out_dir` 可覆盖 |
 | 目录一次建全 | `01_input` / `02_titles` / `03_prompts` / `04_covers` / `05_video` / `06_publish` / `06_publish/receipts`（receipts 为占位目录，Stage 3 才写内容，缺失不阻断前序阶段） |
 | 自动找输入 | 简介按 `简介.txt → synopsis.txt → 详细简介.txt`；参考图按契约 §5；mp4 唯一时才记 `video.path`，多个则只记数量与命名规律 |
 | 简介只认原文 | 写入 `01_input/synopsis.txt`，Stage 1 只从这里读，不沿用聊天里的改写版 |
 | 参考图只复制 | 复制为 `01_input/reference.*`，并记 `reference_original` 与 `reference_sha256`，原图不动；找不到也继续建目录 |
 | 默认映射 | `cover_1<-T1`、`cover_2<-T2`、`cover_3<-T3`，`titles.gate=pending`；门禁后按用户点选改写 |
-| 不覆盖 | `job.json` 已存在时默认报错，只有 `--force` 才重建 |
+| 不覆盖 | `job.json` 已存在时抛 `FileExistsError`，只有 `force=True` 才重建 |
 
-宿主无本地执行能力（如豆包客户端纯对话）时，**不依赖任何脚本**，按下面的顺序直接执行——本 skill 的 Stage 0/1/2 全部知识都在 `SKILL.md` + `references/` 内，豆包导入后即可完成；本地执行段（草稿封面、视频登记、发布、清理）回 Trae：
+宿主无本地执行能力（如豆包客户端纯对话）时，**不依赖任何脚本**，按下面的顺序直接执行——本 skill 的 Stage 0/1/2 全部知识都在 `SKILL.md` + `references/` 内，豆包导入后即可完成；本地执行段（草稿封面写入 `write-draft`、视频登记、发布、清理）回 Trae：
 
 **Stage 0（建任务）**
 
@@ -110,7 +115,7 @@ python scripts/drama_cover.py prepare --series-dir "D:\短剧\重生八零，打
 
 **回 Trae（本地执行段）**
 
-8. 用户回到 Trae 说“封面已就位”，Trae 依次：`validate --fix`（补算全部 hash 并校验）→ `ingest`（登记+规范化+改名+推进 stage）→ `record-video`（登记 pipeline 导出目录）→ 草稿封面（`lib/jy_cover.py`）/ 发布 / 清理；或一条 `python lib/cover_watch.py --root "D:/短剧"` 全自动跑完（含串流导出 mp4 与 Toast 通知）。豆包侧至此交付完毕。
+8. 用户回到 Trae 说“封面已就位”，Trae 依次：`validate --fix`（补算全部 hash 并校验）→ `ingest`（登记+规范化+改名+推进 stage）→ `record-video`（登记 pipeline 导出目录）→ 草稿封面（`scripts/drama_cover.py write-draft`）/ 发布 / 清理；或一条 `python lib/cover_watch.py --root "D:/短剧"` 全自动跑完（含串流导出 mp4 与 Toast 通知）。豆包侧至此交付完毕。
 
 唯一规则：**不在对话里手写 job.json**（它是 Trae 侧 CLI 的收口产物），也绝不编造 hash；只交内容产物，文件内容必须完整可复制，不给“略”。
 
@@ -245,7 +250,6 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 
 | 命令 | 作用 |
 | --- | --- |
-| `prepare` | 建任务目录、落简介、定参考图、写 `job.json` |
 | `record-titles` | 登记 Stage 1 的 12 条标题与提示词快照 |
 | `select` | 人工门禁：写 `titles.selected` 并回填 `cover_map` |
 | `resolve` | Stage 2 取上下文：标题+参考图+提示词，门禁未过自动选分（`--dry-run`/`--no-auto`） |
@@ -256,6 +260,10 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 | `title` | 打印标题规范路径（Agent 读规范后在线生成，Ollama 兜底） |
 | `art-from-video` | ffmpeg select+thumbnail 抽最佳帧 |
 | `compose-pillow` | Pillow 合成，4 样式 × 2 尺寸族，标题可选 |
+| `write-draft` | 写剪映草稿封面：`draft_cover.jpg` + 剪映原生 `composition`（只写 jpg 会被首帧覆盖） |
+| `full` | 一键链路：底图/抽帧 → 竖版合成 →（可选）`write-draft` |
+
+Stage 0 的建目录**不在脚本里**：入口是 Trae 侧 `lib/job_manifest.py::create_job()`（Python API，无 CLI 子命令；历史事件仍记 `prepare`）。
 
 串流残留清理（发布流程未自动化，默认信任"已发布"）：`python pipeline/stream_manifest.py clean --job "<草稿名>" --dry-run` 先核对，去掉 `--dry-run` 才真删；默认删 `__jycache__`/`_work_*`/成品目录、**不删 C 盘草稿**（连草稿加 `--include-drafts`），严格模式加 `--require-receipts`，**只想清中间产物、保留成品与草稿**用 `--intermediates-only`。
 
@@ -265,16 +273,16 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 
 导出完成**不等于**归档：`job.json.stage=archived` 是合法 stage，含义为「已归档、不再参与调度」，由 `pipeline/archive_job.py` 写入（watcher 的触发判定对它硬拦，`--phase` / `--once` / `--job` 都绕不过去）。归档是显式操作：默认准入 `publish.status=published` 或 `video.export_state=cleaned`（`--force` 可跳过）；首次归档时有活锁（`.watcher.lock`）或 `.export_state.json` `status=exporting` 则拒绝；`archive_root` 等于或位于 `watch.roots` 之下、或 `watch.roots` 为空时直接拒绝（fail-closed）。整剧目录搬到 `<archive_root>/<剧名>`，并同步改写 `pipeline/_stream_manifests/*.json` 的 `paths.source_dir`（否则后续清理按旧路径找不到源）；`stage` 已 archived 但目录未搬净时，重跑同一命令即续做。注意：自动发布链不写 `publish.status`（只有手工 `publish-record` 会置 `published`），不要依据它判断是否已发布。契约见 `references/handoff-contract.md` §7.4。
 
-剪映草稿封面写入（`draft_cover.jpg` + 原生 composition）已下沉为共享库 `lib/jy_cover.py`，由 pipeline 在导出链路调用，**不属于本 skill**：
+剪映草稿封面写入（`draft_cover.jpg` + 原生 composition）已内置到本 skill，不再依赖 `lib/jy_cover.py`：
 
-```python
-import sys
-sys.path.insert(0, "<repo>/lib")
-from jy_cover import set_draft_cover, set_cover_composition
-
-set_draft_cover(draft_dir, cover_image="cover.jpg")
-set_cover_composition(draft_dict, draft_dir, "cover.jpg")
+```powershell
+python scripts/drama_cover.py write-draft --cover "<封面图>" --draft-dir "<草稿目录>"
+python scripts/drama_cover.py full --video "<mp4>" --title "<标题>" --out "<输出目录>" [--draft-dir "<草稿目录>"]
 ```
+
+- **必须写 composition**：剪映 5.9 打开草稿时若顶层 `cover` 字段为 `None`，会用第一帧覆盖 `draft_cover.jpg`；只写 jpg 的封面会被吃掉。
+- `write-draft` 读取草稿目录里的 `draft_content.json`，依次写 `draft_cover.jpg`、原生 composition，再原子写回草稿。
+- `full` 只做「底图/抽帧 → 竖版 `bottom_tape` 合成 →（可选）写草稿」，不做标题生成；`--synopsis` 仅为兼容保留。
 
 ## 十、cover_watch：落盘两阶段调度
 

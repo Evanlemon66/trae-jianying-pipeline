@@ -39,13 +39,13 @@ D:\短剧\<剧名>\
     └── 06_publish\
         ├── youtube.json
         ├── tiktok.json
-        └── receipts\                  # 占位目录：由 prepare 预建，内容由 Stage 3 写入；缺失不阻断前序阶段（见 §8）
+        └── receipts\                  # 占位目录：由 create_job 预建，内容由 Stage 3 写入；缺失不阻断前序阶段（见 §8）
 ```
 
 规则：
 
-- `--out` 可覆盖默认目录；未传时：有 `--series-dir` → `<剧集目录>/cover_job`，否则 `./jobs/<剧名>`。
-- 目录由 `prepare` 一次建全（含占位目录 `06_publish/receipts`），后续阶段**只写自己的子目录**。占位目录允许为空；`06_publish/receipts` 缺失**不阻断前序阶段**，只在 `publish_ready` / `published` 校验时要求存在（见 §8）。
+- `out_dir` 可覆盖默认目录；未传时：有 `series_dir` → `<剧集目录>/cover_job`，否则 `./jobs/<剧名>`。
+- 目录由 Trae 侧 `lib/job_manifest.py::create_job()` 一次建全（含占位目录 `06_publish/receipts`；Python API，无 CLI 子命令），后续阶段**只写自己的子目录**。占位目录允许为空；`06_publish/receipts` 缺失**不阻断前序阶段**，只在 `publish_ready` / `published` 校验时要求存在（见 §8）。
 - 所有路径写入 `job.json` 时使用相对任务目录的正斜杠路径，例如 `../封面.png`。
 - 文件名一律 ASCII；剧名、标题只存在于 `job.json` 和 md 文件里。
 
@@ -110,7 +110,7 @@ D:\短剧\<剧名>\
 | `cleanup` | object | 见 §6 |
 | `history` | array | `{at,event,detail,revision}` 追加写 |
 
-**单一写入口**：`job.json` 是**收口产物**，不是 agent 的交付物。第三方 agent 只交内容产物（`titles.json`、`selection.json`、`prompts.json`、4 张图）与调度意图声明（`dispatch.json`，可选），`job.json` 由 `prepare` / `record-titles` / `select` / `ingest` / `set-cut` / `record-video` 生成与更新。`ingest` 同时负责宽容规范化（`selected` 对象/`"T9"`/`9`/纯文本、`slot` 数字/`"封面1"`、`stage` 别名如 `covers_done`、图片任意命名）并把 `dispatch.json` 归并进 `workflow` 段，全部动作记入 `history`。`workflow.intent_revision` 是人工意图标记：仅人工 +1，程序路径只读；变大即视为人工最终意图（`intent_source=manual`），此后 `dispatch.json` 只补缺失、不覆盖。
+**单一写入口**：`job.json` 是**收口产物**，不是 agent 的交付物。第三方 agent 只交内容产物（`titles.json`、`selection.json`、`prompts.json`、4 张图）与调度意图声明（`dispatch.json`，可选），`job.json` 由 `create_job`（Trae 侧 Python API，原 `scripts/drama_cover.py prepare` 已移除）/ `record-titles` / `select` / `ingest` / `set-cut` / `record-video` 生成与更新。`ingest` 同时负责宽容规范化（`selected` 对象/`"T9"`/`9`/纯文本、`slot` 数字/`"封面1"`、`stage` 别名如 `covers_done`、图片任意命名）并把 `dispatch.json` 归并进 `workflow` 段，全部动作记入 `history`。`workflow.intent_revision` 是人工意图标记：仅人工 +1，程序路径只读；变大即视为人工最终意图（`intent_source=manual`），此后 `dispatch.json` 只补缺失、不覆盖。
 
 示例（准备阶段）：
 
@@ -173,7 +173,7 @@ D:\短剧\<剧名>\
 
 | stage | 含义 | 谁写入 |
 | --- | --- | --- |
-| `prepared` | 目录与输入就绪 | `prepare` |
+| `prepared` | 目录与输入就绪 | `create_job`（历史事件仍记 `prepare`） |
 | `titles_done` | 12 条标题与初始提示词已落盘 | Stage 1 |
 | `titles_selected` | 用户点满 3 个编号，`gate=done` | 门禁 |
 | `prompts_ready` | 4 条出图提示词已写入 | Stage 1.5 |
@@ -196,7 +196,7 @@ D:\短剧\<剧名>\
 | 3 | 守护挡身 | `T3` | `cover_03_guard.png` |
 | vertical | 胸像逆光 | 不参与默认映射 | `cover_04_vertical.png` |
 
-- `prepare` 按 **1-1 / 2-2 / 3-3** 预填 `title_id`，`title` 为 `null`。
+- `create_job` 按 **1-1 / 2-2 / 3-3** 预填 `title_id`，`title` 为 `null`。
 - 门禁完成后写 `titles.selected`（3 项 `{slot,title_id}`），并回填 `cover_map[].title_id` / `title`，`gate=done`。
 - **硬约束**：`titles.gate` 只能是 `pending` / `done`，禁止自造枚举（把「已选定」写成 `gate="selected"` 是常见错误）；`titles.selected` 必须是 3 个对象 `{slot,title_id,title}`，禁止字符串/数字数组。已落盘的违规形态用 `validate --job <cover_job> --fix` 修复（规范化 gate/selected、记一条 `validate_fix` history），不要手改文件。
 - 三条横版必须与标题一一对应；竖版标 `role=video_cover`。
@@ -211,7 +211,7 @@ Stage 2 单独执行、且调用方没传参数时，按下列顺序回查：
 | 输入 | 顺序 |
 | --- | --- |
 | 标题 | `titles.gate=done` 用 `selected` → 未过门禁但有 `titles.json`（含评分）时按兜底模式自动选 3 条：**推荐模式**（默认，`summary.recommended` 推荐池按总分取前 3，不足 3 条从全量补足，推荐池缺失退化为全量评分）/ **评分模式**（全量取前 3）；总分相同推荐条目优先，再平按 内容兑现→信息缺口→情绪峰值；写回 `selected_by="auto"` + `auto_mode` 并追加 history → 无评分数据则报错停下 |
-| 参考图 | 显式参数 → `input.reference_image` → `input.reference_original` → 剧集目录探测 → 空并告警 |
+| 参考图 | 显式参数 → `input.reference_image` → `input.reference_original` → 剧集目录探测 → 空并告警。剧集目录探测以 `job_manifest.detect_reference_image` 为准：文件名精确命中（`封面.png/.jpg/.jpeg/.webp` 等）→ 名字含「封面/cover」（排除海报/横版/logo 等 token 后按自然序取第一）→ 自然序第一张；skill 脚本另带自包含兜底 `drama_cover.detect_cover_from_dir`（仅「`封面.*` 精确名 → 目录首图」两级，无排除规则），供无 `lib/` 环境使用，**不参与 job.json 登记** |
 | 提示词 | 显式参数 → `03_prompts/prompts.json` → `job.json.prompts.items` → `cover_map[slot].prompt` → 由选中标题 + 构图反推 |
 
 自动选分是可审计的兜底，不是静默代选：`selected_by="auto"` 与 `auto_mode`（recommended/score）会留在 `job.json` 里，用户事后可显式改选（revision 递增，旧封面标 `stale`）。需要严格门禁时用 `resolve --no-auto`，门禁未过直接报错。
@@ -281,8 +281,8 @@ python lib/job_manifest.py publish-record --job "<cover_job>" `
 ## 7. 写入与校验
 
 ```powershell
-# 建目录（只给剧集目录即可，自动找 简介.txt / 封面 / mp4）
-python scripts/drama_cover.py prepare --series-dir "D:\短剧\重生八零，打猎卖货养妻女"
+# 建目录（Trae 侧 Python API；原 scripts/drama_cover.py prepare 已移除）
+python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.create_job(series_dir=r'D:\短剧\重生八零，打猎卖货养妻女')"
 
 # 登记 Stage 1 结果（标题、初始提示词）
 python lib/job_manifest.py record-titles --job "D:\短剧\重生八零，打猎卖货养妻女\cover_job" `
@@ -314,6 +314,10 @@ python lib/job_manifest.py derive --job "<cover_job>" --platform all --slot 2
 # Stage 2 收口：从落盘产物（prompts.json + 4 张契约图）重建 job.json
 # 收登记、规范化（selected.slot 中文→数字）、补 hash、推进 stage（只进不退），幂等
 python lib/job_manifest.py ingest --job "<cover_job>" [--dry-run]
+
+# 写剪映草稿封面（本 skill 内置；draft_cover.jpg + 原生 composition，缺 composition 会被首帧覆盖）
+python scripts/drama_cover.py write-draft --cover "<封面图>" --draft-dir "<草稿目录>"
+python scripts/drama_cover.py full --video "<mp4>" --title "<标题>" --out "<输出目录>" [--draft-dir "<草稿目录>"]
 
 # 落盘两阶段调度（监听 cover_job，产物齐自动跑；串行、每轮只推进一部）
 #   edit 阶段：validate --fix → ingest（含 dispatch 归并）→ batch_runner --no-export（生成串流草稿+帧对齐）
@@ -472,4 +476,4 @@ edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读�
 | Stage 1.5 | `03_prompts/` | `prompts.json` / `prompts.md` | 4 条出图提示词，豆包/火山/Trae 三渠道共用 |
 | Stage 2 | `04_covers/` | 3 横版 + 1 竖版 + `derived/` | 平台用图；derived 放 YouTube 16:9 等派生尺寸 |
 | pipeline | 只写 `job.json` | `video.export_dir/export_file/draft_name/companions/export_state` | 只记录导出位置（允许绝对路径），不复制 mp4；`05_video/` 留作需要副本时的可选目录。`record_video` 置 `export_state=exported`；`stream_manifest.py clean` 真正删除成品后置 `cleaned`（history 记 `export_cleaned`） |
-| Stage 3 | `06_publish/` | `<platform>.json` + `receipts/` | 每平台状态与回执，驱动 `cleanup` 判定；`receipts/` 由 `prepare` 预建占位，内容（回执）只在 Stage 3 首次写入时落盘，缺失不阻断前序阶段 |
+| Stage 3 | `06_publish/` | `<platform>.json` + `receipts/` | 每平台状态与回执，驱动 `cleanup` 判定；`receipts/` 由 `create_job` 预建占位，内容（回执）只在 Stage 3 首次写入时落盘，缺失不阻断前序阶段 |
