@@ -54,7 +54,8 @@ check("第 2 次退避≈120s", abs((st["next_retry_at"] - now) - 120) <= 2, st[
 
 print("\n== ② 第 3 次置 paused 且 toast ==")
 toasts.clear()
-cw.note_edit_result(jd, "退避", False, error="e3", failure_class="unknown", retryable=True)
+cw.note_edit_result(jd, "退避", False, error="e3", failure_class="unknown", retryable=True,
+                    pause_after=eds.DEFAULT_PAUSE_AFTER)
 st = eds.load(jd)
 check("第 3 次触发 paused", st["status"] == "paused", st)
 check("paused 后 next_retry_at=0", st["next_retry_at"] == 0)
