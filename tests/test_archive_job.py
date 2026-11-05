@@ -47,6 +47,13 @@ ARCH = os.path.join(TMP, "archive")
 MF = os.path.join(TMP, "manifests")
 os.makedirs(ROOT, exist_ok=True)
 os.makedirs(MF, exist_ok=True)
+ROOTS = [ROOT]
+
+
+def run(jd, archive_root=None, *, dry_run=False, roots=None):
+    """默认以临时 ROOT 作为 watch.roots，避免测试依赖本机 presets.json。"""
+    return aj.archive(jd, archive_root or ARCH, MF, dry_run=dry_run,
+                      roots=ROOTS if roots is None else roots)
 
 
 def make_job(name, stage="video_ready", export_state=None, publish_status="not_ready"):
@@ -78,7 +85,7 @@ def write_manifest(name, series):
 print("\n== ① dry-run ==")
 series, jd = make_job("dry", export_state="cleaned")
 write_manifest("dry", series)
-rc = aj.archive(jd, ARCH, MF, dry_run=True)
+rc = run(jd, dry_run=True)
 check("dry-run 返回 0", rc == 0, rc)
 check("dry-run 未改 stage", read_job(jd)["stage"] == "video_ready", read_job(jd)["stage"])
 check("dry-run 未移动目录", os.path.isdir(series) and not os.path.isdir(os.path.join(ARCH, "dry")))
@@ -88,7 +95,7 @@ check("dry-run 未改 manifest",
 print("\n== ② export_state=cleaned 归档 ==")
 series, jd = make_job("cleaned1", export_state="cleaned")
 write_manifest("cleaned1", series)
-rc = aj.archive(jd, ARCH, MF)
+rc = run(jd)
 new_series = os.path.join(ARCH, "cleaned1")
 check("返回 0", rc == 0, rc)
 check("旧目录已移走", not os.path.isdir(series))
@@ -102,13 +109,13 @@ check("manifest source_dir 同步",
 
 print("\n== ③ publish.status=published 归档 ==")
 series, jd = make_job("pub1", stage="publish_ready", publish_status="published")
-rc = aj.archive(jd, ARCH, MF)
+rc = run(jd)
 check("返回 0", rc == 0, rc)
 check("已移动", os.path.isdir(os.path.join(ARCH, "pub1", "cover_job")))
 
 print("\n== ④ 未满足准入 ==")
 series, jd = make_job("notready", stage="covers_ready")
-rc = aj.archive(jd, ARCH, MF)
+rc = run(jd)
 check("跳过返回 1", rc == 1, rc)
 check("stage 未变", read_job(jd)["stage"] == "covers_ready")
 check("目录原地", os.path.isdir(os.path.join(series, "cover_job")))
@@ -116,7 +123,7 @@ check("目录原地", os.path.isdir(os.path.join(series, "cover_job")))
 print("\n== ⑤ 归档目标已存在 ==")
 series, jd = make_job("conflict", export_state="cleaned")
 os.makedirs(os.path.join(ARCH, "conflict"), exist_ok=True)
-rc = aj.archive(jd, ARCH, MF)
+rc = run(jd)
 check("跳过返回 1", rc == 1, rc)
 check("stage 未变", read_job(jd)["stage"] == "video_ready")
 
@@ -124,7 +131,7 @@ print("\n== ⑥ 活锁 ==")
 series, jd = make_job("locked", export_state="cleaned")
 with open(os.path.join(jd, ".watcher.lock"), "w", encoding="utf-8") as f:
     json.dump({"pid": os.getpid()}, f)
-rc = aj.archive(jd, ARCH, MF)
+rc = run(jd)
 check("跳过返回 1", rc == 1, rc)
 check("stage 未变", read_job(jd)["stage"] == "video_ready")
 
@@ -132,7 +139,7 @@ print("\n== ⑦ 导出中 ==")
 series, jd = make_job("exporting", export_state="cleaned")
 with open(os.path.join(jd, ".export_state.json"), "w", encoding="utf-8") as f:
     json.dump({"status": "exporting"}, f)
-rc = aj.archive(jd, ARCH, MF)
+rc = run(jd)
 check("跳过返回 1", rc == 1, rc)
 check("stage 未变", read_job(jd)["stage"] == "video_ready")
 
@@ -145,12 +152,12 @@ print("\n== ⑨ 移动失败后重跑续做 ==")
 series, jd = make_job("resume", export_state="cleaned")
 write_manifest("resume", series)
 with mock.patch.object(aj.shutil, "move", side_effect=OSError("模拟移动失败")):
-    rc = aj.archive(jd, ARCH, MF)
+    rc = run(jd)
 check("首次失败返回 2", rc == 2, rc)
 check("stage 已置 archived", read_job(jd)["stage"] == "archived")
 check("源目录未动", os.path.isdir(os.path.join(series, "cover_job")))
 check("目标未生成", not os.path.exists(os.path.join(ARCH, "resume")))
-rc = aj.archive(jd, ARCH, MF)
+rc = run(jd)
 check("重跑续做返回 0", rc == 0, rc)
 check("重跑后已移动", os.path.isdir(os.path.join(ARCH, "resume", "cover_job")))
 check("源已不在", not os.path.isdir(series))
@@ -176,6 +183,34 @@ with contextlib.redirect_stdout(buf):
 out = buf.getvalue()
 check("等于 roots 也拒绝", rc == 2, rc)
 check("等于 roots 报错同样指明 root", "命中 root" in out and ROOT in out, out.strip())
+
+print("\n== ⑪ 盘符根 root 修正（不再双分隔符失效） ==")
+check("root=D:/ 时 D:/短剧/存档 命中", aj._root_hit("D:/短剧/存档", ["D:/"]) == "D:/")
+check("root=D:/ 时 D:/短剧_存档 也在 D: 盘内，命中", aj._root_hit("D:/短剧_存档", ["D:/"]) == "D:/")
+check("root=D:/短剧 时 D:/短剧_存档 不命中（分隔符守卫）",
+      aj._root_hit("D:/短剧_存档", ["D:/短剧"]) is None)
+series, jd = make_job("drive_root", export_state="cleaned")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = aj.archive(jd, "D:/短剧/存档", MF, roots=["D:/"])
+out = buf.getvalue()
+check("盘符根下归档池 rc=2", rc == 2, rc)
+check("拒绝文案指明命中 root", "命中 root" in out and "D:/" in out, out.strip())
+check("stage 未变", read_job(jd)["stage"] == "video_ready")
+check("目录原地", os.path.isdir(os.path.join(series, "cover_job")))
+
+print("\n== ⑫ roots 为空 fail-closed ==")
+series, jd = make_job("noroots", export_state="cleaned")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = aj.archive(jd, ARCH, MF, roots=[])
+out = buf.getvalue()
+check("roots 为空返回 2", rc == 2, rc)
+check("文案说明未配置 watch.roots 且已拒绝",
+      "未配置 watch.roots" in out and "已拒绝执行" in out, out.strip())
+check("stage 未变", read_job(jd)["stage"] == "video_ready")
+check("目录原地", os.path.isdir(os.path.join(series, "cover_job")))
+check("归档目录未创建", not os.path.exists(os.path.join(ARCH, "noroots")))
 
 print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
 sys.exit(0 if not fails else 1)

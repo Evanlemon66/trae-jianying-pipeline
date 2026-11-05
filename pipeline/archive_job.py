@@ -13,7 +13,8 @@ video.status=done 挡住已导出剧，但剧目录仍留在公共 roots；本�
   - video.export_state == "cleaned"（成品已清理，视为发布后的收尾）
 其余情况跳过；确需归档用 --force。
 拒绝条件：.watcher.lock 的 pid 仍存活；.export_state.json status=exporting；
-归档目标已存在；archive_root 等于或位于任一 watch.roots 之下（规范化真实路径比较）。
+归档目标已存在；archive_root 等于或位于任一 watch.roots 之下（规范化真实路径比较）；
+watch.roots 未配置（fail-closed，无法校验位置时拒绝执行）。
 
 断点可重入：stage 已是 archived 时，只要源目录仍在、归档目标不存在，就继续移动；
 只有"源目录已不在"或"目标已存在"才跳过。
@@ -99,7 +100,7 @@ def _root_hit(archive_root: str, roots: list[str]) -> str | None:
     """archive_root 等于或位于某个 root 之下时返回该 root，否则 None。"""
     ar = _real(archive_root)
     for root in roots:
-        rr = _real(root)
+        rr = _real(root).rstrip(os.sep)
         if ar == rr or ar.startswith(rr + os.sep):
             return root
     return None
@@ -156,7 +157,13 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
     print(f"归档 [{name}] stage={job.get('stage')}")
 
     archive_root = os.path.abspath(archive_root)
-    hit = _root_hit(archive_root, _watch_roots() if roots is None else roots)
+    roots_list = _watch_roots() if roots is None else roots
+    if not roots_list:
+        # fail-closed：没有 roots 就无法判断归档池是否落在公共区，宁可不搬
+        print("  [FAIL] 未配置 watch.roots，无法校验归档池位置，已拒绝执行；"
+              "请检查 pipeline/presets.json 的 watch 段 roots")
+        return 2
+    hit = _root_hit(archive_root, roots_list)
     if hit:
         print(f"  [FAIL] archive_root 不能等于或位于 watch.roots 之下"
               f"（命中 root: {hit}）: {archive_root}")
