@@ -107,6 +107,10 @@ def check_trigger(job_dir: str) -> tuple[bool, list[str]]:
     if (job.get("titles") or {}).get("gate") != "done":
         reasons.append("titles.gate != done")
     stage = jm.canon_stage(job.get("stage"))
+    if stage == "archived":
+        # 归档剧显式硬拦：即使有人放宽 TRIGGER_STAGES 或误改 job.json，也不再进入调度
+        reasons.append("stage=archived（已归档，不再调度）")
+        return False, reasons
     if stage not in TRIGGER_STAGES:
         reasons.append(f"stage={job.get('stage')} 不在可触发集合")
     if (job.get("video") or {}).get("status") == "done":

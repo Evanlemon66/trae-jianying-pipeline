@@ -56,6 +56,7 @@ STAGES = (
     "video_ready",
     "publish_ready",
     "published",
+    "archived",
 )
 
 # 兼容第三方 agent 的别名写法（收口时统一映射到契约值）
