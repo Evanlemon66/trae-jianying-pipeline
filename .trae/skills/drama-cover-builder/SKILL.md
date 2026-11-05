@@ -263,6 +263,8 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 
 `job.json.video.export_state` 记录成品生命周期（`null`/`exported`/`cleaned`）：`record_video` 置 `exported`，clean 真正删成品后自动置 `cleaned`（`--dry-run`/`--intermediates-only` 不回写），不改 `stage`。
 
+导出完成**不等于**归档：`job.json.stage=archived` 是合法 stage，含义为「已归档、不再参与调度」，由 `pipeline/archive_job.py` 写入（watcher 的触发判定对它硬拦，`--phase` / `--once` / `--job` 都绕不过去）。归档是显式操作：默认准入 `publish.status=published` 或 `video.export_state=cleaned`（`--force` 可跳过）；首次归档时有活锁（`.watcher.lock`）或 `.export_state.json` `status=exporting` 则拒绝；`archive_root` 等于或位于 `watch.roots` 之下、或 `watch.roots` 为空时直接拒绝（fail-closed）。整剧目录搬到 `<archive_root>/<剧名>`，并同步改写 `pipeline/_stream_manifests/*.json` 的 `paths.source_dir`（否则后续清理按旧路径找不到源）；`stage` 已 archived 但目录未搬净时，重跑同一命令即续做。注意：自动发布链不写 `publish.status`（只有手工 `publish-record` 会置 `published`），不要依据它判断是否已发布。契约见 `references/handoff-contract.md` §7.4。
+
 剪映草稿封面写入（`draft_cover.jpg` + 原生 composition）已下沉为共享库 `lib/jy_cover.py`，由 pipeline 在导出链路调用，**不属于本 skill**：
 
 ```python
@@ -284,12 +286,20 @@ python lib/cover_watch.py plan --root "D:/短剧"  # 只查看：各剧阶段/�
 python lib/cover_watch.py --hold --once          # 只列计划不执行（先核对 job.json 再放行）
 python lib/cover_watch.py --phase export --once  # 单轮强制只推进导出（配合 export_policy=manual）
 python lib/cover_watch.py status --job "<cover_job>"
+python lib/cover_watch.py inspect --job "<cover_job>"   # 只读聚合：intent / edit / export（不落盘、不触发）
 ```
 
-配置 `<repo>/pipeline/presets.json` 的 `watch` 段（从 `presets.example.json` 复制起步），每轮热加载、改完不用重启：`{"watch":{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":[],"export_policy":"immediate","hold":false}}`。`roots` 下的 `<剧集>/cover_job` 自动发现，无需登记。
+归档（把整剧搬到独立归档池，watcher 永久不再调度；先 `--dry-run` 核对）：
+
+```powershell
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档" --dry-run
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档"
+```
+
+配置 `<repo>/pipeline/presets.json` 的 `watch` 段（从 `presets.example.json` 复制起步），每轮热加载、改完不用重启：`{"watch":{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":[],"export_policy":"immediate","hold":false}}`。`roots` 下的 `<剧集>/cover_job` 自动发现，无需登记。归档池根目录另行配置 `watch.archive_root`（仅 `pipeline/archive_job.py` 使用，必须在 `roots` 之外；`roots` 为空时归档脚本拒绝执行）。
 
 **两阶段**：无串流草稿 → **edit**（validate --fix → ingest 归并 dispatch → batch_runner --no-export 生成草稿+帧对齐）；有草稿 + `workflow.mode=full` + 策略放行 → **export**（导出 mp4 → verify 质检 → record-video → derive）。`mode=edit_only` 永远停在草稿，等人工把 `workflow.mode` 改为 `full` 并 `intent_revision` +1。**export_policy**：`immediate`（默认，剪完即导）/ `after_edit_queue_drained`（全部剧剪完才开始导出）/ `manual`（等 `--phase export`）。**意图**：运行期只读 `job.json.workflow`；`dispatch.json` 仅在 `intent_revision==0` 时归并，人工 +1 后 job.json 永远优先（冲突记日志+桌面通知）。旧版 `export_config.json` 仍兼容。多 job 单 watcher 串行；跨进程由 `.export.lock` 互斥。进度看 Toast / `watcher.log` / `06_publish/pipeline.log` / `plan` / `status`。
 
-触发条件（全满足）：4 张图齐（文件名可任意，`ingest` 自动识别改名）、prompts.json 存在、job.json 可解析、`titles.gate="done"`、`stage ∈ {titles_selected, prompts_ready, covers_ready}`（`covers_done` 等别名自动映射）、video 未导出、无活锁、静默 30s（防抖）。封面自动吃 `cover_04_vertical`；导出后自动质检 `verify_export.py`（`--no-verify` 可关）。
+触发条件（全满足）：4 张图齐（文件名可任意，`ingest` 自动识别改名）、prompts.json 存在、job.json 可解析、`titles.gate="done"`、`stage ∈ {titles_selected, prompts_ready, covers_ready}`（`covers_done` 等别名自动映射）、video 未导出、无活锁、静默 30s（防抖）。`stage=archived` 一律不触发（硬拦发生在阶段/单剧过滤之前，`--phase` / `--once` / `--job` 都绕不过）。封面自动吃 `cover_04_vertical`；导出后自动质检 `verify_export.py`（`--no-verify` 可关）。
 
 **导出状态与自愈（Trae 侧自动，豆包侧无需写任何新东西）**：导出状态收敛在 `cover_job/.export_state.json` 单一真源（`cover_watch` 自动写，契约 §7.1）。导出失败按 1/2/4/8/16/30 分钟**退避重试**；连续失败达到 `watch.retry_pause_after`（默认 5）**暂停该剧并桌面通知**，需人工排查后 `--phase export` 放行（放行不清零计数）。**素材缺失 / 磁盘不足**属硬失败，**不重试、不计数**，直接置终态并通知，避免空转。导出前默认冷启动剪映（`watch.cold_start`，默认 true）。豆包侧照旧只交 Stage 0/1/2 内容产物，不需要感知或写这些运行态字段。

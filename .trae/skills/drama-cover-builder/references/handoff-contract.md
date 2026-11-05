@@ -181,8 +181,11 @@ D:\短剧\<剧名>\
 | `video_ready` | mp4 已落 `05_video/` | pipeline |
 | `publish_ready` | 元数据与物料齐 | 发布 skill |
 | `published` | 至少一个平台回执成功 | 发布 skill |
+| `archived` | 已归档，不再参与调度（剧集目录已移入归档池） | `pipeline/archive_job.py` |
 
 只允许向前推进，不回退；失败时只追加 `history`，`stage` 保持不变。每次写 `job.json` 都是「读-改-写 + 原子替换」，`revision` 递增。第三方 agent 写的非契约 stage 别名（`covers_done` / `covers_complete` / `videos_done`）由 `ingest` 与 watcher 统一映射为契约值后再判定。
+
+`archived` 是终结态：watcher 的触发判定对它**硬拦**（`--phase` / `--once` / `--job` 都绕不过去），只由 `pipeline/archive_job.py` 写入，见 §7.4。`publish.status` 当前只有手工 `python lib/job_manifest.py publish-record ...` 会置 `published`，自动发布链没有写入路径（暂未实现），不要依据它判断「已发布」。
 
 ## 4. 标题与封面映射
 
@@ -320,11 +323,18 @@ python lib/cover_watch.py plan --root "D:/短剧"            # 只查看：各�
 python lib/cover_watch.py --hold --once                    # 只列计划不执行（先核对 job.json 再放行）
 python lib/cover_watch.py --phase export --once            # 单轮强制只推进导出阶段（配合 export_policy=manual）
 python lib/cover_watch.py status --job "<cover_job>"
+python lib/cover_watch.py inspect --job "<cover_job>"      # 只读聚合：intent / edit / export（不落盘、不触发调度）
 python lib/cover_watch.py          # 无参：读 <repo>/pipeline/presets.json 的 watch 段（每轮热加载）
+
+# 归档：置 stage=archived 并搬入独立归档池（硬拦 watcher；先 --dry-run 核对计划）
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档" --dry-run
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档"
 # watch 段：{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,
 #            "derive":[],"export_policy":"immediate","hold":false,
-#            "cold_start":true,"export_stall_timeout":1800,"retry_pause_after":5}
+#            "cold_start":true,"export_stall_timeout":1800,"retry_pause_after":5,
+#            "archive_root":"D:/短剧_存档"}
 #   export_policy: immediate（剪完即导，默认）/ after_edit_queue_drained（全部剪完才导出）/ manual（等 --phase export）
+#   archive_root: 归档池根目录，仅 pipeline/archive_job.py 使用；必须位于 roots 之外（见 §7.4）
 #   derive: 全局派生平台列表，默认 []（不派生）；剧级声明优先走 dispatch.json
 #   cold_start: 每部剧导出前冷启动剪映（杀进程→拉起→等首页），默认 true；手动同时用剪映时设 false
 #   export_stall_timeout: 导出「无进展」判定卡死的秒数，默认 1800（进度 json 每 30s 刷新，仍在写盘不误杀）
@@ -434,6 +444,23 @@ edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读�
 - **闸门**：`build_plan` 的 edit 分支先过本闸门——`paused`/`failed`/退避窗口内 → 计划被挡并给出原因（格式与导出侧一致）；`--phase edit` 人工强制放行，**不清零**计数。`editing` 不拦截（watcher 串行 + `.watcher.lock` 已防并发，崩溃残留允许下一轮直接重试）。
 - **收尾**：剪辑成功 → `done` 并清零；之后无草稿才会再进 edit，届时重新计数。
 - **与 `.export_state.json` 的分工**：草稿建成前归本文件管，导出闸门之后归 §7.1 真源管；两文件同级并存、互不读写。
+
+### 7.4 归档（`stage=archived` + 归档池）
+
+`archived` 是合法 stage，含义是「这部剧本该结束了：已发布或成品已清理，不再参与调度」。watcher 的 `check_trigger` 对它**硬拦**，且硬拦发生在阶段/单剧过滤之前——`--phase` / `--once` / `--job` 都绕不过去。
+
+- **唯一写者**：`pipeline/archive_job.py`。非 dry-run 时依次：
+  1. `job_manifest.update_job` 置 `stage=archived`（`revision+1`，`history` 记 `archived`，detail 含目标路径）；
+  2. 把整剧目录 `<root>/<剧名>` 移到 `<archive_root>/<剧名>`（同盘即改名）；
+  3. 改写 `pipeline/_stream_manifests/*.json` 中 `paths.source_dir` 指向旧目录的记录（`.tmp` + `os.replace` 原子写）。
+  `--dry-run` 只打印计划与待改 manifest 条数，不写盘、不移动。
+- **准入**（默认满足其一；`--force` 跳过）：`publish.status=="published"` 或 `video.export_state=="cleaned"`。
+- **拒绝/跳过**（首次归档）：`.watcher.lock` 的 pid 仍存活（活锁）；`.export_state.json` `status=exporting`（导出进行中）；归档目标已存在（不覆盖，需人工处理）；`archive_root` 等于或位于任一 `watch.roots` 之下（按规范化真实路径比较）；`watch.roots` 未配置时 **fail-closed 直接拒绝**（无法校验归档池位置）。续做（已 archived）只重复位置与目标校验，不再查活锁/导出中。
+- **断点可重入**：`stage` 已 `archived` 且源目录仍在、目标不存在 → 继续移动；源已不在且目标存在 → 跳过（视为完成）；两者都不存在 → 报错。因为 `stage` 先写、目录后搬，移动失败也不会再被 scheduler 选中，修复占用/空间后重跑同一命令即可续做。
+- **归档池位置**：`--archive-root` 优先，未传时读 `watch.archive_root`；建议与 `watch.roots` 同盘、独立根（如 `D:/短剧_存档`），不要放在 roots 内。
+- **必须同步 manifest**：`_stream_manifests` 里的 `paths.source_dir` 是后续 `stream_manifest.py clean` / 回执定位的入口；不改写会出现「剧已搬走、清理仍按旧路径找源」的空转。脚本已自动改，手工搬目录时必须照做。
+- **回迁**：目录移回 roots 后不会自动恢复调度，仍需人工把 `job.json.stage` 改回 `video_ready`（或其他待办阶段）。
+- **`publish.status` 现状**：只有手工 `python lib/job_manifest.py publish-record ...` 会写 `published`；自动发布链**没有写入路径（暂未实现）**。因此不要依据 `publish.status` 判断「已发布」，归档准入实际以 `video.export_state=="cleaned"` 为准，或显式 `--force`。
 
 ## 8. 各阶段产物与意义
 
