@@ -12,6 +12,11 @@
   ⑧ stage=archived 被 cover_watch.check_trigger 硬拦
   ⑨ 移动失败后重跑：stage 已 archived，源仍在、目标不存在 → 续做成功，不重复记事件
   ⑩ archive_root 等于/嵌在 roots 下 → 拒绝，报错指明命中的 root
+  ⑪ 盘符根 root 的分隔符守卫
+  ⑫ roots 为空 fail-closed
+  ⑬ job_dir 不是 <剧名>/cover_job → 拒绝（--force 也不行）
+  ⑭ 剧集目录不是 watch.roots 的直接子级 → 拒绝
+  ⑮ 剧集目录是盘符根 → 拒绝
 
 运行：python tests\\test_archive_job.py（纯临时目录，不碰真实剧）
 """
@@ -69,6 +74,20 @@ def make_job(name, stage="video_ready", export_state=None, publish_status="not_r
     job["publish"]["status"] = publish_status
     jm.save_job(job, jd)
     return series, jd
+
+
+def make_job_at(series, leaf, name, stage="video_ready", export_state="cleaned"):
+    """在任意目录结构下建一部剧（用于路径守卫用例）。"""
+    jd = os.path.join(series, leaf)
+    for rel in jm.JOB_DIRS:
+        os.makedirs(os.path.join(jd, *rel.split("/")), exist_ok=True)
+    with open(os.path.join(jd, "01_input", "synopsis.txt"), "w", encoding="utf-8") as f:
+        f.write("测试简介")
+    job = jm.build_job(name)
+    job["stage"] = stage
+    job["video"]["export_state"] = export_state
+    jm.save_job(job, jd)
+    return jd
 
 
 def read_job(jd):
@@ -211,6 +230,58 @@ check("文案说明未配置 watch.roots 且已拒绝",
 check("stage 未变", read_job(jd)["stage"] == "video_ready")
 check("目录原地", os.path.isdir(os.path.join(series, "cover_job")))
 check("归档目录未创建", not os.path.exists(os.path.join(ARCH, "noroots")))
+
+print("\n== ⑬ job_dir 不是 <剧名>/cover_job → 拒绝 ==")
+series = os.path.join(ROOT, "notcover")
+jd = make_job_at(series, "jobs", "notcover")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = run(jd)
+out = buf.getvalue()
+check("非 cover_job 返回 2", rc == 2, rc)
+check("报错说明必须是 cover_job", "cover_job" in out and "[FAIL]" in out, out.strip())
+check("非 cover_job 源目录未移动", os.path.isdir(jd) and os.path.isdir(series))
+check("非 cover_job 未生成归档目标", not os.path.exists(os.path.join(ARCH, "notcover")))
+check("非 cover_job stage 未变", read_job(jd)["stage"] == "video_ready")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = aj.archive(jd, ARCH, MF, force=True, roots=ROOTS)
+check("非 cover_job 加 --force 仍拒绝", rc == 2, rc)
+
+print("\n== ⑭ 剧集目录不是 roots 直接子级 → 拒绝 ==")
+series = os.path.join(ROOT, "sub", "deep")
+jd = make_job_at(series, "cover_job", "deep")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = run(jd)
+out = buf.getvalue()
+check("更深层返回 2", rc == 2, rc)
+check("报错说明必须是直接子级", "直接子级" in out, out.strip())
+check("更深层源目录未移动", os.path.isdir(os.path.join(series, "cover_job")))
+check("更深层未生成归档目标", not os.path.exists(os.path.join(ARCH, "deep")))
+check("更深层 stage 未变", read_job(jd)["stage"] == "video_ready")
+
+print("\n== ⑮ 剧集目录是盘符根 → 拒绝 ==")
+series, jd = make_job("driveroot", export_state="cleaned")
+real_dirname = os.path.dirname
+
+
+def fake_dirname(p):
+    # 假装 series 是盘符根：dirname(root) == root
+    if os.path.normcase(os.path.normpath(p)) == os.path.normcase(os.path.normpath(series)):
+        return os.path.normpath(series)
+    return real_dirname(p)
+
+
+buf = io.StringIO()
+with mock.patch.object(aj.os.path, "dirname", side_effect=fake_dirname), \
+        contextlib.redirect_stdout(buf):
+    rc = run(jd)
+out = buf.getvalue()
+check("盘符根返回 2", rc == 2, rc)
+check("报错说明盘符根", "盘符根" in out, out.strip())
+check("盘符根源目录未移动", os.path.isdir(os.path.join(series, "cover_job")))
+check("盘符根 stage 未变", read_job(jd)["stage"] == "video_ready")
 
 print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
 sys.exit(0 if not fails else 1)

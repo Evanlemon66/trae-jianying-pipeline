@@ -14,7 +14,9 @@ video.status=done 挡住已导出剧，但剧目录仍留在公共 roots；本�
 其余情况跳过；确需归档用 --force。
 拒绝条件：.watcher.lock 的 pid 仍存活；.export_state.json status=exporting；
 归档目标已存在；archive_root 等于或位于任一 watch.roots 之下（规范化真实路径比较）；
-watch.roots 未配置（fail-closed，无法校验位置时拒绝执行）。
+watch.roots 未配置（fail-closed，无法校验位置时拒绝执行）；
+job_dir 不是 <剧名>/cover_job；剧集目录是盘符根；剧集目录不是 watch.roots 的直接子级。
+以上路径相关拒绝不受 --force 影响（搬错目录不可逆）。
 
 断点可重入：stage 已是 archived 时，只要源目录仍在、归档目标不存在，就继续移动；
 只有"源目录已不在"或"目标已存在"才跳过。
@@ -106,6 +108,31 @@ def _root_hit(archive_root: str, roots: list[str]) -> str | None:
     return None
 
 
+def _series_dir_guard(job_dir: str, series_dir: str, roots: list[str]) -> str | None:
+    """移动前的路径断言；返回拒绝原因，None=通过。不受 --force 影响。
+
+    - job_dir 必须是 <剧集目录>/cover_job（out_dir 覆盖后仍必须是这个名字）
+    - 剧集目录不能是盘符根/文件系统根（dirname(root) == root）
+    - 剧集目录必须是某个 watch.roots 的直接子级（不是更深层，也不是 root 本身）
+
+    缺这层校验时，out_dir 一旦指到共享父目录，归档会把整层目录（甚至 D:\\）
+    搬进归档池，而 shutil.move 不可逆。
+    """
+    base = os.path.basename(os.path.normpath(job_dir)).lower()
+    if base != "cover_job":
+        return f"job_dir 必须是 <剧名>/cover_job（实际: {job_dir}）"
+    sd = os.path.normpath(series_dir)
+    if os.path.normcase(os.path.dirname(sd)) == os.path.normcase(sd):
+        return f"剧集目录不能是盘符根/文件系统根: {series_dir}"
+    parent = os.path.dirname(os.path.realpath(sd)).rstrip("\\/")
+    for root in roots:
+        rr = os.path.realpath(root).rstrip("\\/")
+        if os.path.normcase(parent) == os.path.normcase(rr):
+            return None
+    return (f"剧集目录必须是某个 watch.roots 的直接子级"
+            f"（实际: {series_dir}；roots: {', '.join(roots)}）")
+
+
 def _eligible(job: dict) -> bool:
     pub = str((job.get("publish") or {}).get("status") or "")
     exp = (job.get("video") or {}).get("export_state")
@@ -167,6 +194,12 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
     if hit:
         print(f"  [FAIL] archive_root 不能等于或位于 watch.roots 之下"
               f"（命中 root: {hit}）: {archive_root}")
+        return 2
+
+    # 路径断言先于 --force / dry-run：搬错的目录不可逆，必须硬拦
+    guard_err = _series_dir_guard(job_dir, series_dir, roots_list)
+    if guard_err:
+        print(f"  [FAIL] {guard_err}")
         return 2
 
     target = os.path.join(archive_root, name)
