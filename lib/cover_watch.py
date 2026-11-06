@@ -198,11 +198,43 @@ def release_lock(job_dir: str) -> None:
         pass
 
 
+LOG_MAX_BYTES = 10 * 1024 * 1024   # watcher.log 单文件上限（10 MB）
+LOG_BACKUP_COUNT = 5               # 保留 watcher.log.1 ~ watcher.log.5
+
+
+def _rotate_log(log_path: str) -> None:
+    """按大小轮转 watcher.log：超限则删 .5 → .4→.5 → … → .1→.2 → log→.1。
+
+    只在写入前调用；任一步失败（被占用/权限/跨盘）记一行 stderr 并放弃本次轮转，
+    继续往当前文件追加，绝不抛异常打断调度。用 os.replace（Windows 覆盖语义更稳）。
+    """
+    try:
+        if os.path.getsize(log_path) < LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    backups = [f"{log_path}.{i}" for i in range(1, LOG_BACKUP_COUNT + 1)]
+    oldest = backups[-1]
+    try:
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(LOG_BACKUP_COUNT - 1, 0, -1):
+            src, dst = backups[i - 1], backups[i]
+            if os.path.exists(src):
+                os.replace(src, dst)
+        os.replace(log_path, backups[0])
+    except OSError as e:
+        print(f"[warn] watcher.log 轮转失败，继续写当前文件: {e}", file=sys.stderr)
+
+
 def _log(job_dir: str, msg: str) -> None:
+    """唯一写入口：所有 watcher.log 写入都走这里（先按大小轮转，再追加）。"""
     line = f"{jm.now_iso()} {msg}"
     print(line)
+    path = os.path.join(job_dir, "watcher.log")
+    _rotate_log(path)
     try:
-        with open(os.path.join(job_dir, "watcher.log"), "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:
         pass
