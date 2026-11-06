@@ -534,7 +534,9 @@ def update_job(job_dir: str, patch: dict[str, Any], *,
     patch_titles = patch.get("titles")
     if isinstance(patch_titles, dict) and patch_titles.get("gate") == "pending" \
             and (job.get("titles") or {}).get("gate") == "done":
-        raise ValueError("titles.gate 不能从 done 回退为 pending（重选请用 select 命令）")
+        raise ValueError("titles.gate 不能从 done 回退为 pending；"
+                         "如需更换标题请用 select 命令重写 selected"
+                         "（select 不会把 gate 打回 pending）")
     target_stage = patch.get("stage")
     if target_stage:
         if target_stage not in STAGES:
@@ -877,18 +879,23 @@ def select_titles(job_dir: str, picks: list[dict[str, Any]],
             item["title"] = by_slot[slot]["title"]
         new_map.append(item)
 
+    current_stage = job.get("stage")
+    selected_at = now_iso()
     patch: dict[str, Any] = {
-        "stage": "titles_selected",
         "titles": {
             "gate": "done",
             "selected": [{"slot": p["slot"], "title_id": p["title_id"],
                           "title": p["title"]} for p in picks],
-            "selected_at": now_iso(),
+            "selected_at": selected_at,
             "selected_by": by,
             "auto_mode": auto_mode if by == "auto" else None,
         },
         "cover_map": new_map,
     }
+    # 只有当前阶段早于 titles_selected 时才推进 stage；已出封面后重选不能回退 stage。
+    reselect_after_covers = _stage_index(current_stage) >= _stage_index("titles_selected")
+    if not reselect_after_covers:
+        patch["stage"] = "titles_selected"
     # 竖版绑定：selected 中评分最高的一条；人工已指定则保留，无评分数据保持 null
     best = _best_of_selected(job_dir, (job.get("titles") or {}).get("file"), picks)
     event = "gate_select" if by == "user" else "gate_auto_select"
@@ -902,6 +909,15 @@ def select_titles(job_dir: str, picks: list[dict[str, Any]],
         detail += f"；竖版绑定最高分 {best['title_id']}"
     elif explicit not in (None, ""):
         detail += f"；竖版保留人工指定 {explicit}"
+    if reselect_after_covers:
+        # stage 不回退，但已生成的封面与旧标题绑定，必须显式标记待重做，不能静默
+        patch["derived"] = {
+            "covers_stale": True,
+            "covers_stale_at": selected_at,
+            "reason": f"重选发生在 {current_stage} 之后，04_covers 需重新生成",
+        }
+        detail += (f"；重选（当前 {current_stage}）：stage 保持不变，"
+                   "04_covers 需重新生成")
     job = update_job(job_dir, patch, event=event, detail=detail)
     _annotate_titles_file(job_dir, job, picks, by)
     return job
@@ -1643,6 +1659,14 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
         new_stage = stage
     job["stage"] = new_stage
     report["stage_to"] = new_stage
+
+    # ── 重选标记清除：4 张契约封面（3 横 + 竖）已重建
+    derived = job.get("derived")
+    if isinstance(derived, dict) and derived.get("covers_stale") \
+            and len(horizontal) == 3 and "vertical" in report["covers"]:
+        derived["covers_stale"] = False
+        derived["reason"] = None
+        report["normalized"].append("derived.covers_stale 清除（封面已重建）")
 
     # ── dispatch.json → workflow 归并（意图收口；intent_revision 程序只读）
     try:

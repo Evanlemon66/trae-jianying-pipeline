@@ -116,6 +116,9 @@ def check_trigger(job_dir: str) -> tuple[bool, list[str]]:
         return False, reasons
     if (job.get("titles") or {}).get("gate") != "done":
         reasons.append("titles.gate != done")
+    if (job.get("derived") or {}).get("covers_stale"):
+        # 重选后旧封面与旧标题绑定：必须先重建 04_covers，否则剪辑会嵌入过期封面
+        reasons.append("重选后 04_covers 需重新生成（derived.covers_stale=true）")
     stage = jm.canon_stage(job.get("stage"))
     if stage == "archived":
         # 归档剧显式硬拦：即使有人放宽 TRIGGER_STAGES 或误改 job.json，也不再进入调度
