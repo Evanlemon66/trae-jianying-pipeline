@@ -2024,25 +2024,43 @@ def run_whisper(input_path, model_size=None, device=None, compute_type=None):
     compute_type = compute_type or wp.get("compute_type") or "int8"
     candidates = list(dict.fromkeys([(device, compute_type), ("cpu", "int8"), ("cpu", "default")]))
     model = None
+    used = None
     for dev, ct in candidates:
         try:
             print(f"  🗣️ loading whisper model ({model_size}, {dev}/{ct})...")
             model = WhisperModel(model_size, device=dev, compute_type=ct)
+            used = (dev, ct)
             break
         except Exception as e:
             print(f"  ⚠️ whisper ({dev}/{ct}) 加载失败: {str(e)[:80]}")
     if model is None:
         raise RuntimeError("faster-whisper 所有后端均加载失败")
-    print(f"  🗣️ transcribing...")
-    segments, info = model.transcribe(input_path, beam_size=5, vad_filter=True)
-    subs = []
-    for seg in segments:
-        subs.append({
-            "start_us": int(seg.start * 1_000_000),
-            "end_us": int(seg.end * 1_000_000),
-            "text": seg.text.strip(),
-        })
-    return subs
+
+    # 模型加载成功不代表后端可用：ctranslate2 首次 encode 时才加载 cuBLAS，
+    # 缺 cublas64_12.dll 等异常只会在 transcribe()/迭代 segments 时抛出。
+    # 这里沿用加载时的候选链（cuda → cpu/int8 → cpu/default），每个后端只试一次。
+    tried = [used]
+    while True:
+        try:
+            print(f"  🗣️ transcribing...")
+            segments, info = model.transcribe(input_path, beam_size=5, vad_filter=True)
+            subs = []
+            for seg in segments:
+                subs.append({
+                    "start_us": int(seg.start * 1_000_000),
+                    "end_us": int(seg.end * 1_000_000),
+                    "text": seg.text.strip(),
+                })
+            return subs
+        except Exception as e:
+            print(f"  ⚠️ whisper ({used[0]}/{used[1]}) 转写失败: {str(e)[:120]}")
+            nxt = next((c for c in candidates if c not in tried), None)
+            if nxt is None:
+                raise
+            tried.append(nxt)
+            print(f"  🗣️ 改用 {nxt[0]}/{nxt[1]} 重试...")
+            model = WhisperModel(model_size, device=nxt[0], compute_type=nxt[1])
+            used = nxt
 
 
 _pp = (_ENV_PROFILE.get("paraformer") or {})
@@ -2141,6 +2159,57 @@ def run_ffmpeg_extract_audio(video_path, output_wav):
         print(f"  ✗ ffmpeg failed: {result.stderr[-500:]}")
         return False
     return True
+
+
+_NORM_SUFFIX = ".__jy_norm__.mp4"
+_SOURCE_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".flv", ".ts", ".webm", ".m4v", ".wmv")
+
+
+def _heal_norm_cache(cache_path):
+    """音频抽取失败 → 判定该集 __jy_norm__ 缓存不可信，删除并从源文件重转一次。
+
+    只对 `__jycache__/<集>.__jy_norm__.mp4` 生效（其他路径返回 None，不做任何事）；
+    重建路径与旧缓存一致，草稿里的素材引用不会失效。失败返回 None。
+    """
+    abs_cache = os.path.abspath(cache_path)
+    base = os.path.basename(abs_cache)
+    if not base.endswith(_NORM_SUFFIX):
+        return None
+    if os.path.basename(os.path.dirname(abs_cache)) != "__jycache__":
+        return None
+    stem = base[:-len(_NORM_SUFFIX)]
+    src_dir = os.path.dirname(os.path.dirname(abs_cache))
+    src = next((p for p in (os.path.join(src_dir, stem + ext) for ext in _SOURCE_EXTS)
+                if os.path.isfile(p)), None)
+    if not src:
+        print(f"  ⚠️ 缓存不可信但找不到源文件，无法重建: {base}")
+        return None
+    try:
+        os.remove(abs_cache)
+        print(f"  🧹 音频提取失败，删除坏缓存: {base}")
+    except OSError as e:
+        print(f"  ⚠️ 删除坏缓存失败: {e}")
+        return None
+    rebuilt = normalize_video_for_jianying(src, force=True)
+    if not rebuilt:
+        print(f"  ✗ 缓存重建失败: {os.path.basename(src)}")
+        return None
+    print(f"  🔧 缓存重建完成: {os.path.basename(rebuilt)}")
+    return rebuilt
+
+
+def _extract_audio_with_heal(video_path, wav_path):
+    """Step 7：抽音频失败时只做一次「删缓存 → 源文件重转 → 再抽一次」。
+
+    返回 (用于 ASR 的音频源, 是否成功)。重转后仍失败则原样返回，交由既有
+    ASR 降级链/失败计数处理，不在这里无限重试。
+    """
+    if run_ffmpeg_extract_audio(video_path, wav_path):
+        return wav_path, True
+    rebuilt = _heal_norm_cache(video_path)
+    if rebuilt and run_ffmpeg_extract_audio(rebuilt, wav_path):
+        return wav_path, True
+    return (rebuilt or video_path), False
 
 
 def summarize_draft(draft):
@@ -2551,8 +2620,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             if do_ffmpeg and not asr_source.lower().endswith(
                     (".wav", ".mp3", ".m4a", ".aac", ".flac")):
                 wav = os.path.join(workdir, f"audio_ep{u['idx']:02d}.wav")
-                if run_ffmpeg_extract_audio(asr_source, wav):
-                    asr_source = wav
+                asr_source, ok = _extract_audio_with_heal(asr_source, wav)
+                if ok:
                     print(f"  ✅ 提取到: {wav}")
 
             # Step 8: 识别字幕（集内相对时间轴）
