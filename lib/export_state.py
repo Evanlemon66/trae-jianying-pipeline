@@ -172,15 +172,11 @@ def _backup_legacy_retry(job_dir: str) -> None:
             pass
 
 
-def migrate(job_dir: str, *, video_status: Optional[str] = None,
-            stage: Optional[str] = None, progress_status: Optional[str] = None,
-            progress_mtime: float = 0.0, progress_pct: Optional[int] = None,
-            now: Optional[float] = None) -> dict[str, Any]:
-    """真源缺失时按旧数据一次性推断并落盘。优先级见模块 docstring。
-
-    入参由调用方（cover_watch）从 job.json / .progress.json 读好后传入，
-    本模块不反向依赖 job_manifest / pipeline，保持单向。
-    """
+def _infer_initial(job_dir: str, *, video_status: Optional[str] = None,
+                   stage: Optional[str] = None, progress_status: Optional[str] = None,
+                   progress_mtime: float = 0.0, progress_pct: Optional[int] = None,
+                   now: Optional[float] = None) -> dict[str, Any]:
+    """按旧数据在内存里推断初始状态（纯函数，不落盘）。优先级见模块 docstring。"""
     now = now if now is not None else _now()
     st = _default()
     legacy = _read_legacy_retry(job_dir)
@@ -207,6 +203,21 @@ def migrate(job_dir: str, *, video_status: Optional[str] = None,
     if progress_pct is not None:
         st["progress"] = progress_pct
     st["heartbeat_ts"] = st["heartbeat_ts"] or now
+    return st
+
+
+def migrate(job_dir: str, *, video_status: Optional[str] = None,
+            stage: Optional[str] = None, progress_status: Optional[str] = None,
+            progress_mtime: float = 0.0, progress_pct: Optional[int] = None,
+            now: Optional[float] = None) -> dict[str, Any]:
+    """真源缺失时按旧数据一次性推断并落盘。
+
+    入参由调用方（cover_watch）从 job.json / .progress.json 读好后传入，
+    本模块不反向依赖 job_manifest / pipeline，保持单向。
+    """
+    st = _infer_initial(job_dir, video_status=video_status, stage=stage,
+                        progress_status=progress_status, progress_mtime=progress_mtime,
+                        progress_pct=progress_pct, now=now)
     _backup_legacy_retry(job_dir)
     _atomic_write(job_dir, st)
     return st
@@ -219,17 +230,24 @@ def load(job_dir: str, *, progress_mtime: float = 0.0, migrate_ctx: Optional[dic
     """读真源；缺失时用 migrate_ctx 迁移。返回应用了 stale 推导的有效状态（不落盘回收）。
 
     migrate_ctx 可选键：video_status / stage / progress_status / progress_pct。
+    只读/评估路径：首次创建落盘失败（OSError）时退回纯内存推断，不打断调度。
     """
     st = _read_raw(job_dir)
     if st is None:
         ctx = migrate_ctx or {}
-        st = migrate(job_dir,
-                     video_status=ctx.get("video_status"),
-                     stage=ctx.get("stage"),
-                     progress_status=ctx.get("progress_status"),
-                     progress_mtime=progress_mtime,
-                     progress_pct=ctx.get("progress_pct"),
-                     now=now)
+        kwargs = dict(
+            video_status=ctx.get("video_status"),
+            stage=ctx.get("stage"),
+            progress_status=ctx.get("progress_status"),
+            progress_mtime=progress_mtime,
+            progress_pct=ctx.get("progress_pct"),
+            now=now,
+        )
+        try:
+            st = migrate(job_dir, **kwargs)
+        except OSError:
+            # 只读路径不能因为落盘失败把 daemon 打崩；内存态语义与 migrate 一致
+            st = _infer_initial(job_dir, **kwargs)
     return _effective(st, progress_mtime, now=now)
 
 

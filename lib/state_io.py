@@ -59,7 +59,12 @@ def read_raw(job_dir: str, state_name: str) -> Optional[dict[str, Any]]:
 
 
 def atomic_write(job_dir: str, state_name: str, data: dict[str, Any]) -> None:
-    """原子落盘（不修改调用方的 dict）：补 updated_at / writer / version。"""
+    """原子落盘（不修改调用方的 dict）：补 updated_at / writer / version。
+
+    失败语义：任何一步（建目录/写 tmp/替换）最终失败都会清理 .tmp 后抛 OSError，
+    不静默吞掉。只读/评估路径（如 load 首次创建）若允许失败，必须在调用处
+    单独兜住；begin/succeed/fail 等真实写入必须让异常冒到调用方。
+    """
     data = dict(data)
     data["updated_at"] = _iso()
     data["writer"] = os.getpid()
@@ -87,6 +92,7 @@ def atomic_write(job_dir: str, state_name: str, data: dict[str, Any]) -> None:
                 os.remove(tmp)
         except OSError:
             pass
+        raise  # 清理完 tmp 后必须继续上抛，不能被本 except 吃掉
 
 
 def save_if_changed(job_dir: str, state_name: str,

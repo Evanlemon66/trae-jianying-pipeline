@@ -95,11 +95,17 @@ def _save_if_changed(job_dir: str, new: dict[str, Any]) -> dict[str, Any]:
 # ── 读取 ─────────────────────────────────────────────────────────
 
 def load(job_dir: str) -> dict[str, Any]:
-    """读状态；缺失时落盘初始 pending（与 export_state.load 的创建语义一致）。"""
+    """读状态；缺失时落盘初始 pending（与 export_state.load 的创建语义一致）。
+
+    只读/评估路径：首次创建落盘失败（OSError）时退回内存态，不打断调度。
+    """
     st = _read_raw(job_dir)
     if st is None:
         st = _default()
-        _atomic_write(job_dir, st)
+        try:
+            _atomic_write(job_dir, st)
+        except OSError:
+            pass
     return st
 
 
