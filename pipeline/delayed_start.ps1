@@ -57,11 +57,36 @@ function Format-Timestamp([datetime]$Time) {
     return $Time.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
 }
 
+# 日志轮转：写之前检查大小，超过上限就 删 .3 → .2→.3 → .1→.2 → .log→.1，再新建空文件继续写
+# 轮转失败（例如文件被占用）一律吞掉，继续写当前文件，不打断业务逻辑
+function Invoke-LogRotation([string]$Path, [int64]$MaxBytes = 1048576, [int]$Keep = 3) {
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            New-Item -ItemType File -Path $Path -Force | Out-Null
+            return
+        }
+        if ((Get-Item -LiteralPath $Path).Length -lt $MaxBytes) { return }
+        $oldest = $Path + '.' + $Keep
+        if (Test-Path -LiteralPath $oldest) { Remove-Item -LiteralPath $oldest -Force -ErrorAction Stop }
+        for ($i = $Keep - 1; $i -ge 1; $i--) {
+            $src = $Path + '.' + $i
+            if (Test-Path -LiteralPath $src) {
+                Move-Item -LiteralPath $src -Destination ($Path + '.' + ($i + 1)) -Force -ErrorAction Stop
+            }
+        }
+        Move-Item -LiteralPath $Path -Destination ($Path + '.1') -Force -ErrorAction Stop
+        New-Item -ItemType File -Path $Path -Force | Out-Null
+    } catch {
+        # 轮转失败不抛出：下一行日志仍写原文件
+    }
+}
+
 function Write-Log([string]$Message) {
     try {
         if (-not (Test-Path -LiteralPath $logDir)) {
             New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         }
+        Invoke-LogRotation -Path $logFile
         $line = '[{0}] {1}' -f (Format-Timestamp (Get-Date)), $Message
         Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
     } catch {
