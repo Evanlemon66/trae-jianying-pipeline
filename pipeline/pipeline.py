@@ -2018,7 +2018,10 @@ def run_demucs(input_path, output_dir, model=None, fallback=None):
     for m in models:
         cmd = [py, "-m", "demucs", "-n", m, "--two-stems=vocals", "-o", output_dir, input_path]
         print(f"  🎵 demucs ({m}): {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+        # errors="replace"：ffmpeg/demucs 的 stderr 常带非 UTF-8（GBK）字节，
+        # 严格解码会让 subprocess 的读取线程抛 UnicodeDecodeError 并清空缓冲。
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
         if result.returncode != 0:
             print(f"  ✗ demucs ({m}) failed: {result.stderr[-300:]}")
             continue
@@ -2175,7 +2178,10 @@ def run_ffmpeg_extract_audio(video_path, output_wav):
     cmd = [ffmpeg, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", output_wav]
     print(f"  🎬 ffmpeg: {' '.join(cmd)}")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+        # errors="replace"：保住 ffmpeg 的 stderr 内容，同时避免非 UTF-8 字节
+        # 让 subprocess 读取线程抛 UnicodeDecodeError（日志尾部只剩线程噪音）。
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
     except FileNotFoundError:
         print("  ⚠ ffmpeg not found")
         return False
