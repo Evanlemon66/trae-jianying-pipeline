@@ -114,6 +114,39 @@ check("日志无 validate ok", "validate ok" not in log, log)
 check("日志写真实错误", "cleanup.status" in log, log)
 check("未进入 ingest", ingest_calls == [], ingest_calls)
 
+print("\n== ③ watcher 路径：pending 在校验前归一，正常进 ingest ==")
+jd3 = make_fixture("watcher归一C", "pending")
+ok_calls = []
+_orig_ingest2 = cw.jm.ingest_job
+
+
+def _spy_ingest_ok(job_dir, **k):
+    ok_calls.append(job_dir)
+    return _orig_ingest2(job_dir, **k)
+
+
+cw.jm.ingest_job = _spy_ingest_ok
+try:
+    ok3 = cw.run_edit(jd3, {
+        "name": "测试剧",
+        "cmd": [sys.executable, "-c", "import sys; sys.exit(0)"],
+    }, dry_run=False)
+finally:
+    cw.jm.ingest_job = _orig_ingest2
+
+with open(os.path.join(jd3, "watcher.log"), "r", encoding="utf-8") as f:
+    log3 = f.read()
+check("run_edit 返回 True", ok3 is True, ok3)
+check("日志出现 validate ok", "validate ok" in log3, log3)
+check("日志无 validate 失败", "validate 失败" not in log3, log3)
+check("正常进入 ingest", ok_calls == [jd3], ok_calls)
+job3 = jm.load_job(os.path.join(jd3, "job.json"))
+check("落盘 cleanup.status=blocked", job3["cleanup"]["status"] == "blocked",
+      job3["cleanup"]["status"])
+check("落盘 history 含归一记录",
+      any("cleanup.status" in (h.get("detail") or "") for h in job3.get("history", [])),
+      job3.get("history"))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\n{'=' * 40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
 sys.exit(1 if fails else 0)

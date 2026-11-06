@@ -1085,7 +1085,13 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
 
     try:
         jm.backfill_hashes(job_dir)
-        errors = jm.validate_job(jm.load_job(os.path.join(job_dir, "job.json")), job_dir)
+        job = jm.load_job(os.path.join(job_dir, "job.json"))
+        # 与 ingest_job 的归一保持一致：pending 先按 blocked 校验，避免 watcher
+        # 在 ingest 之前就把豆包写的 pending 拒掉（ingest 里保留同样归一，双保险）。
+        cleanup = job.get("cleanup")
+        if isinstance(cleanup, dict) and cleanup.get("status") == "pending":
+            cleanup["status"] = "blocked"
+        errors = jm.validate_job(job, job_dir)
     except Exception as e:
         _log(job_dir, f"validate 失败: {e}")
         toast("❌ 剪辑阶段失败", f"{name} validate: {e}", icon="error")
