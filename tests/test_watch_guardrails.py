@@ -7,7 +7,9 @@
   ② build_plan：export_state=cleaned 视为完成；exported 只等清理不重复导出；
                 --phase 强制路径不受影响；after_edit_queue_drained 语义不变；archived 仍硬拦
   ③ 编辑看门狗：新鲜心跳不动；超时且 pid 不存在 → 记失败不 kill；
-                超时 pid 存活但归属校验不过 → 不 kill；归属通过 → kill；无心跳时用状态文件 mtime 兜底
+                超时 pid 存活但归属校验不过 → 不 kill、不记失败、不放行（保持 editing）；
+                归属通过 → kill；自建子进程超时 → 直接 kill，不查归属文本；
+                无心跳时用状态文件 mtime 兜底
   ④ 新人宽限期：新剧拦；job.json 被改放行；grace=0 关闭；有执行 history 放行；超期放行
 
 运行：python tests\\test_watch_guardrails.py（纯临时目录，不碰真实剧、不 kill 真实进程）
@@ -202,11 +204,17 @@ with mock.patch.object(cw.pc, "get_watch_config", return_value={}), \
         mock.patch.object(cw, "_pid_owned_by_job", return_value=False), \
         mock.patch.object(cw, "_kill_tree") as kill:
     jd = editing_job("看门狗归属不符", pid=303, stale_s=120)
-    cw._reap_stalled_edit(jd, CFG, name="看门狗归属不符")
+    lock_fp = os.path.join(jd, ".watcher.lock")
+    with open(lock_fp, "w", encoding="utf-8") as f:
+        json.dump({"pid": 303}, f)
+    rc = cw._reap_stalled_edit(jd, CFG, name="看门狗归属不符")
     st = eds.peek(jd)
     check("pid 存活但归属不符 → 不 kill", not kill.called)
-    check("归属不符仍记失败", st["status"] == "retrying", st)
-    check("归属不符写日志", "归属校验未通过" in
+    check("归属不符不记失败（仍 editing）", st["status"] == "editing", st)
+    check("归属不符不动失败计数", st["consecutive_failures"] == 0, st)
+    check("归属不符不放行（返回 None）", rc is None, rc)
+    check("归属不符保留 .watcher.lock", os.path.isfile(lock_fp))
+    check("归属不符写警告日志", "本轮不记失败" in
           open(os.path.join(jd, "watcher.log"), encoding="utf-8").read())
 
 with mock.patch.object(cw.pc, "get_watch_config", return_value={}), \
@@ -229,7 +237,7 @@ with mock.patch.object(cw.pc, "get_watch_config", return_value={}), \
           eds.peek(jd))
 
 with mock.patch.object(cw.pc, "get_watch_config", return_value={}), \
-        mock.patch.object(cw, "_pid_owned_by_job", return_value=False), \
+        mock.patch.object(cw, "_pid_owned_by_job") as owned, \
         mock.patch.object(cw, "_kill_tree") as kill:
     jd = editing_job("看门狗超时窗口", pid=606, stale_s=0)
     proc = mock.MagicMock()
@@ -247,7 +255,9 @@ with mock.patch.object(cw.pc, "get_watch_config", return_value={}), \
             mock.patch("time.time", side_effect=fake_time):
         rc = cw._wait_edit_with_watchdog(jd, proc, "看门狗超时窗口")
     check("看门狗超时返回 -999（避免调用方重复计数）", rc == -999, rc)
-    check("归属校验不过不 kill", not kill.called)
+    check("自建子进程超时直接 kill 一次", kill.call_count == 1, kill.call_count)
+    check("kill 目标为子进程 pid", kill.call_args and kill.call_args[0][0] == 606)
+    check("不再走归属文本校验", not owned.called, owned.called)
     check("看门狗已记一次失败", eds.peek(jd)["status"] == "retrying", eds.peek(jd))
 
 check("_pid_owned_by_job(0) 一律 False", cw._pid_owned_by_job(0, ROOT) is False)

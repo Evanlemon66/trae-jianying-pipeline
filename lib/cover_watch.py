@@ -816,7 +816,11 @@ def _pid_owned_by_job(pid: int, series_dir: str) -> bool:
 
 
 def _wait_edit_with_watchdog(job_dir: str, proc: subprocess.Popen, name: str) -> int:
-    """等编辑子进程，按 pipeline.log 的进展刷新心跳；超时则校验归属后 kill。"""
+    """等编辑子进程，按 pipeline.log 的进展刷新心跳；超时直接 kill 本进程的子进程。
+
+    该 pid 来自本进程的 Popen 句柄，归属已确定，无需再做命令行文本校验
+    （CIM 查询在中文路径/编码差异下会误判，反而导致"记失败但子进程还在写"）。
+    """
     timeout = _edit_stall_timeout()
     log_path = os.path.join(job_dir, "06_publish", "pipeline.log")
     try:
@@ -838,13 +842,11 @@ def _wait_edit_with_watchdog(job_dir: str, proc: subprocess.Popen, name: str) ->
             last_beat = time.time()
             eds.heartbeat(job_dir, pid=proc.pid, now=last_beat)
         if timeout > 0 and time.time() - last_beat >= timeout:
-            series_dir = os.path.dirname(job_dir.rstrip("\\/"))
             _log(job_dir, f"edit 卡死：{int(timeout)}s 无日志进展，pid={proc.pid}")
-            if _pid_owned_by_job(proc.pid, series_dir):
-                _kill_tree(proc.pid)
-                _log(job_dir, f"edit 卡死：已终止 pid={proc.pid}（命令行校验通过）")
-            else:
-                _log(job_dir, f"edit 卡死：pid={proc.pid} 归属校验未通过，未 kill（避免误杀）")
+            # 自己 Popen 的子进程，归属无需外部校验，直接杀整棵树；
+            # 否则一旦校验失败就会"记失败但不杀"，下一轮重启后两个 edit 同时写草稿。
+            _kill_tree(proc.pid)
+            _log(job_dir, f"edit 卡死：已终止 pid={proc.pid}（本进程子进程）")
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -860,6 +862,8 @@ def _reap_stalled_edit(job_dir: str, cfg: dict[str, Any], *, name: str) -> None:
     """每轮巡检：editing 心跳超时 → 校验 pid 归属后 kill，并记一次失败退避。
 
     与 run_edit 内的看门狗互补：这里处理上一轮崩溃/遗留的 editing。
+    归属无法证明时只告警并返回：不 kill、不记失败、不放行下一轮，避免在旧子进程
+    仍在写同一草稿时又启动一个新的 edit。
     """
     timeout = _edit_stall_timeout(cfg)
     if timeout <= 0:
@@ -878,17 +882,23 @@ def _reap_stalled_edit(job_dir: str, cfg: dict[str, Any], *, name: str) -> None:
     pid = int(st.get("pid") or 0)
     series_dir = os.path.dirname(job_dir.rstrip("\\/"))
     alive = _pid_alive(pid)
-    if alive and _pid_owned_by_job(pid, series_dir):
+    if not alive:
+        _log(job_dir, f"edit 卡死：pid={pid} 已不存在，仅清理状态")
+    elif _pid_owned_by_job(pid, series_dir):
         _kill_tree(pid)
         _log(job_dir, f"edit 卡死：pid={pid} 心跳 {int(time.time() - hb)}s 未更新，已终止")
-    elif alive:
-        _log(job_dir, f"edit 卡死：pid={pid} 归属校验未通过，未 kill（避免误杀）")
     else:
-        _log(job_dir, f"edit 卡死：pid={pid} 已不存在，仅清理状态")
-    note_edit_result(job_dir, name, False,
-                     error=f"edit 心跳超时（{int(time.time() - hb)}s 未更新）",
-                     failure_class="edit_stalled", retryable=True)
-    toast("⛔ 剪辑卡死", f"{name}：心跳超时，已按失败退避", icon="error")
+        _log(job_dir, f"edit 卡死：pid={pid} 归属校验未通过，未 kill，"
+                      f"本轮不记失败、不放行（等人工确认）")
+        return
+    try:
+        note_edit_result(job_dir, name, False,
+                         error=f"edit 心跳超时（{int(time.time() - hb)}s 未更新）",
+                         failure_class="edit_stalled", retryable=True)
+        toast("⛔ 剪辑卡死", f"{name}：心跳超时，已按失败退避", icon="error")
+    except OSError as e:
+        # 巡检轮次不因为它自己写状态失败就把 daemon 打崩；下一轮会再次巡检。
+        _log(job_dir, f"edit 卡死：写 .edit_state.json 失败（{e}），下一轮重试")
 
 
 def _job_created_ts(job_dir: str, job: dict[str, Any]) -> Optional[float]:
