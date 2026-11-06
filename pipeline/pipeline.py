@@ -1863,10 +1863,23 @@ def get_audio_filepath_from_draft(draft):
     return None
 
 
+def _asr_backend_failed(backend, err):
+    """单后端 ASR 失败的统一日志行：点名后端 + 异常类型 + 首行 message。"""
+    msg = str(err).strip().splitlines()
+    first = msg[0].strip() if msg else ""
+    if len(first) > 200:
+        first = first[:199] + "…"
+    print(f"  ⚠️ {backend} 失败: {type(err).__name__}: {first}")
+
+
 def run_asr_chain(audio_source, workdir, skip_local_ai=False):
     """单段音频 ASR 降级链：剪映云ASR → Paraformer → faster-whisper。
 
-    返回集内相对时间轴的字幕列表（未加集偏移），失败返回 []。
+    任何单后端的异常（不只是 ImportError）都不得穿出本函数：记一条点名后端的
+    日志后继续降级；三档全部失败返回 []，由调用方按「本集无字幕」处理并走
+    既有失败登记/退避，而不是让异常掀翻整轮 batch_runner（rc=1）。
+    2026-11-07：whisper 的 `RuntimeError: Library cublas64_12.dll is not found`
+    曾直接穿出本函数，打挂整轮。
     """
     if not audio_source:
         print("  ✗ 没有音频可用于 ASR!")
@@ -1877,10 +1890,15 @@ def run_asr_chain(audio_source, workdir, skip_local_ai=False):
         return []
 
     # 第一优先: 剪映云 ASR (免费, 中文质量最好)
-    cn_subs = run_vc_asr(audio_source, workdir)
-    if cn_subs:
-        print(f"  ✅ 剪映云识别出 {len(cn_subs)} 条字幕")
-        return cn_subs
+    try:
+        cn_subs = run_vc_asr(audio_source, workdir)
+        if cn_subs:
+            print(f"  ✅ 剪映云识别出 {len(cn_subs)} 条字幕")
+            return cn_subs
+    except ImportError:
+        print("  ⚠️ vc_bridge 不可用")
+    except Exception as e:
+        _asr_backend_failed("剪映云 ASR", e)
 
     # 降级: 本地 Paraformer (优先) → faster-whisper
     print("  ↩️ 降级到本地 Paraformer ASR...")
@@ -1892,16 +1910,22 @@ def run_asr_chain(audio_source, workdir, skip_local_ai=False):
     except ImportError:
         print("  ⚠️ funasr-onnx 未安装 (pip install funasr-onnx)")
     except Exception as e:
-        print(f"  ⚠️ Paraformer 失败: {type(e).__name__}: {e}")
+        _asr_backend_failed("Paraformer", e)
 
     print("  ↩️ 再降级到 faster-whisper...")
     try:
         cn_subs = run_whisper(audio_source)
-        print(f"  ✅ 识别出 {len(cn_subs) if cn_subs else 0} 条字幕")
+        if cn_subs:
+            print(f"  ✅ 识别出 {len(cn_subs)} 条字幕")
+            return cn_subs
+        print("  ⚠️ faster-whisper 未识别出字幕")
     except ImportError:
         print("  ⚠️ faster-whisper 未安装 (pip install faster-whisper)")
-        return []
-    return cn_subs or []
+    except Exception as e:
+        _asr_backend_failed("faster-whisper", e)
+
+    print("  ✗ ASR 全链失败（剪映云 / Paraformer / faster-whisper 均未产出字幕）")
+    return []
 
 
 def translate_texts(cn_texts, workdir):

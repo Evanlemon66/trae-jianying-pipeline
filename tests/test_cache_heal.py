@@ -184,6 +184,55 @@ try:
 finally:
     sys.modules.pop("faster_whisper", None)
 
+print("\n== ⑥ run_asr_chain 单后端异常不穿出（含 cublas RuntimeError）==")
+_saved_asr = (pl.run_vc_asr, pl.run_paraformer, pl.run_whisper)
+try:
+    # 6a: 三档全失败（whisper 抛 cublas RuntimeError）→ 返回 []，异常不得穿出
+    pl.run_vc_asr = lambda *a, **k: None
+
+    def _boom_paraformer(*a, **k):
+        raise RuntimeError("Paraformer backend boom")
+
+    def _boom_whisper(*a, **k):
+        raise RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+
+    pl.run_paraformer = _boom_paraformer
+    pl.run_whisper = _boom_whisper
+    raised = None
+    try:
+        got6 = pl.run_asr_chain("dummy.wav", TMP)
+    except Exception as e:  # noqa: BLE001 - 这里就是要证明它不抛
+        raised = e
+        got6 = None
+    check("RuntimeError 不穿出", raised is None, raised)
+    check("全部失败返回 []", got6 == [], got6)
+
+    # 6b: 剪映云成功 → 直接返回，不再走本地降级
+    calls = []
+    pl.run_vc_asr = lambda *a, **k: (calls.append("vc"),
+                                     [{"start_us": 0, "end_us": 1000, "text": "你好"}])[1]
+    pl.run_paraformer = lambda *a, **k: (calls.append("para"), [])[1]
+    pl.run_whisper = lambda *a, **k: (calls.append("whisper"), [])[1]
+    got6b = pl.run_asr_chain("dummy.wav", TMP)
+    check("剪映云成功直接返回", bool(got6b) and got6b[0]["text"] == "你好", got6b)
+    check("未继续降级", calls == ["vc"], calls)
+
+    # 6c: 剪映云异常 + Paraformer 空 → whisper 兜底成功（异常后仍继续下一档）
+    calls2 = []
+
+    def _boom_vc(*a, **k):
+        calls2.append("vc")
+        raise RuntimeError("vc bridge boom")
+
+    pl.run_vc_asr = _boom_vc
+    pl.run_whisper = lambda *a, **k: (calls2.append("whisper"),
+                                      [{"start_us": 0, "end_us": 1000, "text": "兜底"}])[1]
+    got6c = pl.run_asr_chain("dummy.wav", TMP)
+    check("异常后继续降级到 whisper", got6c and got6c[0]["text"] == "兜底", got6c)
+    check("按降级顺序继续（vc 异常→whisper）", calls2 == ["vc", "whisper"], calls2)
+finally:
+    pl.run_vc_asr, pl.run_paraformer, pl.run_whisper = _saved_asr
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\n{'=' * 40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
 sys.exit(1 if fails else 0)
