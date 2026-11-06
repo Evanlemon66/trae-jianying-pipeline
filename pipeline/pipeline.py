@@ -2386,7 +2386,10 @@ def run_pipeline(draft_name_or_path, video_paths=None,
     print(f"  🎬 JianYing Full-Local Pipeline")
     print(f"  📂 Draft      : {draft_name_or_path}")
     print(f"  🎥 Videos     : {len(video_paths) if video_paths else '(无, 使用已有)'}")
-    print(f"  ✂️ cut_us     : {cut_us}  ({cut_us/1_000_000 if cut_us else 'None (no cut)'}s)")
+    if cut_us:
+        print(f"  ✂️ cut_us     : {cut_us}  ({cut_us/1_000_000}s)")
+    else:
+        print("  ✂️ cut_us     : 未指定（整片保留）")
     print(f"  🧩 Presets    : {[p[0] for p in PRESETS] if do_presets else 'skip'}")
     print(f"  🛑 Skip AI    : {skip_local_ai}")
     print(f"  📤 Export     : {do_export}")
@@ -2609,7 +2612,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             return None
         print()
     else:
-        print("━ [6] 跳过裁剪 (cut_us=None) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("━ [6] 无裁剪参数，跳过 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         print()
 
     # ━━━━ Step 7-9: 逐集 提取音频 → ASR → 翻译 → 写字幕（带集偏移）━━━━
