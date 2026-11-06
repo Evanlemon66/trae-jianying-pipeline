@@ -1167,6 +1167,13 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     except Exception as e:
         _log(job_dir, f"export_config 失败: {e}")
         toast("❌ 导出阶段失败", f"{name} export_config: {e}", icon="error")
+        # 异常被吞掉后若只 return False，本轮不计数 → 下一轮 5s 立即重试、无限空转；
+        # 与 chain 异常同等对待：必须登记失败，让退避/阈值暂停生效。
+        note_export_result(job_dir, name, False,
+                           pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
+                           error=f"export_config 失败: {e}"[-500:],
+                           failure_class="export_config_error",
+                           retryable=True, phase="export")
         return False
     job = jm.load_job(os.path.join(job_dir, "job.json"))
     wf = _intent_of(job)
@@ -1665,6 +1672,42 @@ def _round_flags(args: argparse.Namespace, hold_on: bool) -> tuple[bool, bool]:
     return (not getattr(args, "once", False)), True
 
 
+def _round_state_brief(job_dir: str, action: str) -> tuple:
+    """本轮执行前的状态快照（status / 连续失败数 / last_error），用于判断
+    chain 异常时失败是否已被本次执行登记，避免重复计数。"""
+    st = (eds.peek(job_dir) if action == "edit"
+          else _sio.read_raw(job_dir, es.STATE_NAME)) or {}
+    return (st.get("status"), int(st.get("consecutive_failures") or 0), st.get("last_error"))
+
+
+def _record_chain_failure(job_dir: str, name: str, action: str,
+                          cfg: dict[str, Any], err: BaseException,
+                          before: tuple) -> None:
+    """本地执行链的未捕获异常 → 必须登记一次失败，否则每轮立即重试、无限空转。
+
+    若本次执行已经写过状态机（状态已进入 done/retrying/paused/failed 且与执行前
+    快照不同），只记日志、不重复计数；否则说明异常直接掀翻了这一轮（失败计数、
+    退避、阈值暂停全被跳过），补记失败让它们照常生效。
+    登记过程本身再异常也只记日志，绝不让 daemon 因一处状态写失败而退出。
+    """
+    text = f"chain 异常: {err}"
+    try:
+        after = _round_state_brief(job_dir, action)
+        if after[0] in ("done", "retrying", "paused", "failed") and after != before:
+            _log(job_dir, f"{text}（本次执行已登记为 {after[0]}，不重复计数）")
+            return
+        if action == "edit":
+            note_edit_result(job_dir, name, False, error=text[-500:],
+                             failure_class="chain_exception", retryable=True)
+        else:
+            note_export_result(job_dir, name, False,
+                               pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
+                               error=text[-500:], failure_class="chain_exception",
+                               retryable=True, phase="export")
+    except Exception as e2:
+        _log(job_dir, f"{text}（登记失败时再次异常: {e2}）")
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     """查看所有剧的阶段/意图/下一步/被挡原因（不执行）。"""
     cfg = _load_watch_config(getattr(args, "config", None), quiet=True) or {}
@@ -1777,6 +1820,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             continue
         hb.update(stage=pick["action"], job=pick["job_dir"], phase="running",
                   round=round_no)
+        before_state = _round_state_brief(pick["job_dir"], pick["action"])
         try:
             if pick["action"] == "edit":
                 success = run_edit(pick["job_dir"], pick, dry_run=False)
@@ -1786,6 +1830,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
                                      no_derive=args.no_derive)
         except Exception as e:
             _log(pick["job_dir"], f"chain 异常: {e}")
+            # 异常掀翻本轮的路径必须登记失败：否则计数/退避/阈值暂停全被跳过，
+            # 坏代码或坏数据会变成 30 秒一轮的永久空转（本轮修复的历史事故）。
+            _record_chain_failure(pick["job_dir"], pick["name"], pick["action"],
+                                  cfg, e, before_state)
             toast("❌ 本地执行链异常", f"{pick['name']}: {e}", icon="error")
             success = False
         finally:
