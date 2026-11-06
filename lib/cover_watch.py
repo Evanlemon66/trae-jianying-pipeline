@@ -241,6 +241,21 @@ def release_lock(job_dir: str) -> None:
         pass
 
 
+def _write_lock(job_dir: str, phase: str, **extra: Any) -> None:
+    """更新本进程持有的 .watcher.lock 字段（phase / pipeline_pid 等）。
+
+    锁的创建与陈旧接管由 acquire_lock() 原子完成；这里只做原地字段更新，
+    且只在锁属于本进程时写，避免误改别人的锁。写失败向上抛，由调用方处理。
+    """
+    data = read_lock(job_dir)
+    if not data or int(data.get("pid") or 0) != os.getpid():
+        return
+    data["phase"] = phase
+    data.update(extra)
+    data["updated_at"] = jm.now_iso()
+    _sio.atomic_write(job_dir, LOCK_NAME, data)
+
+
 LOG_MAX_BYTES = 10 * 1024 * 1024   # watcher.log 单文件上限（10 MB）
 LOG_BACKUP_COUNT = 5               # 保留 watcher.log.1 ~ watcher.log.5
 
