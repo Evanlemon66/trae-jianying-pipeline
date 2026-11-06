@@ -1042,7 +1042,7 @@ def _new_job_in_grace(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
 
 
 def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
-    """edit 阶段：validate --fix → ingest（含 workflow 归并）→ batch_runner --no-export。
+    """edit 阶段：backfill_hashes + 真实校验 → ingest（含 workflow 归并）→ batch_runner --no-export。
 
     失败处理（.edit_state.json 单一真源，lib/edit_state.py）：
       - 缺目录类失败一次自动补齐（不占额度、不退避，下一轮立即重试）；
@@ -1070,11 +1070,17 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
 
     try:
         jm.backfill_hashes(job_dir)
-        _log(job_dir, "validate --fix ok")
+        errors = jm.validate_job(jm.load_job(os.path.join(job_dir, "job.json")), job_dir)
     except Exception as e:
-        _log(job_dir, f"validate --fix 失败: {e}")
-        toast("❌ 剪辑阶段失败", f"{name} validate --fix: {e}", icon="error")
+        _log(job_dir, f"validate 失败: {e}")
+        toast("❌ 剪辑阶段失败", f"{name} validate: {e}", icon="error")
         return _fail(str(e))
+    if errors:
+        msg = "；".join(errors)
+        _log(job_dir, f"validate 失败: {msg}")
+        toast("❌ 剪辑阶段失败", f"{name} validate: {msg}", icon="error")
+        return _fail(msg)
+    _log(job_dir, "validate ok")
     try:
         rep = jm.ingest_job(job_dir)
         wfr = rep.get("workflow") or {}

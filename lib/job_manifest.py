@@ -1668,6 +1668,15 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
         derived["reason"] = None
         report["normalized"].append("derived.covers_stale 清除（封面已重建）")
 
+    # ── cleanup.status 归一：契约 §6 只允许 blocked/eligible/done/skipped；
+    #    豆包偶发把 cleanup.external 的 pending 误写到顶层
+    cleanup_note = None
+    cleanup = job.get("cleanup")
+    if isinstance(cleanup, dict) and cleanup.get("status") == "pending":
+        cleanup["status"] = "blocked"
+        cleanup_note = "cleanup.status pending→blocked"
+        report["normalized"].append(cleanup_note)
+
     # ── dispatch.json → workflow 归并（意图收口；intent_revision 程序只读）
     try:
         report["workflow"] = merge_workflow_core(job, job_dir)
@@ -1678,10 +1687,13 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
         report["dry_run"] = True
         return report
     job["revision"] = int(job.get("revision") or 0) + 1
+    detail = (f"covers={len(report['covers'])}/4 "
+              f"missing={report['missing_covers']} stage {stage}->{new_stage}")
+    if cleanup_note:
+        detail += f"；归一: {cleanup_note}"
     job.setdefault("history", []).append({
         "at": now_iso(), "event": "ingest",
-        "detail": f"covers={len(report['covers'])}/4 "
-                  f"missing={report['missing_covers']} stage {stage}->{new_stage}",
+        "detail": detail,
         "revision": job["revision"]})
     errors = validate_job(job, job_dir)
     if errors:
