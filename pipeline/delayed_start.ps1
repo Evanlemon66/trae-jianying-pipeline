@@ -60,12 +60,13 @@ function Format-Timestamp([datetime]$Time) {
 # 日志轮转：写之前检查大小，超过上限就 删 .3 → .2→.3 → .1→.2 → .log→.1，再新建空文件继续写
 # 轮转失败（例如文件被占用）一律吞掉，继续写当前文件，不打断业务逻辑
 function Invoke-LogRotation([string]$Path, [int64]$MaxBytes = 1048576, [int]$Keep = 3) {
+    # 返回 $true = 正常（含无需轮转、文件不存在刚新建）；返回 $false = 改名失败（如被占用）
     try {
         if (-not (Test-Path -LiteralPath $Path)) {
             New-Item -ItemType File -Path $Path -Force | Out-Null
-            return
+            return $true
         }
-        if ((Get-Item -LiteralPath $Path).Length -lt $MaxBytes) { return }
+        if ((Get-Item -LiteralPath $Path).Length -lt $MaxBytes) { return $true }
         $oldest = $Path + '.' + $Keep
         if (Test-Path -LiteralPath $oldest) { Remove-Item -LiteralPath $oldest -Force -ErrorAction Stop }
         for ($i = $Keep - 1; $i -ge 1; $i--) {
@@ -76,8 +77,10 @@ function Invoke-LogRotation([string]$Path, [int64]$MaxBytes = 1048576, [int]$Kee
         }
         Move-Item -LiteralPath $Path -Destination ($Path + '.1') -Force -ErrorAction Stop
         New-Item -ItemType File -Path $Path -Force | Out-Null
+        return $true
     } catch {
-        # 轮转失败不抛出：下一行日志仍写原文件
+        # 轮转失败不抛出：原文件继续照常写，由调用方决定是否记日志
+        return $false
     }
 }
 
