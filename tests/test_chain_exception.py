@@ -264,6 +264,44 @@ check("last_error 含发生位置", "_boom_here:" in st9["last_error"], st9["las
 check("last_error 不含解码噪音", "UnicodeDecodeError" not in st9["last_error"],
       st9["last_error"])
 
+print("\n== ⑩ chain 异常按 pid 树终止本轮子进程（不按进程名）==")
+import subprocess as _sp  # noqa: E402
+
+_pidfile = os.path.join(TMP, "grandchild.pid")
+_child_code = (
+    "import subprocess, sys, time, pathlib\n"
+    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+    f"pathlib.Path(r'{_pidfile}').write_text(str(p.pid))\n"
+    "time.sleep(30)\n"
+)
+_grand = _sp.Popen([sys.executable, "-c", _child_code])
+grand_pid = 0
+try:
+    for _ in range(40):
+        if os.path.exists(_pidfile):
+            try:
+                grand_pid = int(open(_pidfile, encoding="utf-8").read().strip())
+            except ValueError:
+                pass
+        if grand_pid:
+            break
+        time.sleep(0.1)
+    check("孙进程已启动", grand_pid > 0 and cw._pid_alive(grand_pid), grand_pid)
+    pids = cw._descendant_pids(os.getpid())
+    check("快照包含直接子进程", _grand.pid in pids, (_grand.pid, pids))
+    check("快照包含孙进程（按 pid 树）", grand_pid in pids, (grand_pid, pids))
+    killed = cw._kill_descendants(os.getpid())
+    check("直接子进程被终止", _grand.pid in killed, killed)
+    check("孙进程被终止", grand_pid in killed, killed)
+    _grand.wait(timeout=10)
+    check("直接子进程已退出", _grand.poll() is not None, _grand.poll())
+    check("孙进程已不存在", not cw._pid_alive(grand_pid), grand_pid)
+finally:
+    if _grand.poll() is None:
+        cw._kill_tree(_grand.pid)
+    if grand_pid and cw._pid_alive(grand_pid):
+        cw._kill_tree(grand_pid)
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\n{'=' * 40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
 sys.exit(1 if fails else 0)

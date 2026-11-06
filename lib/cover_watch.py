@@ -983,6 +983,70 @@ def _pid_owned_by_job(pid: int, series_dir: str) -> bool:
     return series in _norm_cmp_path(out)
 
 
+def _proc_tree_snapshot() -> dict[int, int]:
+    """Win32 进程表快照（pid → parent pid）。失败返回 {}，调用方按「无可杀」处理。"""
+    ps = ("Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+          "ForEach-Object { Write-Output ($_.ProcessId.ToString() + '|' + "
+          "$_.ParentProcessId.ToString()) }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                             capture_output=True, text=True, timeout=20).stdout
+    except Exception as e:
+        print(f"  [WARN] 进程表快照失败: {e}")
+        return {}
+    tree: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        tree[pid] = ppid
+    return tree
+
+
+def _descendant_pids(root_pid: int, tree: Optional[dict[int, int]] = None) -> list[int]:
+    """返回 root_pid 的全部后代 pid（按 pid 树，不按进程名匹配）。"""
+    tree = _proc_tree_snapshot() if tree is None else tree
+    children: dict[int, list[int]] = {}
+    for pid, ppid in tree.items():
+        children.setdefault(ppid, []).append(pid)
+    out: list[int] = []
+    stack, seen = [root_pid], {root_pid}
+    while stack:
+        cur = stack.pop()
+        for child in children.get(cur, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            out.append(child)
+            stack.append(child)
+    return out
+
+
+def _kill_descendants(root_pid: int) -> list[int]:
+    """终止 root_pid 派生的全部子进程（按 pid 树），返回实际尝试终止的 pid 列表。
+
+    只用于 root_pid=watcher 自身：本地执行链异常掀翻本轮后，若 batch_runner /
+    ffmpeg 还活着，下一轮会与它并发写同一份缓存/草稿（2026-11-07 六个坏缓存事故）。
+    只遍历 pid 树、不按进程名匹配，因此不会误杀别的剧的进程。
+    """
+    pids = _descendant_pids(root_pid)
+    killed: list[int] = []
+    for pid in reversed(pids):
+        if not _pid_alive(pid):
+            continue
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True, text=True, timeout=10)
+            killed.append(pid)
+        except Exception as e:
+            print(f"  [WARN] taskkill pid={pid} 失败: {e}")
+    return killed
+
+
 def _wait_edit_with_watchdog(job_dir: str, proc: subprocess.Popen, name: str) -> int:
     """等编辑子进程，按 pipeline.log 的进展刷新心跳；超时直接 kill 本进程的子进程。
 
@@ -1885,12 +1949,21 @@ def cmd_watch(args: argparse.Namespace) -> int:
                                      verify=not args.no_verify,
                                      no_derive=args.no_derive)
         except Exception as e:
-            _log(pick["job_dir"], f"chain 异常: {e}")
+            # 先终止本轮派生的子进程树，再登记失败：异常掀翻本轮时若 batch_runner /
+            # ffmpeg 还活着，下一轮会与它并发写同一份缓存/草稿（2026-11-07 六个坏缓存
+            # 事故）。按 pid 树只杀本 watcher 的后代，不按进程名，避免误杀别的剧。
+            killed = _kill_descendants(os.getpid())
+            brief = _exception_brief(e, where=f"cmd_watch.{pick['action']}")
+            _log(pick["job_dir"], f"chain 异常: {brief}")
+            if killed:
+                _log(pick["job_dir"],
+                     f"chain 异常：已按 pid 树终止本轮子进程 {len(killed)} 个 "
+                     f"(pids={killed})")
             # 异常掀翻本轮的路径必须登记失败：否则计数/退避/阈值暂停全被跳过，
             # 坏代码或坏数据会变成 30 秒一轮的永久空转（本轮修复的历史事故）。
             _record_chain_failure(pick["job_dir"], pick["name"], pick["action"],
                                   cfg, e, before_state)
-            toast("❌ 本地执行链异常", f"{pick['name']}: {e}", icon="error")
+            toast("❌ 本地执行链异常", f"{pick['name']}: {brief}", icon="error")
             success = False
         finally:
             release_lock(pick["job_dir"])
