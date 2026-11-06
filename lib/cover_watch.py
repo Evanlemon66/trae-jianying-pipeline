@@ -185,21 +185,56 @@ def lock_alive(job_dir: str) -> bool:
     return bool(data) and _pid_alive(int(data.get("pid") or 0))
 
 
-def _write_lock(job_dir: str, phase: str, pipeline_pid: Optional[int] = None) -> None:
-    data = {"pid": os.getpid(), "job": job_dir, "phase": phase,
-            "started": jm.now_iso(), "pipeline_pid": pipeline_pid}
-    with open(lock_path(job_dir), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def acquire_lock(job_dir: str, phase: str = "triggered") -> bool:
-    if lock_alive(job_dir):
+def _claim_lock(path: str, data: dict[str, Any]) -> bool:
+    """原子抢占：O_CREAT|O_EXCL 创建成功才算拿到锁。"""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
         return False
-    _write_lock(job_dir, phase)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except OSError:
+        # 写完失败：清掉自己刚创建的文件，避免留下不可读锁
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
     return True
 
 
+def acquire_lock(job_dir: str, phase: str = "triggered") -> bool:
+    """原子抢占 .watcher.lock：成功 True；活锁 False；陈旧锁接管一次。"""
+    path = lock_path(job_dir)
+    data = {"pid": os.getpid(), "job": job_dir, "phase": phase,
+            "started": jm.now_iso(), "pipeline_pid": None}
+    if _claim_lock(path, data):
+        return True
+
+    existing = read_lock(job_dir)
+    if not existing:
+        return False
+    pid = int(existing.get("pid") or 0)
+    if pid > 0 and not _pid_alive(pid):
+        # 陈旧锁：再读一次确认 pid 未变，删掉后重试一次抢占
+        again = read_lock(job_dir)
+        if not again or int(again.get("pid") or 0) != pid:
+            return False
+        try:
+            os.remove(path)
+        except OSError:
+            return False
+        return _claim_lock(path, data)
+    return False
+
+
 def release_lock(job_dir: str) -> None:
+    """只释放自己持有的锁：pid 不是本进程就不删。"""
+    data = read_lock(job_dir)
+    if not data or int(data.get("pid") or 0) != os.getpid():
+        return
     try:
         os.remove(lock_path(job_dir))
     except OSError:

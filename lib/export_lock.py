@@ -45,18 +45,56 @@ def lock_alive() -> bool:
     return bool(data) and _pid_alive(int(data.get("pid") or 0))
 
 
-def acquire(owner: str = "") -> bool:
-    """活锁存在返回 False；否则写入 {pid, owner, started} 返回 True。"""
-    if lock_alive():
+def _claim(data: dict[str, Any]) -> bool:
+    """原子抢占：O_CREAT|O_EXCL 创建成功才算拿到锁。"""
+    try:
+        fd = os.open(_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
         return False
-    data = {"pid": os.getpid(), "owner": owner,
-            "started": datetime.now().astimezone().isoformat(timespec="seconds")}
-    with open(_LOCK_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except OSError:
+        # 写完失败：清掉自己刚创建的文件，避免留下不可读锁
+        try:
+            os.remove(_LOCK_PATH)
+        except OSError:
+            pass
+        raise
     return True
 
 
+def acquire(owner: str = "") -> bool:
+    """原子抢占导出锁：成功返回 True；活锁返回 False；陈旧锁接管一次。"""
+    data = {"pid": os.getpid(), "owner": owner,
+            "started": datetime.now().astimezone().isoformat(timespec="seconds")}
+    if _claim(data):
+        return True
+
+    existing = read_lock()
+    if not existing:
+        # 文件存在但不可解析（极短写入窗口 / 损坏）：不删，避免误删别人刚创建的锁
+        return False
+    pid = int(existing.get("pid") or 0)
+    if pid > 0 and not _pid_alive(pid):
+        # 陈旧锁：再读一次确认 pid 未变，删掉后重试一次抢占
+        again = read_lock()
+        if not again or int(again.get("pid") or 0) != pid:
+            return False
+        try:
+            os.remove(_LOCK_PATH)
+        except OSError:
+            return False
+        return _claim(data)
+    return False
+
+
 def release() -> None:
+    """只释放自己持有的锁：pid 不是本进程就不删。"""
+    data = read_lock()
+    if not data or int(data.get("pid") or 0) != os.getpid():
+        return
     try:
         os.remove(_LOCK_PATH)
     except OSError:
