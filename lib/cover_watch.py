@@ -870,14 +870,66 @@ def note_edit_result(job_dir: str, name: str, ok: bool, *,
     _log(job_dir, f"edit 失败第 {fails} 次[{failure_class}]，{delay}s 后重试")
 
 
-def _pipeline_log_tail(job_dir: str, n: int = 2000) -> str:
-    """读 06_publish/pipeline.log 末尾，用于 batch_runner 失败时的分类文本。"""
-    p = os.path.join(job_dir, "06_publish", "pipeline.log")
+# pipeline.log 尾部常被这些子进程解码线程噪音覆盖，结构化提取时必须剔除
+_LOG_NOISE = ("UnicodeDecodeError", "_readerthread",
+              "Exception in thread", "subprocess.py")
+_LOG_ERR_RE = re.compile(
+    r"(✗|Traceback|RuntimeError|Error|error:|失败|failed|"
+    r"Conversion failed|Nothing was written|缺少目录)")
+
+
+def _exception_brief(err: BaseException, where: str = "") -> str:
+    """结构化异常摘要：异常类型 + 首行 message + 发生位置（函数:行号）。
+
+    last_error 不再记录日志尾部 500 字符：2026-11-07 那轮 pipeline.log 尾部被子进程
+    解码线程的 UnicodeDecodeError 噪音覆盖，按 last_error 误判了一轮根因。
+    """
+    msg = str(err).replace("\r", "").strip()
+    first = msg.splitlines()[0].strip() if msg else ""
+    if len(first) > 200:
+        first = first[:199] + "…"
+    tb = err.__traceback__
+    loc = ""
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        loc = f"{code.co_name}:{tb.tb_lineno}"
+        tb = tb.tb_next
+    out = f"{type(err).__name__}: {first}" if first else type(err).__name__
+    if loc:
+        out += f" @ {loc}"
+    if where:
+        out += f" ({where})"
+    return out
+
+
+def _pipeline_failure_brief(job_dir: str, rc: int) -> str:
+    """batch_runner 非 0 退出：退出码 + 本轮最后几条有效错误行（剔除解码噪音）。
+
+    不再整段记录日志尾部；只保留最后 3 条去重错误行，同时保住「缺少目录」这类
+    需要自愈匹配的关键行（_try_heal_missing_dirs 依赖它）。
+    """
+    path = os.path.join(job_dir, "06_publish", "pipeline.log")
+    sig: list[str] = []
     try:
-        with open(p, encoding="utf-8", errors="replace") as f:
-            return f.read()[-n:]
+        with open(path, encoding="utf-8", errors="replace") as f:
+            data = f.read()[-16384:]
+        marker = data.rfind("cover_watch edit 阶段")
+        if marker >= 0:
+            data = data[marker:]
+        for line in data.splitlines():
+            s = line.strip()
+            if not s or any(n in s for n in _LOG_NOISE):
+                continue
+            if not _LOG_ERR_RE.search(s):
+                continue
+            if s not in sig:
+                sig.append(s)
     except OSError:
-        return ""
+        pass
+    base = f"batch_runner rc={rc}（run_edit）"
+    if not sig:
+        return base
+    return base + "｜" + " ⏎ ".join(x[:160] for x in sig[-3:])
 
 
 def _norm_cmp_path(s: str) -> str:
@@ -1074,11 +1126,15 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     eds.begin(job_dir, phase="edit")
 
     def _fail(err_text: str) -> bool:
-        """失败统一出口：先试缺目录自愈（不占额度），否则分类写状态机。"""
+        """失败统一出口：先试缺目录自愈（不占额度），否则分类写状态机。
+
+        err_text 必须是结构化摘要（_exception_brief / _pipeline_failure_brief /
+        validate 的明确错误串），不要再传日志尾部原文。
+        """
         if _try_heal_missing_dirs(job_dir, err_text, name):
             return False
         category, _action = fc.classify(err_text, phase="edit")
-        note_edit_result(job_dir, name, False, error=err_text[-500:],
+        note_edit_result(job_dir, name, False, error=err_text,
                          failure_class=category,
                          retryable=fc.is_retryable(category))
         return False
@@ -1095,7 +1151,7 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     except Exception as e:
         _log(job_dir, f"validate 失败: {e}")
         toast("❌ 剪辑阶段失败", f"{name} validate: {e}", icon="error")
-        return _fail(str(e))
+        return _fail(_exception_brief(e, where="run_edit.validate"))
     if errors:
         msg = "；".join(errors)
         _log(job_dir, f"validate 失败: {msg}")
@@ -1114,14 +1170,14 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     except Exception as e:
         _log(job_dir, f"ingest 失败: {e}")
         toast("❌ 剪辑阶段失败", f"{name} ingest: {e}", icon="error")
-        return _fail(str(e))
+        return _fail(_exception_brief(e, where="run_edit.ingest"))
     # 旧版 export_config 落盘（cut_s → video.cut_s 记账；derive 覆盖留到 export 阶段用）
     try:
         apply_export_config(job_dir)
     except Exception as e:
         _log(job_dir, f"export_config 失败: {e}")
         toast("❌ 剪辑阶段失败", f"{name} export_config: {e}", icon="error")
-        return _fail(str(e))
+        return _fail(_exception_brief(e, where="run_edit.export_config"))
     cmd = list(plan["cmd"])
     _log(job_dir, "pipeline start: " + " ".join(cmd))
     with open(os.path.join(job_dir, "06_publish", "pipeline.log"), "a",
@@ -1137,7 +1193,7 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
         return False  # 看门狗已记一次 edit_stalled 失败，不再重复计数
     if rc != 0:
         toast("❌ 剪辑失败", f"{name} rc={rc}，见 06_publish/pipeline.log", icon="error")
-        return _fail(_pipeline_log_tail(job_dir) or f"batch_runner rc={rc}")
+        return _fail(_pipeline_failure_brief(job_dir, rc))
     note_edit_result(job_dir, name, True)
     toast("✅ 草稿就绪", f"{name}（等待导出阶段）", icon="success")
     _log(job_dir, "edit done")
@@ -1171,7 +1227,7 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
         # 与 chain 异常同等对待：必须登记失败，让退避/阈值暂停生效。
         note_export_result(job_dir, name, False,
                            pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
-                           error=f"export_config 失败: {e}"[-500:],
+                           error=_exception_brief(e, where="run_export.export_config"),
                            failure_class="export_config_error",
                            retryable=True, phase="export")
         return False
@@ -1690,19 +1746,19 @@ def _record_chain_failure(job_dir: str, name: str, action: str,
     退避、阈值暂停全被跳过），补记失败让它们照常生效。
     登记过程本身再异常也只记日志，绝不让 daemon 因一处状态写失败而退出。
     """
-    text = f"chain 异常: {err}"
+    text = f"chain 异常: {_exception_brief(err, where=action)}"
     try:
         after = _round_state_brief(job_dir, action)
         if after[0] in ("done", "retrying", "paused", "failed") and after != before:
             _log(job_dir, f"{text}（本次执行已登记为 {after[0]}，不重复计数）")
             return
         if action == "edit":
-            note_edit_result(job_dir, name, False, error=text[-500:],
+            note_edit_result(job_dir, name, False, error=text,
                              failure_class="chain_exception", retryable=True)
         else:
             note_export_result(job_dir, name, False,
                                pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
-                               error=text[-500:], failure_class="chain_exception",
+                               error=text, failure_class="chain_exception",
                                retryable=True, phase="export")
     except Exception as e2:
         _log(job_dir, f"{text}（登记失败时再次异常: {e2}）")

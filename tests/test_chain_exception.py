@@ -197,6 +197,73 @@ check("第二轮返回 0", rc2 == 0, rc2)
 check("第二轮未执行（attempts 不变）", st4b["attempts"] == 1, st4b["attempts"])
 check("第二轮未重复计数", st4b["consecutive_failures"] == 1, st4b["consecutive_failures"])
 
+print("\n== ⑦ last_error 改结构化异常（不再记录日志尾部）==")
+
+
+def _boom_here():
+    raise RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+
+
+try:
+    _boom_here()
+except RuntimeError as e:
+    brief = cw._exception_brief(e, where="测试链路")
+check("含异常类型", "RuntimeError" in brief, brief)
+check("含首行 message", "cublas64_12.dll" in brief, brief)
+check("含发生位置（函数:行号）", "_boom_here:" in brief, brief)
+check("含调用位置说明", "测试链路" in brief, brief)
+
+
+class _MultiLine(Exception):
+    pass
+
+
+brief_ml = cw._exception_brief(_MultiLine("第一行\n第二行"), where="多行")
+check("多条 message 只取首行", "第二行" not in brief_ml, brief_ml)
+check("未抛出的异常也能生成摘要", brief_ml.startswith("_MultiLine: 第一行"), brief_ml)
+
+# _pipeline_failure_brief：过滤线程噪音，保留真实错误与「缺少目录」自愈线索
+print("\n== ⑧ batch_runner rc!=0 取有效错误行，剔除解码噪音 ==")
+jd8 = make_fixture("结构化日志")
+logp = os.path.join(jd8, "06_publish", "pipeline.log")
+with open(logp, "w", encoding="utf-8") as f:
+    f.write("\n".join([
+        "===== 2026-11-07T00:00:00 cover_watch edit 阶段 =====",
+        "Exception in thread Thread-3 (_readerthread):",
+        "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xbc in position 124",
+        "  ✗ ffmpeg failed: Conversion failed!",
+        "Traceback (most recent call last):",
+        "RuntimeError: Library cublas64_12.dll is not found or cannot be loaded",
+        "Exception in thread Thread-4 (_readerthread):",
+        "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xa8 in position 266",
+    ]) + "\n")
+pf = cw._pipeline_failure_brief(jd8, 1)
+check("以退出码开头", pf.startswith("batch_runner rc=1"), pf)
+check("保留真实错误行", "cublas64_12.dll" in pf or "Conversion failed" in pf, pf)
+check("剔除解码噪音", "UnicodeDecodeError" not in pf and "_readerthread" not in pf, pf)
+
+with open(logp, "w", encoding="utf-8") as f:
+    f.write("  ✗ 缺少目录: 06_publish/receipts\n")
+    f.write("UnicodeDecodeError: 'utf-8' codec can't decode byte 0xbc\n")
+pf2 = cw._pipeline_failure_brief(jd8, 2)
+check("缺目录自愈线索仍保留", "缺少目录: 06_publish/receipts" in pf2, pf2)
+
+print("\n== ⑨ chain 异常登记 last_error 不含日志噪音 ==")
+jd9 = make_fixture("结构化状态")
+with open(os.path.join(jd9, "06_publish", "pipeline.log"), "w", encoding="utf-8") as f:
+    f.write("UnicodeDecodeError: 'utf-8' codec can't decode byte 0xbc\n" * 20)
+before9 = cw._round_state_brief(jd9, "edit")
+eds.begin(jd9, phase="edit")
+try:
+    _boom_here()
+except RuntimeError as e:
+    cw._record_chain_failure(jd9, "测试剧", "edit", {}, e, before9)
+st9 = _status(jd9)
+check("last_error 含异常类型", "RuntimeError" in st9["last_error"], st9["last_error"])
+check("last_error 含发生位置", "_boom_here:" in st9["last_error"], st9["last_error"])
+check("last_error 不含解码噪音", "UnicodeDecodeError" not in st9["last_error"],
+      st9["last_error"])
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\n{'=' * 40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
 sys.exit(1 if fails else 0)
