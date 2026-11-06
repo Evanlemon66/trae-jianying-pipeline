@@ -381,19 +381,41 @@ def fail(job_dir: str, error: Optional[str] = None, *,
 
 # ── 闸门 ─────────────────────────────────────────────────────────
 
+def _infer_from_ctx(job_dir: str, *, progress_mtime: float = 0.0,
+                    migrate_ctx: Optional[dict[str, Any]] = None,
+                    now: Optional[float] = None) -> dict[str, Any]:
+    """按 migrate_ctx 在内存里推断初始状态（不迁移、不写盘）。"""
+    ctx = migrate_ctx or {}
+    return _infer_initial(
+        job_dir,
+        video_status=ctx.get("video_status"),
+        stage=ctx.get("stage"),
+        progress_status=ctx.get("progress_status"),
+        progress_mtime=progress_mtime,
+        progress_pct=ctx.get("progress_pct"),
+        now=now,
+    )
+
+
 def gate(job_dir: str, *, phase_override: Optional[str] = None,
          progress_mtime: float = 0.0,
          migrate_ctx: Optional[dict[str, Any]] = None) -> Optional[str]:
     """导出闸门：返回等待/暂停原因；None 表示可导。--phase export 为人工强制放行。
 
-    只读（不落盘回收）：stale 推导仅在内存生效，持久化回收由 reap_stale 在执行链做。
+    纯内存推导：文件缺失时按 migrate_ctx 推断，但**不 migrate、不备份、不写盘**；
+    真实创建统一交给 begin()（真实导出开始时调用）。stale 推导也只在内存生效，
+    持久化回收由 reap_stale 在执行链做。
     注意：done 不在此拦截——「是否已导」由 check_trigger（stage=video_ready /
     video.status=done）负责，gate 只管 重试退避 / 暂停 / 进行中 这类可恢复阻塞，
     以保证与旧 retry_gate 语义兼容（成功后放行）。
     """
     if phase_override == "export":
         return None
-    st = load(job_dir, progress_mtime=progress_mtime, migrate_ctx=migrate_ctx)
+    st = _read_raw(job_dir)
+    if st is None:
+        st = _infer_from_ctx(job_dir, progress_mtime=progress_mtime,
+                             migrate_ctx=migrate_ctx)
+    st = _effective(st, progress_mtime)
     status = st.get("status")
     if status == "paused":
         return (f"连续 {st.get('consecutive_failures')} 次导出失败已暂停"

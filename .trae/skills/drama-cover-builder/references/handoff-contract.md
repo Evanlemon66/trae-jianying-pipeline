@@ -15,7 +15,7 @@ D:\短剧\<剧名>\
     ├── job.json
     ├── dispatch.json                   # 可选：豆包侧调度意图声明（mode/cut_s/derive/priority），ingest 归并进 job.json.workflow，见 §7
     ├── export_config.json              # 可选（旧版兼容）：导出偏好（cut_s / derive），见 §7
-    ├── .export_state.json              # 运行态：导出状态机单一真源（进入导出闸门时 cover_watch 自动写，无需手工建），见 §7.1
+    ├── .export_state.json              # 运行态：导出状态机单一真源（真实导出开始时 cover_watch 自动写，无需手工建），见 §7.1
     ├── .export_retry.json              # 运行态（旧版，仅迁移来源）：首次读真源时迁入 .export_state.json 并备份 .bak
     ├── .edit_state.json                # 运行态：剪辑阶段失败退避/暂停状态机（首次 edit 闸门判定时自动写），见 §7.3
     ├── 01_input\
@@ -371,7 +371,7 @@ python lib/job_manifest.py validate --job "<cover_job>" --fix   # 先修复 gate
 
 导出阶段的「是否已导 / 失败几次 / 是否暂停 / 进度到哪」只读这一份文件，不再分散判断。
 
-- **位置**：`<cover_job>/.export_state.json`（与 `.watcher.lock` 同级）。运行态文件，**仅当该剧首次进入导出闸门（即将执行导出）时创建**；未进闸门的剧（已 `video_ready`、缺图/缺 prompts、gate 未 done 等）不会生成该文件。无需手工建。
+- **位置**：`<cover_job>/.export_state.json`（与 `.watcher.lock` 同级）。运行态文件，**仅当该剧真实导出开始时（`lib/export_state.py` 的 `begin()`）创建**；只做计划/闸门评估（如 `cover_watch plan`）不会创建或迁移该文件。未进闸门的剧（已 `video_ready`、缺图/缺 prompts、gate 未 done 等）不会生成该文件。无需手工建。
 - **唯一写者**：`lib/export_state.py`，且只由 `cover_watch` 的导出链路调用。剪映导出子进程、`job_manifest`、`series_runner` 都不写它。`job.json` 的 `video.status` 是展示字段，由本真源派生（真源 `done` → `video.status="done"`），任何地方不得绕过真源直接改。
 - **原子与幂等**：`.tmp` + `os.replace` 写入；`succeed` 对已 `done` 原样返回不重写。
 
