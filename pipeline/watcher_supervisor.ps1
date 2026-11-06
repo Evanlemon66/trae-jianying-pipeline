@@ -23,6 +23,7 @@ $repoRoot   = Split-Path -Parent $scriptDir
 $logDir     = Join-Path $repoRoot 'pipeline\_work'
 $logFile    = Join-Path $logDir 'watcher_supervisor.log'
 $consoleLog = Join-Path $logDir 'watcher_console.log'
+$heartbeatFile = Join-Path $logDir 'watcher_heartbeat.json'
 $watcherPy  = Join-Path $repoRoot 'lib\cover_watch.py'
 
 # 隐藏本进程的控制台窗口（计划任务每 5 分钟唤起一次，避免窗口闪烁）
@@ -86,6 +87,18 @@ function Get-WatcherProcesses {
     return @($procs | Where-Object { $_.CommandLine -and $_.CommandLine -match 'cover_watch' })
 }
 
+# 心跳卡死判定纯函数（缺失/不可解析/刚启动/pid 不一致都不判卡死）
+$stallLib = Join-Path $scriptDir 'watcher_stall.ps1'
+if (Test-Path -LiteralPath $stallLib) {
+    try {
+        . $stallLib
+    } catch {
+        Write-Log ("加载 watcher_stall.ps1 失败，跳过卡死判定: " + $_.Exception.Message)
+    }
+} else {
+    Write-Log "未找到 watcher_stall.ps1，跳过卡死判定"
+}
+
 function Invoke-Supervisor {
     # 日志目录先行创建（同时给 watcher 的 stdout 重定向准备落点）
     try {
@@ -112,8 +125,71 @@ function Invoke-Supervisor {
 
     $running = @(Get-WatcherProcesses)
     if ($running.Count -gt 0) {
-        Write-Log ("已在运行: pid=" + $running[0].ProcessId + "（共 " + $running.Count + " 个 cover_watch 进程），本次不重复启动")
-        return 0
+        $runningPid = [int]$running[0].ProcessId
+        $count = $running.Count
+
+        $canJudge = $null -ne (Get-Command Get-WatcherStallDecision -ErrorAction SilentlyContinue)
+        $decision = 'disabled'
+        $stallSeconds = 900
+        if ($canJudge) {
+            $stallSeconds = Get-WatchStallSeconds -RepoRoot $repoRoot
+            $hb = $null
+            if (Test-Path -LiteralPath $heartbeatFile) {
+                try {
+                    $raw = Get-Content -LiteralPath $heartbeatFile -Raw -Encoding UTF8
+                    if ($raw -and $raw.Trim().Length -gt 0) {
+                        $hb = $raw | ConvertFrom-Json
+                    }
+                } catch {
+                    $hb = $null
+                }
+            }
+            $decision = Get-WatcherStallDecision -Heartbeat $hb `
+                -NowEpoch ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) `
+                -StallSeconds $stallSeconds -RunningPid $runningPid
+        }
+
+        if ($decision -eq 'stalled') {
+            Write-Log ("判定卡死 → 重启: pid=$runningPid（共 $count 个 cover_watch 进程）" +
+                       "心跳停滞超过 ${stallSeconds}s")
+            foreach ($p in $running) {
+                try {
+                    & taskkill.exe /F /T /PID $p.ProcessId 2>&1 | Out-Null
+                } catch {
+                    Write-Log ("终止 pid=" + $p.ProcessId + " 失败: " + $_.Exception.Message)
+                }
+            }
+            # 等旧进程真正退出，避免叠加启动第二个 watcher
+            $gone = $false
+            for ($i = 0; $i -lt 20; $i++) {
+                Start-Sleep -Milliseconds 500
+                if (@(Get-WatcherProcesses).Count -eq 0) { $gone = $true; break }
+            }
+            if (-not $gone) {
+                Write-Log "判定卡死 → 重启: 旧进程 10s 内未退出，为避免叠加本次不启动"
+                return 1
+            }
+            Write-Log "判定卡死 → 重启: 旧进程已终止，开始重新拉起"
+            # 删掉旧心跳，避免新进程写出第一份心跳前被再次判定
+            try {
+                if (Test-Path -LiteralPath $heartbeatFile) {
+                    Remove-Item -LiteralPath $heartbeatFile -Force -ErrorAction Stop
+                }
+            } catch {
+                Write-Log ("删除旧心跳失败（继续启动）: " + $_.Exception.Message)
+            }
+            # fall through 到下面的启动块
+        } else {
+            switch ($decision) {
+                'noheartbeat' { Write-Log ("已在运行: pid=$runningPid（共 $count 个 cover_watch 进程；无心跳文件，不判卡死）") }
+                'unparsable'  { Write-Log ("已在运行: pid=$runningPid（共 $count 个 cover_watch 进程；心跳不可解析，不判卡死）") }
+                'pidmismatch' { Write-Log ("已在运行: pid=$runningPid（共 $count 个 cover_watch 进程；心跳 pid 不一致，不判卡死）") }
+                'startup'     { Write-Log ("已在运行: pid=$runningPid（共 $count 个 cover_watch 进程；启动余量内，不判卡死）") }
+                'healthy'     { Write-Log ("已在运行: pid=$runningPid（共 $count 个 cover_watch 进程；心跳正常，本次不重复启动）") }
+                default       { Write-Log ("已在运行: pid=$runningPid（共 $count 个 cover_watch 进程），本次不重复启动") }
+            }
+            return 0
+        }
     }
 
     # 即将启动 watcher：此刻还没有进程持有 watcher_console.log 的句柄，改名安全，先按 10MB×5 轮转；

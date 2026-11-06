@@ -13,6 +13,7 @@
     "watch.retry_pause_after: 连续导出失败多少次后暂停该剧（默认 5），退避间隔 1/2/4/8/16/30 分钟；恢复办法：删除 cover_job/.export_state.json 或 --phase export 强制放行（放行不清零失败计数）。失败分类与状态见契约 §7.1。",
     "watch.edit_stall_timeout_s: 剪辑阶段「心跳超时」判定卡死的秒数（默认 900，设 0 关闭看门狗）。watcher 每轮巡检 status=editing 的剧，超过该时长没有心跳更新即判残留；先校验 pid 命令行/父链确实指向这部剧才会 kill，校验不过只记日志不杀，随后按一次可重试失败走退避/暂停。",
     "watch.new_job_grace_min: 新剧宽限期分钟数（默认 10，设 0 关闭）。仅对「首次被发现、history 里还没有任何执行记录」的新剧生效：距 job.json 创建时间不足该分钟数则本轮跳过；期间 job.json 被改过（mtime 变新，说明有人在配裁剪）视为放行，直接走原有静默防抖逻辑。已在队列中的剧不受影响。",
+    "watch.stall_heartbeat_s: watcher 心跳停滞判定卡死的秒数（默认 900）。watcher 每 30s 原子写 pipeline/_work/watcher_heartbeat.json；supervisor 发现进程在跑但心跳超过该秒数未更新，判定卡死并杀进程树后重新拉起。心跳缺失、不可解析、pid 不一致或进程刚启动（180s 内）都不判卡死，避免误杀。",
     "presets: 剪映「我的预设」里的组合预设名，必须与预设库完全一致（可用 pipeline.py --list-presets 查看）。",
     "alpha 为可选的滤镜透明度（0~1），仅对滤镜类预设生效，普通贴纸/logo 预设不用填。",
     "不配 presets 字段时，预设库中 pipeline_ 开头的预设会被自动启用。",
@@ -36,7 +37,8 @@
     "export_stall_timeout": 1800,
     "retry_pause_after": 5,
     "edit_stall_timeout_s": 900,
-    "new_job_grace_min": 10
+    "new_job_grace_min": 10,
+    "stall_heartbeat_s": 900
   },
   "presets": [
     { "name": "我的logo" },

@@ -54,6 +54,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -84,6 +85,10 @@ EXTS = (".png", ".jpg", ".jpeg", ".webp")
 LOCK_NAME = ".watcher.lock"
 EXPORT_CONFIG_NAME = "export_config.json"
 EXPORT_POLICIES = ("immediate", "after_edit_queue_drained", "manual")
+
+_WORK_DIR = os.path.join(_REPO, "pipeline", "_work")
+HEARTBEAT_NAME = "watcher_heartbeat.json"
+HEARTBEAT_INTERVAL_S = 30.0
 
 
 def _norm_job_dir(path: str) -> str:
@@ -238,6 +243,64 @@ def _log(job_dir: str, msg: str) -> None:
             f.write(line + "\n")
     except OSError:
         pass
+
+
+class _WatcherHeartbeat:
+    """进程心跳：后台 daemon 线程每 30s 原子写，主循环按轮次更新上下文。
+
+    心跳文件放 pipeline/_work/watcher_heartbeat.json（已被 .gitignore 忽略），
+    供 watcher_supervisor.ps1 判定「进程活着但卡死」。写失败只告警，不影响调度。
+    """
+
+    def __init__(self, work_dir: str = _WORK_DIR,
+                 interval: float = HEARTBEAT_INTERVAL_S) -> None:
+        self._work_dir = work_dir
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._state: dict[str, Any] = {
+            "stage": "starting", "job": None, "phase": None, "round": 0,
+        }
+        self._started_ts = time.time()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._write()  # 先同步写一次，避免 supervisor 在启动初期读到旧心跳
+        self._thread = threading.Thread(
+            target=self._loop, name="watcher-heartbeat", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def update(self, **fields: Any) -> None:
+        with self._lock:
+            self._state.update(fields)
+        self._write()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            self._write()
+
+    def _write(self) -> None:
+        with self._lock:
+            payload = {
+                "pid": os.getpid(),
+                "updated_ts": time.time(),
+                "started_ts": self._started_ts,
+                "stage": self._state.get("stage"),
+                "job": self._state.get("job"),
+                "phase": self._state.get("phase"),
+                "round": self._state.get("round"),
+            }
+        try:
+            _sio.atomic_write(self._work_dir, HEARTBEAT_NAME, payload)
+        except OSError as e:
+            print(f"[warn] 心跳写入失败: {e}", file=sys.stderr)
 
 
 # ── 导出失败退避 / 暂停（单一真源适配层）──────────────────────────
@@ -1593,7 +1656,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
     done: set[str] = set()
     known: set[str] = set()
     intent_states: dict[str, dict[str, Any]] = {}
+    hb = _WatcherHeartbeat()
+    hb.start()
+    round_no = 0
     while True:
+        round_no += 1
+        hb.update(stage="scan", job=None, phase=None, round=round_no)
         # 配置热加载
         try:
             cfg_new = _load_watch_config(getattr(args, "config", None), quiet=True)
@@ -1623,12 +1691,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if not candidates and (args.once or args.verbose):
                 print("[plan] 本轮无可推进任务")
             if args.once:
+                hb.stop()
                 return 0
             time.sleep(interval)
             continue
         pick = _pick(candidates)
         if pick is None:
             if args.once:
+                hb.stop()
                 return 0
             time.sleep(interval)
             continue
@@ -1637,8 +1707,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 if p is not pick and p["action"] == "blocked":
                     print(_plan_line(p))
         if not acquire_lock(pick["job_dir"], phase=pick["action"]):
+            hb.update(stage="wait-lock", job=pick["job_dir"], phase=None, round=round_no)
             time.sleep(interval)
             continue
+        hb.update(stage=pick["action"], job=pick["job_dir"], phase="running",
+                  round=round_no)
         try:
             if pick["action"] == "edit":
                 success = run_edit(pick["job_dir"], pick, dry_run=False)
@@ -1652,9 +1725,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
             success = False
         finally:
             release_lock(pick["job_dir"])
+            hb.update(stage="idle", job=None, phase=None, round=round_no)
         if success and pick["action"] == "export":
             done.add(pick["job_dir"])
         if args.once:
+            hb.stop()
             return 0
         time.sleep(interval)
 
