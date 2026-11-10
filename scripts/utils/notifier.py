@@ -20,6 +20,9 @@ import os
 import sys
 import subprocess
 
+# 非 Windows 平台该常量为 0（不生效）；Windows 下用于隐藏通知子进程控制台
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 # emoji 图标映射，嵌入 title 让 Windows Toast 更美观
 _ICON_EMOJI = {
@@ -33,6 +36,26 @@ _ICON_EMOJI = {
 
 _MAX_TITLE = 60
 _MAX_MSG = 120
+
+# 测试期隔离：默认抑制桌面通知；ALLOW_TEST_TOAST=1 时显式放行并加 [测试] 前缀
+TEST_ALLOW_ENV = "ALLOW_TEST_TOAST"
+TEST_PREFIX = "[测试] "
+
+
+def _under_pytest() -> bool:
+    """廉价、无副作用的「当前进程在 pytest 下」判断。
+
+    - PYTEST_CURRENT_TEST 由 pytest 在每个用例执行期间设置；
+    - 或 pytest 已导入且带 __version__（不硬依赖 pytest，运行时未装也正常）。
+    任何异常都按「不在测试」处理，绝不影响主流程。
+    """
+    try:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return True
+        mod = sys.modules.get("pytest")
+        return mod is not None and hasattr(mod, "__version__")
+    except Exception:
+        return False
 
 
 def _fit(text: str, limit: int) -> str:
@@ -50,6 +73,13 @@ def toast(title: str, message: str = "", icon: str = "info") -> None:
         icon: "info" | "success" | "warning" | "error" | "done" | "fail"
     """
     try:
+        # 测试期门禁：默认只写日志，不触碰 plyer / NotifyIcon / osascript
+        if _under_pytest():
+            if os.environ.get(TEST_ALLOW_ENV) != "1":
+                print(f"[toast suppressed in test] {title} | {message}", file=sys.stderr)
+                return
+            # 显式放行：真弹，但加前缀，避免与生产告警混淆
+            title = TEST_PREFIX + str(title or "")
         # 组装美观的标题：emoji + 内容
         emoji = _ICON_EMOJI.get(icon, _ICON_EMOJI["info"])
         nice_title = _fit(f"{emoji} {title}".strip(), _MAX_TITLE)
@@ -114,6 +144,7 @@ def _mac_toast(title: str, message: str) -> None:
         ["osascript", "-e", script],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=_NO_WINDOW,
     )
 
 
@@ -124,6 +155,7 @@ def _linux_toast(title: str, message: str, icon: str) -> None:
             ["notify-send", title, message or "", "-i", icon_map.get(icon, "dialog-information")],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW,
         )
     except FileNotFoundError:
         pass

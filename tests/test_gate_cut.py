@@ -10,6 +10,9 @@ import job_manifest as jm  # noqa: E402
 import cover_watch as cw  # noqa: E402
 
 fails = []
+# 回归测试不弹真实桌面通知：把 toast 换成内存捕获，仍保留 C1 覆盖通知路径
+toasts = []
+cw.toast = lambda title, msg, icon="info": toasts.append((title, msg))
 
 
 def check(name, cond, extra=""):
@@ -81,22 +84,32 @@ def wf_of(rev, cut):
 JOB_VID = {"video": {"cut_s": 30}}
 set_ec(60)
 # C1 rev=0 + export_config 存在 → export_config 优先（新人工动作）
+# 保留通知路径覆盖：默认 notify=True，用上面替换的 toast 捕获，不弹真实桌面通知
+toasts.clear()
 check("C1 rev=0 有ec: ec(60) > wf(91)", cw._effective_cut(wf_of(0, 91), JOB_VID, jd2) == 60.0)
+check("C1b 通知路径弹一次且标题正确",
+      len(toasts) == 1 and "裁剪意图分歧" in toasts[0][0], toasts)
 # C2 rev=0 无 export_config → workflow
 rm_ec()
-check("C2 rev=0 无ec: wf(91)", cw._effective_cut(wf_of(0, 91), JOB_VID, jd2) == 91.0)
+check("C2 rev=0 无ec: wf(91)",
+      cw._effective_cut(wf_of(0, 91), JOB_VID, jd2, notify=False, write_log=False) == 91.0)
 # C3 rev>0 + export_config 存在 → workflow 最高（人工已确认）
 set_ec(60)
-check("C3 rev>0 有ec: wf(91) > ec(60)", cw._effective_cut(wf_of(1, 91), JOB_VID, jd2) == 91.0)
+check("C3 rev>0 有ec: wf(91) > ec(60)",
+      cw._effective_cut(wf_of(1, 91), JOB_VID, jd2, notify=False, write_log=False) == 91.0)
 # C4 rev>0 无 export_config → workflow
 rm_ec()
-check("C4 rev>0 无ec: wf(91)", cw._effective_cut(wf_of(1, 91), JOB_VID, jd2) == 91.0)
+check("C4 rev>0 无ec: wf(91)",
+      cw._effective_cut(wf_of(1, 91), JOB_VID, jd2, notify=False, write_log=False) == 91.0)
 # C5 video.cut_s 最低：无 wf/ec 时兜底；有 wf 时被压过
-check("C5a 无wf无ec: video(30) 兜底", cw._effective_cut(wf_of(0, None), JOB_VID, jd2) == 30.0)
-check("C5b 有wf: video 被压过", cw._effective_cut(wf_of(0, 91), JOB_VID, jd2) == 91.0)
+check("C5a 无wf无ec: video(30) 兜底",
+      cw._effective_cut(wf_of(0, None), JOB_VID, jd2, notify=False, write_log=False) == 30.0)
+check("C5b 有wf: video 被压过",
+      cw._effective_cut(wf_of(0, 91), JOB_VID, jd2, notify=False, write_log=False) == 91.0)
 # C6 0/负值/布尔 不生效
 set_ec(0)
-check("C6 ec=0 视为不裁→落 video(30)", cw._effective_cut(wf_of(0, None), JOB_VID, jd2) == 30.0)
+check("C6 ec=0 视为不裁→落 video(30)",
+      cw._effective_cut(wf_of(0, None), JOB_VID, jd2, notify=False, write_log=False) == 30.0)
 rm_ec()
 shutil.rmtree(TMP, ignore_errors=True)
 

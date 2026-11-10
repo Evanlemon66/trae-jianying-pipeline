@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.join(_ROOT, "lib"))
 import cover_watch as cw  # noqa: E402
 import edit_state as eds  # noqa: E402
 
+cw.toast = lambda *a, **k: None  # 回归测试不弹真实桌面通知
+
 fails = []
 
 
