@@ -246,6 +246,20 @@ def _mark_export_cleaned(source_dir, deleted):
         print(f"  [warn] 回写 job.json 失败（不影响已完成的删除）: {e}")
 
 
+def _job_video(source_dir):
+    """读 job.json 的 video 段（clean 的兜底来源；读不到返回 {}）。"""
+    if not source_dir:
+        return {}
+    jp = os.path.join(source_dir, "cover_job", "job.json")
+    try:
+        with open(jp, encoding="utf-8-sig") as f:
+            job = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    video = job.get("video")
+    return video if isinstance(video, dict) else {}
+
+
 def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=False,
           intermediates_only=False):
     """清理一部剧的串流残留。默认信任"已发布"，不删草稿（除非 include_drafts）。
@@ -263,6 +277,25 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
     paths = d.get("paths", {})
     title = d.get("draft_name", draft_name)
     source_dir = paths.get("source_dir", "")
+    # 兜底：旧 manifest 可能缺 export_file（record 时未写），此时用 job.json 的
+    # video.export_file，避免"成品还在盘上、clean 却静默跳过"的漏删。
+    video = _job_video(source_dir)
+    if not paths.get("export_file") and video.get("export_file"):
+        paths = dict(paths)
+        paths["export_file"] = video["export_file"]
+        print(f"  [回退] manifest 缺 export_file，改用 job.json: {paths['export_file']}")
+    missing_export = (not intermediates_only) and not paths.get("export_file")
+    if missing_export:
+        exported_evidence = (str(video.get("status") or "").lower() == "done"
+                             or str(video.get("export_state") or "").lower()
+                             in ("exported", "cleaned"))
+        if exported_evidence:
+            print("  [错误] 找不到任何成品路径：manifest 无 export_file，job.json 也无"
+                  "可用路径，但记录显示已导出——成品可能仍占盘。"
+                  "请先用 stream_manifest.py record 补写 export_file 再清理。")
+            return 2
+        print("  [warn] 找不到成品路径（manifest 与 job.json 均无 export_file），"
+              "本次只清中间产物；若成品已导出请先补写记录")
     print(f"清理 [{title}]:")
     if require_receipts:
         ok, why = receipts_status(source_dir)
