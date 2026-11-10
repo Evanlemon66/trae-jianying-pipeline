@@ -14,6 +14,9 @@
 """
 import os, sys, json, uuid, shutil, subprocess, glob
 
+# pythonw 托管下没有控制台，ffmpeg 子进程必须显式隐藏，否则每次抽帧弹窗
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def gen_uuid():
     return str(uuid.uuid4()).upper()
@@ -114,7 +117,7 @@ def set_draft_cover(draft_dir, cover_image=None, extract_from_video=None,
                  "-i", extract_from_video,
                  "-vf", filter_expr,
                  "-frames:v", "1", "-q:v", "2", dst],
-                check=True,
+                check=True, creationflags=_NO_WINDOW,
             )
         except subprocess.CalledProcessError as e:
             print(f"  ⚠️ smart-select 失败({e.returncode})，回退固定时间抽帧 @3s")
@@ -127,7 +130,7 @@ def set_draft_cover(draft_dir, cover_image=None, extract_from_video=None,
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
              "-ss", f"{t}", "-i", extract_from_video,
              "-frames:v", "1", "-q:v", "2", dst],
-            check=True,
+            check=True, creationflags=_NO_WINDOW,
         )
 
     print(f"  🖼️ draft_cover.jpg: {'smart-select' if smart_select else f'@{extract_time_s}s'} "

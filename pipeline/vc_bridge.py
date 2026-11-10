@@ -18,6 +18,8 @@ import subprocess
 import urllib.request
 import urllib.error
 
+from no_window import NO_WINDOW, hidden_child_env
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
 CONFIG_PATH = os.path.join(_HERE, "presets.json")
@@ -221,10 +223,12 @@ def texts_to_subs(texts):
 def _run_vc(args, timeout=600):
     py = find_python()
     cmd = [py, "-m", "videocaptioner"] + args
-    env = _ensure_ffmpeg_path()
+    # videocaptioner 内部 pydub 会自行 popen ffmpeg：注入 sitecustomize 用的环境，
+    # 让隐藏窗口补丁跨进程生效（父进程 os.environ 不变）
+    env = hidden_child_env(_ensure_ffmpeg_path())
     result = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8",
-        errors="replace", timeout=timeout, env=env,
+        errors="replace", timeout=timeout, env=env, creationflags=NO_WINDOW,
     )
     return result
 

@@ -72,7 +72,9 @@ def ensure_ffmpeg():
 
 def run(cmd, **kw):
     print("+", " ".join(str(c) for c in cmd)[:200])
-    subprocess.run(cmd, check=True, **kw)
+    # 默认隐藏控制台；调用方显式传 creationflags 时以其为准
+    flags = kw.pop("creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    subprocess.run(cmd, check=True, creationflags=flags, **kw)
 
 
 def jy_center(tx, ty):

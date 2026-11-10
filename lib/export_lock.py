@@ -13,6 +13,9 @@ import subprocess
 from datetime import datetime
 from typing import Any, Optional
 
+# pythonw 托管下没有控制台，tasklist 子进程必须显式隐藏，否则每次探活弹窗
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 _LOCK_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".export.lock")
 
@@ -22,7 +25,8 @@ def _pid_alive(pid: int) -> bool:
         return False
     try:
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                             capture_output=True, text=True, timeout=10).stdout.strip()
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=_NO_WINDOW).stdout.strip()
         for line in out.splitlines():
             cols = [c.strip('"') for c in line.split('","')]
             if len(cols) > 1 and cols[1] == str(pid):

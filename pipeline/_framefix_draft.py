@@ -17,6 +17,8 @@
 """
 import json, os, re, shutil, subprocess, sys
 
+from no_window import NO_WINDOW
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 
@@ -36,7 +38,8 @@ def _probe_frames(path, fp):
     try:
         r = subprocess.run([fp, "-v", "error", "-select_streams", "v:0", "-show_entries",
                             "stream=nb_frames,avg_frame_rate,duration", "-of", "json", path],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=60,
+                           creationflags=NO_WINDOW)
         st = json.loads(r.stdout)["streams"][0]
         num, den = (st.get("avg_frame_rate") or "30/1").split("/")
         fps = float(num) / float(den) if float(den) else 30.0

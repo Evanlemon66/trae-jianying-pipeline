@@ -14,6 +14,9 @@ import numpy as np
 from scipy import signal
 import onnxruntime as ort
 
+# pythonw 托管下每起一个控制台子进程都会弹黑框：ffmpeg 一律隐藏
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 JY_ASR_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", ""),
@@ -244,7 +247,7 @@ def mp4_to_wav(mp4_path, wav_path, tta_start=None, tta_end=None):
         cmd = ["ffmpeg", "-y", "-ss", str(tta_start), "-i", mp4_path,
                "-t", str(tta_end - tta_start),
                "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", wav_path]
-    subprocess.run(cmd, capture_output=True, check=True)
+    subprocess.run(cmd, capture_output=True, check=True, creationflags=_NO_WINDOW)
     return wav_path
 
 

@@ -33,6 +33,7 @@ sys.path.insert(0, _HERE)
 
 import repair_translation as rp  # noqa: E402  复用字幕轨/集范围/材质读写工具
 import split_long_subtitles as sl  # noqa: E402
+from no_window import NO_WINDOW  # noqa: E402
 
 DRAFT_ROOT = rp.DRAFT_ROOT
 CJK_RE = rp._CJK_RE
@@ -75,7 +76,8 @@ def _media_duration(path):
     if not ff:
         return None
     r = subprocess.run([ff, "-v", "error", "-show_entries", "format=duration",
-                        "-of", "csv=p=0", path], capture_output=True, text=True)
+                        "-of", "csv=p=0", path], capture_output=True, text=True,
+                       creationflags=NO_WINDOW)
     try:
         d = float((r.stdout or "").strip())
     except ValueError:

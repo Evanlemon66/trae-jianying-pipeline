@@ -10,6 +10,9 @@ except ImportError:
 from typing import Optional, Literal
 from typing import Dict, Any
 
+# pythonw 托管下每起一个控制台子进程都会弹黑框：ffprobe 一律隐藏
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def _probe_media(path: str) -> Dict[str, Any]:
     """Probe media with ffprobe when pymediainfo/libmediainfo is unavailable."""
@@ -24,7 +27,8 @@ def _probe_media(path: str) -> Dict[str, Any]:
         "json",
         path,
     ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15,
+                         creationflags=_NO_WINDOW)
     if res.returncode != 0:
         raise ValueError(res.stderr.strip() or f"ffprobe failed for {path}")
     return json.loads(res.stdout or "{}")

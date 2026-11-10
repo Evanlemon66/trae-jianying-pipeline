@@ -199,10 +199,19 @@ function Invoke-Supervisor {
         Write-Log 'watcher_console.log 轮转失败（可能被占用），跳过轮转继续启动 watcher'
     }
 
-    # cmd /c 包一层只为把 watcher 的输出落到 watcher_console.log；
+    # 不再经 cmd /c 包装（cmd 会额外带一个控制台窗口），直接启动 python。
+    # 优先 pythonw.exe：它是 GUI 宿主，不创建控制台，进程树里不会出现 conhost；
+    # 输出由 cover_watch.py 入口重定向到 watcher_console.log（print 与 traceback 都不丢）。
     # 真正的 python 子进程命令行仍含 cover_watch，后续 WMI 判定照常能识别。
-    # 与手工启动一致：python -u "lib/cover_watch.py"（-u 让输出即时落到日志）
-    $cmdLine = 'cmd.exe /d /s /c ""{0}" -u "{1}" >> "{2}" 2>&1"' -f $pythonExe, $watcherPy, $consoleLog
+    $launchExe = $pythonExe
+    $pythonw = Join-Path (Split-Path -Parent $pythonExe) 'pythonw.exe'
+    if (Test-Path -LiteralPath $pythonw) {
+        $launchExe = $pythonw
+    } else {
+        Write-Log ("警告: 未找到 pythonw.exe（$pythonw），退回 python.exe；" +
+                   "本次可能短暂出现控制台窗口，建议补装或修正 PATH")
+    }
+    $cmdLine = '"{0}" -u "{1}"' -f $launchExe, $watcherPy
     try {
         $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
                 -Arguments @{ CommandLine = $cmdLine; CurrentDirectory = $repoRoot } -ErrorAction Stop

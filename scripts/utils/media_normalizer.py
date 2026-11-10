@@ -3,6 +3,9 @@ import json
 import subprocess
 from typing import Optional
 
+# pythonw 托管下每起一个控制台子进程都会弹黑框：ffmpeg/ffprobe 一律隐藏
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def _norm_output_path(input_path: str) -> str:
     abs_in = os.path.abspath(input_path)
@@ -46,7 +49,8 @@ def _probe_video(input_path: str) -> dict:
         "json",
         input_path,
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                          creationflags=_NO_WINDOW)
     if proc.returncode != 0:
         return {}
     try:
@@ -155,7 +159,8 @@ def normalize_video_for_jianying(input_path: str, force: bool = False) -> Option
     ]
 
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              creationflags=_NO_WINDOW)
     except FileNotFoundError:
         print("❌ FFmpeg not found. Cannot normalize video for JianYing import.")
         return None

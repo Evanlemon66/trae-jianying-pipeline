@@ -19,6 +19,7 @@ import numpy as np
 sys.stdout.reconfigure(encoding="utf-8")
 
 from export_config import get_ffmpeg  # noqa: E402
+from no_window import NO_WINDOW  # noqa: E402
 
 FF = get_ffmpeg()
 W, H, FPS = 256, 144, 30
@@ -46,7 +47,7 @@ def _grab_clip(path, t, dur):
     try:
         r = subprocess.run([FF, "-v", "error", "-ss", f"{t:.3f}", "-t", f"{dur:.3f}", "-i", path,
                             "-vf", f"fps={FPS},scale={W}:{H},format=gray", "-f", "rawvideo", "-"],
-                           capture_output=True, timeout=300)
+                           capture_output=True, timeout=300, creationflags=NO_WINDOW)
         a = np.frombuffer(r.stdout, dtype=np.uint8)
         n = len(a) // (W * H)
         if n == 0:

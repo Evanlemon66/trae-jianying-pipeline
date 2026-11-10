@@ -5,6 +5,9 @@ import re
 import subprocess
 from typing import Dict, List, Optional, Union
 
+# pythonw 托管下每起一个控制台子进程都会弹黑框：ffprobe 一律隐藏
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 DRAFT_CONTENT_FILENAMES = ("draft_info.json", "draft_content.json")
 
 
@@ -233,6 +236,7 @@ def get_duration_ffprobe_cached(file_path: str) -> float:
             stderr=subprocess.STDOUT,
             text=True,
             timeout=5,
+            creationflags=_NO_WINDOW,
         )
         return float(result.stdout.strip())
     except Exception as e:

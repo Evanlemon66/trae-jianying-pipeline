@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.join(_REPO, "pipeline"))
 
 import job_manifest as jm  # noqa: E402
 import export_config as pc  # noqa: E402
+from no_window import NO_WINDOW  # noqa: E402
 
 LOCK_NAME = ".watcher.lock"
 STATE_NAME = ".export_state.json"
@@ -60,7 +61,8 @@ def _pid_alive(pid: int) -> bool:
         return False
     try:
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                             capture_output=True, text=True, timeout=10).stdout.strip()
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=NO_WINDOW).stdout.strip()
         for line in out.splitlines():
             cols = [c.strip('"') for c in line.split('","')]
             if len(cols) > 1 and cols[1] == str(pid):
