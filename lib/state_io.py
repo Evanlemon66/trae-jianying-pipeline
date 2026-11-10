@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from typing import Any, Optional
 
@@ -71,28 +72,40 @@ def atomic_write(job_dir: str, state_name: str, data: dict[str, Any]) -> None:
     if data.get("version") is None:
         data["version"] = STATE_VERSION
     path = state_path(job_dir, state_name)
-    tmp = path + ".tmp"
-    try:
-        os.makedirs(job_dir, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        # 原子替换必须成功才算写入，故短重试而不是静默吞掉。
-        for i in range(WRITE_RETRIES):
-            try:
-                os.replace(tmp, path)
-                return
-            except OSError:
-                if i == WRITE_RETRIES - 1:
-                    raise
-                time.sleep(0.05 * (i + 1))
-    except OSError:
+    os.makedirs(job_dir, exist_ok=True)
+    # 临时名每次唯一（mkstemp）：固定 <name>.tmp 会被上一次异常退出的残留、
+    # 或两个写者（心跳线程 + 主线程 / 两个进程）同时抢同一路径，
+    # 在 Windows 上表现为 open(tmp) 报 [Errno 13] Permission denied。
+    last_err: Optional[OSError] = None
+    for attempt in range(WRITE_RETRIES):
+        tmp: Optional[str] = None
+        fd: Optional[int] = None
         try:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
-        raise  # 清理完 tmp 后必须继续上抛，不能被本 except 吃掉
+            fd, tmp = tempfile.mkstemp(prefix=state_name + ".", suffix=".tmp", dir=job_dir)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = None
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            # 原子替换必须成功才算写入，故短重试而不是静默吞掉
+            os.replace(tmp, path)
+            return
+        except OSError as e:
+            last_err = e
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+            if tmp:
+                try:
+                    if os.path.isfile(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+            if attempt < WRITE_RETRIES - 1:
+                time.sleep(0.05 * (attempt + 1))
+    raise last_err if last_err is not None else OSError("atomic_write 失败")
 
 
 def save_if_changed(job_dir: str, state_name: str,

@@ -370,6 +370,7 @@ class _WatcherHeartbeat:
         }
         self._started_ts = time.time()
         self._code_fingerprint = _code_fingerprint()
+        self._fail_streak = 0
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
@@ -407,10 +408,24 @@ class _WatcherHeartbeat:
                 "phase": self._state.get("phase"),
                 "round": self._state.get("round"),
             }
-        try:
-            _sio.atomic_write(self._work_dir, HEARTBEAT_NAME, payload)
-        except OSError as e:
-            print(f"[warn] 心跳写入失败: {e}", file=sys.stderr)
+        # 写失败不能把心跳永久停更：同一轮内带退避重试 3 次，仍失败则下一周期
+        # （30s 后）继续写；只有连续失败才告警，避免每轮刷屏。
+        last: Optional[OSError] = None
+        for attempt in range(3):
+            try:
+                _sio.atomic_write(self._work_dir, HEARTBEAT_NAME, payload)
+            except OSError as e:
+                last = e
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            if self._fail_streak:
+                print(f"[hb] 心跳写入恢复（此前连续失败 {self._fail_streak} 次）")
+                self._fail_streak = 0
+            return
+        self._fail_streak += 1
+        if self._fail_streak <= 3 or self._fail_streak % 10 == 0:
+            print(f"[warn] 心跳写入失败（连续 {self._fail_streak} 次，下一周期重试）: {last}",
+                  file=sys.stderr)
 
 
 def check_release_safe(phase: str, *, heartbeat_path: Optional[str] = None,
