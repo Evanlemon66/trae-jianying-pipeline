@@ -3,6 +3,8 @@
 
 运行：python tests\\test_watcher_heartbeat.py（纯临时目录，不碰真实剧）
 """
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -44,6 +46,9 @@ def main():
         check("初始 stage=starting", data.get("stage") == "starting", data.get("stage"))
         check("state_io 补 updated_at", bool(data.get("updated_at")))
         check("state_io 补 version", data.get("version") == 1, data.get("version"))
+        check("含 code_fingerprint 且与当前代码一致",
+              data.get("code_fingerprint") == cw._code_fingerprint(),
+              data.get("code_fingerprint"))
 
         hb.update(stage="edit", job="D:/剧/cover_job", phase="running", round=7)
         data = read_hb(path)
@@ -60,6 +65,58 @@ def main():
 
         hb.stop()
         check("stop 后线程退出", hb._thread is not None and not hb._thread.is_alive())
+
+        print("\n== 放行前代码指纹校验 ==")
+        hb_path = os.path.join(tmp, "guard_heartbeat.json")
+
+        def write_hb(**kw):
+            payload = {"pid": os.getpid(), "updated_ts": time.time()}
+            payload.update(kw)
+            with open(hb_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+
+        check("无心跳（watcher 没跑）→ 放行",
+              cw.check_release_safe("edit", heartbeat_path=hb_path) is None)
+        write_hb(updated_ts=time.time() - 600, code_fingerprint="deadbeef")
+        check("心跳过期 → 按没在跑放行",
+              cw.check_release_safe("edit", heartbeat_path=hb_path) is None)
+        write_hb(pid=2 ** 31 - 1, code_fingerprint="deadbeef")
+        check("pid 已退出 → 按没在跑放行",
+              cw.check_release_safe("edit", heartbeat_path=hb_path) is None)
+        write_hb(code_fingerprint="deadbeef")
+        reason = cw.check_release_safe("edit", heartbeat_path=hb_path)
+        check("在跑且指纹不一致 → 拒绝",
+              reason is not None and "仍运行旧代码" in reason, reason)
+        check("拒绝提示含「重启」", reason is not None and "重启" in reason, reason)
+        write_hb()
+        reason2 = cw.check_release_safe("edit", heartbeat_path=hb_path)
+        check("旧版心跳无指纹 → 拒绝",
+              reason2 is not None and "旧代码" in reason2, reason2)
+        write_hb(code_fingerprint=cw._code_fingerprint())
+        check("在跑且指纹一致 → 放行",
+              cw.check_release_safe("edit", heartbeat_path=hb_path) is None)
+
+        print("\n== cmd_watch --phase 集成：旧代码拒绝放行 ==")
+        cfg_path = os.path.join(tmp, "watch.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        main_hb = os.path.join(tmp, cw.HEARTBEAT_NAME)
+        with open(main_hb, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "updated_ts": time.time(),
+                       "code_fingerprint": "deadbeef"}, f)
+        old_work = cw._WORK_DIR
+        cw._WORK_DIR = tmp
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = cw.main(["--job", os.path.join(tmp, "cover_job"),
+                              "--config", cfg_path, "--once", "--phase", "edit"])
+        finally:
+            cw._WORK_DIR = old_work
+        check("--phase 被拒绝（返回 1）", rc == 1, rc)
+        check("输出明确提示 watcher 仍在跑旧代码",
+              "仍运行旧代码" in out.getvalue() and "重启" in out.getvalue(),
+              out.getvalue())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
