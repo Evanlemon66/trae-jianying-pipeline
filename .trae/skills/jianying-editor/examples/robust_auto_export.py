@@ -13,6 +13,9 @@ import psutil
 import subprocess
 import winreg
 
+# pythonw 托管下每起一个控制台子进程都会弹黑框：ffprobe 一律隐藏
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # 输出流统一 UTF-8：重定向到文件/GBK 控制台时，打印 emoji 不再抛 UnicodeEncodeError
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -130,7 +133,7 @@ def _ffprobe_duration(path):
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", path],
-            capture_output=True, text=True)
+            capture_output=True, text=True, creationflags=_NO_WINDOW)
         return float((r.stdout or "").strip())
     except Exception:
         return None
@@ -142,7 +145,7 @@ def _ffprobe_has_audio(path):
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a",
              "-show_entries", "stream=index", "-of", "csv=p=0", path],
-            capture_output=True, text=True)
+            capture_output=True, text=True, creationflags=_NO_WINDOW)
         return bool((r.stdout or "").strip())
     except Exception:
         return False
@@ -198,7 +201,7 @@ def _preflight_media(draft_name):
             r = subprocess.run(
                 [ffprobe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "csv=p=0", p],
-                capture_output=True, text=True, timeout=90)
+                capture_output=True, text=True, timeout=90, creationflags=_NO_WINDOW)
         except Exception as e:
             return (p, f"ffprobe 调用失败: {e}")
         if r.returncode != 0 or not (r.stdout or "").strip():
@@ -1463,6 +1466,46 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
         except Exception as e:
             dprint(f"⚠️ 导出后回首页失败（不影响导出结果）: {e}")
 
+def subtitle_gate(draft_name, roots=None):
+    """缺字幕导出闸门：返回 cover_job 的缺字幕集号（空列表=放行）。
+
+    roots 为空时读 pipeline/presets.json 的 watch.roots；找不到 job.json 时返回 []
+    （独立手敲本脚本、无任务目录时不误拦）。与 series_runner._job_dir_for 同规则。
+    """
+    try:
+        import job_manifest as jm
+    except Exception:
+        return []
+    if roots is None:
+        try:
+            _pipeline_dir = os.path.join(_REPO_ROOT, "pipeline")
+            if _pipeline_dir not in sys.path:
+                sys.path.insert(0, _pipeline_dir)
+            import export_config as pc
+            roots = pc.get_watch_config().get("roots") or []
+        except Exception:
+            roots = []
+    hits = []
+    for root in roots:
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for d in names:
+            if not draft_name.startswith(d):
+                continue
+            cand = os.path.join(root, d, "cover_job")
+            if os.path.isfile(os.path.join(cand, "job.json")):
+                hits.append((len(d), cand))
+    if not hits:
+        return []
+    hits.sort(reverse=True)
+    best = [c for n, c in hits if n == hits[0][0]]
+    if len(best) > 1:
+        return []
+    return jm.subtitle_missing(best[0])
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="剪映自动化导出工具")
     parser.add_argument("draft_name", help="草稿名称")
@@ -1481,6 +1524,13 @@ if __name__ == "__main__":
                         help="导出前冷启动剪映（杀进程→拉起→等首页），避免上一部刚导完时 UI 假死")
 
     args = parser.parse_args()
+
+    # 缺字幕策略：直调本脚本也要拦（不依赖调用方是否已检查）
+    _missing = subtitle_gate(args.draft_name)
+    if _missing:
+        print("⛔ 缺字幕未修复：第" + "、".join(str(n) for n in _missing) + "集")
+        print("   请重剪这些集，确认字幕非空后重跑；未修复前不会导出。")
+        sys.exit(2)
 
     # 重试循环（移植自老脚本）：UI 类失败 → 回首页（内含关闭按钮/重启兜底）→ 重试
     attempts = 1 + max(0, args.retries)

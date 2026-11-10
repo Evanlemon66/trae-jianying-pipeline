@@ -379,6 +379,30 @@ def fail(job_dir: str, error: Optional[str] = None, *,
     return _save_if_changed(job_dir, st)
 
 
+def clear_block(job_dir: str, *, failure_class: str = "subtitle_missing",
+                now: Optional[float] = None) -> Optional[dict[str, Any]]:
+    """解除不可重试的硬失败：仅 status=="failed" 且 failure_class 匹配时 -> pending。
+
+    用于缺字幕修复后的复位：该集重新剪辑且字幕非空、清单清空后，由 cover_watch
+    调用；不匹配/非 failed 时原样返回（幂等）。attempts/consecutive_failures 保留，
+    仍可追溯历史失败次数。
+    """
+    st = _read_raw(job_dir)
+    if st is None:
+        return None
+    if st.get("status") != "failed" or st.get("failure_class") != failure_class:
+        return st
+    now = now if now is not None else _now()
+    st = dict(st)
+    st["status"] = "pending"
+    st["last_error"] = None
+    st["failure_class"] = "unknown"
+    st["next_retry_at"] = 0
+    st["progress"] = None
+    st["heartbeat_ts"] = now
+    return _save_if_changed(job_dir, st)
+
+
 # ── 闸门 ─────────────────────────────────────────────────────────
 
 def _infer_from_ctx(job_dir: str, *, progress_mtime: float = 0.0,

@@ -35,8 +35,12 @@ sys.path.insert(0, _SCRIPTS_DIR)
 sys.path.insert(0, os.path.join(_PROJECT_ROOT, "lib"))
 
 import pipeline as pl  # noqa: E402
+from no_window import NO_WINDOW, install_default_hidden, hidden_child_env  # noqa: E402
+install_default_hidden()  # 无控制台托管时兜底隐藏所有子进程窗口（有控制台不生效）
 from utils.notifier import toast as _toast  # noqa: E402
 from export_config import export_mp4_path  # noqa: E402
+import job_manifest as jm  # noqa: E402
+import subtitle_guard  # noqa: E402
 try:
     import export_lock as _elock  # noqa: E402
 except Exception:  # 锁模块缺失时退化为无锁（保持旧行为）
@@ -56,7 +60,8 @@ def _ensure_jianying_closed(grace_s=15.0):
     def _running():
         try:
             out = _sp.check_output(["tasklist", "/fi", "imagename eq JianyingPro.exe"],
-                                   text=True, stderr=_sp.DEVNULL)
+                                   text=True, stderr=_sp.DEVNULL,
+                                   creationflags=NO_WINDOW)
             return "JianyingPro.exe" in out
         except Exception:
             return False
@@ -64,7 +69,8 @@ def _ensure_jianying_closed(grace_s=15.0):
     if not _running():
         return
     print("🛑 检测到剪映正在运行：为避免草稿被其内存旧副本回写覆盖（封面/字幕丢失），先关闭剪映")
-    _sp.run(["taskkill", "/IM", "JianyingPro.exe", "/T"], capture_output=True)  # 优雅退出（含子进程）
+    _sp.run(["taskkill", "/IM", "JianyingPro.exe", "/T"], capture_output=True,
+            creationflags=NO_WINDOW)  # 优雅退出（含子进程）
     t0 = time.time()
     while time.time() - t0 < grace_s:
         if not _running():
@@ -72,7 +78,8 @@ def _ensure_jianying_closed(grace_s=15.0):
             return
         time.sleep(1)
     print("  ⚠️ 剪映未在时限内退出，强制结束")
-    _sp.run(["taskkill", "/F", "/IM", "JianyingPro.exe", "/T"], capture_output=True)
+    _sp.run(["taskkill", "/F", "/IM", "JianyingPro.exe", "/T"], capture_output=True,
+            creationflags=NO_WINDOW)
     time.sleep(2)
 
 
@@ -94,16 +101,31 @@ def _natural_key(path):
 
 
 def _parse_only(values):
-    """把 --only 参数解析成集数集合。支持单个集数与区间（20..30 / 20-30），可混用。"""
+    """把 --only 参数解析成 (集数集合, 开区间下限)。支持单个集数、闭区间（20..30 / 20-30）
+    与只有下限的开区间（20..，表示第20集到最后一集），可混用。"""
     eps = set()
+    open_min = None
     for v in values or []:
-        m = re.fullmatch(r"(\d{1,4})\s*(?:\.\.|-)\s*(\d{1,4})", str(v))
+        raw = str(v).strip()
+        m = re.fullmatch(r"(\d{1,4})\s*(?:\.\.|-)\s*(\d{1,4})", raw)
         if m:
             a, b = int(m.group(1)), int(m.group(2))
             eps.update(range(min(a, b), max(a, b) + 1))
-        else:
-            eps.add(int(v))
-    return eps
+            continue
+        m = re.fullmatch(r"(\d{1,4})\s*\.\.", raw)
+        if m:
+            start = int(m.group(1))
+            open_min = start if open_min is None else min(open_min, start)
+            continue
+        eps.add(int(raw))
+    return eps, open_min
+
+
+def _only_match(ep, only_eps, open_min):
+    """单集是否命中 --only 选择：空选择=全选；开区间按「>= 下限」命中。"""
+    if not only_eps and open_min is None:
+        return True
+    return ep in only_eps or (open_min is not None and ep >= open_min)
 
 
 def _write_episode_map(draft_dir, draft_name, series_dir, cut_s):
@@ -222,6 +244,7 @@ def main():
     args = ap.parse_args()
 
     series_dir = os.path.abspath(args.series_dir)
+    job_dir = os.path.join(series_dir, "cover_job")  # 缺字幕清单所在任务目录
     if not os.path.isdir(series_dir):
         print(f"✗ 目录不存在: {series_dir}")
         sys.exit(1)
@@ -322,14 +345,14 @@ def main():
 
     prefix = args.draft_prefix or os.path.basename(series_dir.rstrip("\\/"))
     state = {} if args.fresh else load_state(args.workdir)
-    only_eps = _parse_only(args.only)
+    only_eps, only_open_min = _parse_only(args.only)
 
     # ── 单草稿串流模式：按文件名 a→z 全部注入同一草稿主轨，一次跑完 ──
     if args.stream:
         sel = []
         for i, v in enumerate(videos):
             ep = _ep_number(v, i)
-            if only_eps and ep not in only_eps:
+            if not _only_match(ep, only_eps, only_open_min):
                 continue
             sel.append((ep, v))
         sel.sort(key=lambda x: _natural_key(x[1]))
@@ -361,6 +384,7 @@ def main():
             skip_local_ai=False,
             workdir=args.workdir,
             presets=pl.parse_presets_arg(args.presets) if args.presets else None,
+            job_dir=job_dir,
             **cover_kw,
         )
 
@@ -402,9 +426,20 @@ def main():
             ff_result = None
 
         _toast("🎬 串流草稿已就绪", f"{draft_name}（{len(sel)} 集）")
+        # 整轮结束：缺字幕清单非空只收尾通知一条（不按集弹）
+        subtitle_guard.notify(job_dir)
 
         # ---- 导出（后台 WMI + pythonw + CREATE_NO_WINDOW，零弹窗、不阻塞）----
-        if args.auto_export:
+        export_blocked = False
+        try:
+            jm.require_export_allowed(job_dir)
+        except jm.ExportBlocked as e:
+            print(f"\n⛔ {e}")
+            print("   请重剪这些集，确认字幕非空后重跑；未修复前不会导出。")
+            export_blocked = True
+        if args.auto_export and export_blocked:
+            print("   ⏭️ 已跳过后台导出（缺字幕未修复）")
+        if args.auto_export and not export_blocked:
             import subprocess as _sp
             import tempfile as _tf
             exporter = os.path.join(
@@ -429,6 +464,10 @@ LOG_DIR = r"{launcher_dir}"
 PY = r"{sys.executable}"
 os.makedirs(LOG_DIR, exist_ok=True)
 env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+# 让导出进程也走 sitecustomize 补丁：它自己会 popen ffprobe 等外部程序
+_pp = r"{_HERE}"
+env["PYTHONPATH"] = _pp + ((os.pathsep + env["PYTHONPATH"]) if env.get("PYTHONPATH") else "")
+env["JY_HIDE_WINDOW"] = "1"
 out = open(r"{log_out}", "w", encoding="utf-8", errors="replace")
 err = open(r"{log_err}", "w", encoding="utf-8", errors="replace")
 subprocess.Popen(
@@ -448,7 +487,7 @@ subprocess.Popen(
             try:
                 rc = _sp.run(
                     ["powershell", "-NoProfile", "-Command", ps_cmd],
-                    capture_output=True, timeout=30)
+                    capture_output=True, timeout=30, creationflags=NO_WINDOW)
                 if rc.returncode == 0:
                     print(f"  WMI 后台启动完成（pythonw，零弹窗）")
                 else:
@@ -499,7 +538,9 @@ subprocess.Popen(
                                                   "verify_export.py")
                     if os.path.exists(verify_script):
                         rc = _sp.call([sys.executable, verify_script, draft_name, out_mp4],
-                                      cwd=os.path.dirname(verify_script))
+                                      cwd=os.path.dirname(verify_script),
+                                      env=hidden_child_env(),
+                                      creationflags=NO_WINDOW)
                         if rc == 0:
                             _toast("✅ 验证全部通过", draft_name)
                         else:
@@ -514,7 +555,7 @@ subprocess.Popen(
     todo = []
     for i, v in enumerate(videos):
         ep = _ep_number(v, i)
-        if only_eps and ep not in only_eps:
+        if not _only_match(ep, only_eps, only_open_min):
             continue
         st = state.get(v, {}).get("status")
         if st == "done":
@@ -561,6 +602,7 @@ subprocess.Popen(
                     cover_extract_from_video=None if args.cover_image else video,
                     workdir=wd_ep,
                     presets=pl.parse_presets_arg(args.presets) if args.presets else None,
+                    job_dir=job_dir,
                 )
                 done = True
                 break
@@ -589,6 +631,8 @@ subprocess.Popen(
         print("   失败集可重跑: python batch_runner.py <目录> --only <集数>")
     print(f"{'='*60}")
     _toast("🎬 批量制作完成", f"成功 {ok} 集, 失败 {fail} 集, 耗时 {mins:.0f} 分钟")
+    # 整轮结束：缺字幕清单非空只收尾通知一条（不按集弹）
+    subtitle_guard.notify(job_dir)
 
     if args.auto_merge and ok > 0:
         try:
@@ -600,6 +644,7 @@ subprocess.Popen(
                 [sys.executable, os.path.join(_HERE, "merge_drafts.py"),
                  "--state", state_path, "--out", merge_out],
                 cwd=_HERE,
+                creationflags=NO_WINDOW,
             )
         except Exception as e:
             print(f"  ✗ 合并失败: {e}")

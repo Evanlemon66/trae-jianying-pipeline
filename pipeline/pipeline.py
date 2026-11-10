@@ -10,6 +10,9 @@ sys.path.insert(0, _HERE)
 from jy_cover import set_draft_cover, set_cover_composition
 
 from export_config import get_deps_root, get_font_path
+import job_manifest as jm
+from no_window import NO_WINDOW, install_default_hidden, hidden_child_env
+install_default_hidden()  # 无控制台托管时兜底隐藏所有子进程窗口（有控制台不生效）
 
 from utils.formatters import (
     get_default_drafts_root as _upstream_get_default_drafts_root,
@@ -304,7 +307,8 @@ def backup_draft(path):
 def _jianying_running():
     try:
         import subprocess as _sp
-        out = _sp.check_output(["tasklist", "/fi", "imagename eq JianyingPro.exe"], text=True)
+        out = _sp.check_output(["tasklist", "/fi", "imagename eq JianyingPro.exe"], text=True,
+                               creationflags=NO_WINDOW)
         return "JianyingPro.exe" in out
     except Exception:
         return False
@@ -857,6 +861,7 @@ def _cover_start_for_cut(video_path, cut_us):
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", video_path],
             capture_output=True, text=True, timeout=30, check=True,
+            creationflags=NO_WINDOW,
         ).stdout.strip()
         dur = float(out)
         if dur > 0:
@@ -1139,7 +1144,8 @@ def detect_silences_ffmpeg(audio_path, noise_db=-35.0, min_sil_s=0.22):
            f"silencedetect=noise={noise_db}dB:d={min_sil_s}", "-f", "null", "-"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=300)
+                           encoding="utf-8", errors="replace", timeout=300,
+                           creationflags=NO_WINDOW)
     except Exception:
         return []
     sils, cur = [], None
@@ -1493,6 +1499,7 @@ def get_video_duration_us(video_path):
                  "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
                  video_path],
                 capture_output=True, text=True, encoding="utf-8", timeout=30,
+                creationflags=NO_WINDOW,
             )
             if result.returncode == 0 and result.stdout.strip():
                 return int(float(result.stdout.strip()) * 1_000_000)
@@ -1522,6 +1529,7 @@ def get_video_size(video_path):
              "-show_entries", "stream=width,height",
              "-of", "csv=s=x:p=0", video_path],
             capture_output=True, text=True, encoding="utf-8", timeout=30,
+            creationflags=NO_WINDOW,
         )
         if result.returncode == 0 and result.stdout.strip():
             w, h = result.stdout.strip().split("x")[:2]
@@ -2021,7 +2029,9 @@ def run_demucs(input_path, output_dir, model=None, fallback=None):
         # errors="replace"：ffmpeg/demucs 的 stderr 常带非 UTF-8（GBK）字节，
         # 严格解码会让 subprocess 的读取线程抛 UnicodeDecodeError 并清空缓冲。
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace")
+                                encoding="utf-8", errors="replace",
+                                env=hidden_child_env(),
+                                creationflags=NO_WINDOW)
         if result.returncode != 0:
             print(f"  ✗ demucs ({m}) failed: {result.stderr[-300:]}")
             continue
@@ -2036,6 +2046,33 @@ def run_demucs(input_path, output_dir, model=None, fallback=None):
             return vocal, (no_vocal if os.path.exists(no_vocal) else None)
         print(f"  ✗ demucs ({m}) 输出缺失")
     return None, None
+
+
+_CT2_TORCH_DLL_TRIED = False
+_CT2_TORCH_DLL_OK = False
+
+
+def _prepare_ctranslate2_cuda():
+    """即将尝试 GPU 时，把 torch\\lib 注册进本进程 DLL 搜索路径（仅 Windows）。
+
+    faster-whisper 底层的 CTranslate2 动态加载 cublas64_12.dll，而该 DLL 只随
+    torch 安装在 site-packages\\torch\\lib，不在 PATH。import torch 会把它注册为
+    本进程 DLL 目录，从而让 CTranslate2 找得到；CPU-only 路径不导入 torch。
+    任何失败（未装 torch / 导入异常 / 非 Windows）都不影响主流程，保持原降级链。
+    """
+    global _CT2_TORCH_DLL_TRIED, _CT2_TORCH_DLL_OK
+    if _CT2_TORCH_DLL_TRIED:
+        return _CT2_TORCH_DLL_OK
+    _CT2_TORCH_DLL_TRIED = True
+    if os.name != "nt":
+        return False
+    try:
+        import torch  # noqa: F401  # 只为注册 torch\\lib 到本进程 DLL 搜索路径
+        _CT2_TORCH_DLL_OK = True
+        print("  🗣️ 已为 CTranslate2 注册 torch\\lib（cuBLAS 可从 torch 目录加载）")
+    except Exception as e:
+        print(f"  ⚠️ 为 CTranslate2 注册 torch\\lib 失败，GPU 不可用将走 CPU: {str(e)[:80]}")
+    return _CT2_TORCH_DLL_OK
 
 
 def run_whisper(input_path, model_size=None, device=None, compute_type=None):
@@ -2055,6 +2092,8 @@ def run_whisper(input_path, model_size=None, device=None, compute_type=None):
     for dev, ct in candidates:
         try:
             print(f"  🗣️ loading whisper model ({model_size}, {dev}/{ct})...")
+            if str(dev).startswith("cuda"):
+                _prepare_ctranslate2_cuda()
             model = WhisperModel(model_size, device=dev, compute_type=ct)
             used = (dev, ct)
             break
@@ -2086,6 +2125,8 @@ def run_whisper(input_path, model_size=None, device=None, compute_type=None):
                 raise
             tried.append(nxt)
             print(f"  🗣️ 改用 {nxt[0]}/{nxt[1]} 重试...")
+            if str(nxt[0]).startswith("cuda"):
+                _prepare_ctranslate2_cuda()
             model = WhisperModel(model_size, device=nxt[0], compute_type=nxt[1])
             used = nxt
 
@@ -2112,7 +2153,8 @@ def run_paraformer(input_path, workdir):
     wav16k = os.path.join(workdir, "paraformer_16k.wav")
     subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", input_path,
                     "-vn", "-ar", "16000", "-ac", "1", wav16k],
-                   capture_output=True, text=True, check=True)
+                   capture_output=True, text=True, check=True,
+                   creationflags=NO_WINDOW)
 
     print(f"  🗣️ loading Paraformer ({'int8' if PARAFORMER_QUANTIZE else 'fp32'})...")
     asr = Paraformer(PARAFORMER_DIR, batch_size=1, quantize=PARAFORMER_QUANTIZE)
@@ -2181,7 +2223,8 @@ def run_ffmpeg_extract_audio(video_path, output_wav):
         # errors="replace"：保住 ffmpeg 的 stderr 内容，同时避免非 UTF-8 字节
         # 让 subprocess 读取线程抛 UnicodeDecodeError（日志尾部只剩线程噪音）。
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace")
+                                encoding="utf-8", errors="replace",
+                                creationflags=NO_WINDOW)
     except FileNotFoundError:
         print("  ⚠ ffmpeg not found")
         return False
@@ -2357,6 +2400,29 @@ def default_workdir_for_draft(draft_name_or_path):
     return os.path.join(_HERE, f"_work_{safe}_{tag}")
 
 
+def _classify_subtitle_outcome(ep_num, *, asr_empty: bool, appended: int) -> str | None:
+    """单集字幕结论：三档 ASR 全空 / 裁 cut 后零条 -> failed；有字幕 -> repaired。
+
+    ep_num 非法（非正整数）时返回 None，调用方跳过该集，不误记清单。
+    """
+    if not isinstance(ep_num, int) or isinstance(ep_num, bool) or ep_num <= 0:
+        return None
+    if asr_empty:
+        return "failed"
+    return "repaired" if appended > 0 else "failed"
+
+
+def _resolve_pipeline_job_dir(job_dir, video_paths):
+    """优先用调用方显式传入的 cover_job，否则从视频路径逐级向上找。"""
+    if job_dir:
+        return job_dir
+    for path in (video_paths or []):
+        found = jm.find_job_dir(path)
+        if found:
+            return found
+    return None
+
+
 def run_pipeline(draft_name_or_path, video_paths=None,
                  cut_us=None, workdir=None,
                  skip_local_ai=False, do_export=True,
@@ -2366,7 +2432,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                  do_vad_gate=True, vad_min_speech_ratio=None,
                  presets=None,
                  cover_image=None, cover_extract_from_video=None, cover_extract_time_s=3.0,
-                 vocal_mode="audio_track"):
+                 vocal_mode="audio_track", job_dir=None):
     if workdir is None:
         workdir = default_workdir_for_draft(draft_name_or_path)
     os.makedirs(workdir, exist_ok=True)
@@ -2617,6 +2683,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
 
     # ━━━━ Step 7-9: 逐集 提取音频 → ASR → 翻译 → 写字幕（带集偏移）━━━━
     cn_all, en_all = [], []
+    failed_eps, repaired_eps = set(), set()  # 缺字幕清单：整轮结束后一次落盘
     translation_gaps = []  # 翻译全链失败的集，主循环结束后立即进入修复轮
     if do_whisper or do_translate:
         print("━ [7-9] 提取音频 → 识别字幕 → 翻译 (按集串流) ━━━━━━━━━━━━━")
@@ -2647,6 +2714,11 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         for u in units:
             tag = f"第{u['idx']}集 " if len(units) > 1 else ""
             print(f"  ── {tag}{u['name']}  offset={u['start_us']/1_000_000:.2f}s")
+            # 缺字幕策略：集号优先从「第N集」解析，回退单位序号
+            m_ep = re.search(r"第\s*(\d+)\s*集", str(u.get("name") or ""))
+            ep_num = int(m_ep.group(1)) if m_ep else (
+                u.get("idx") if isinstance(u.get("idx"), int) else None)
+            cn_before = len(cn_all)
 
             # Step 7: 分离音频
             asr_source = u["path"]
@@ -2665,6 +2737,10 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                 cn_subs = []
             if not cn_subs:
                 print(f"  ⚠️ {tag}无字幕, 跳过")
+                # 只有真正跑过 ASR 的集才记失败；跳过 ASR 的集不参与清单
+                if do_whisper and _classify_subtitle_outcome(
+                        ep_num, asr_empty=True, appended=0) == "failed":
+                    failed_eps.add(ep_num)
                 continue
 
             # 句间间隙回截：云端 ASR 段首尾相接（字幕常驻不掉字），按该集人声
@@ -2699,6 +2775,14 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                 })
             if dropped:
                 print(f"  ✂️ {tag}丢弃裁点前字幕 {dropped} 条")
+            # 缺字幕策略：本集最终字幕条数为 0 才算失败；有产出才算真正修复
+            if do_whisper:
+                verdict = _classify_subtitle_outcome(
+                    ep_num, asr_empty=False, appended=len(cn_all) - cn_before)
+                if verdict == "failed":
+                    failed_eps.add(ep_num)
+                elif verdict == "repaired":
+                    repaired_eps.add(ep_num)
 
             # Step 9: 翻译本集字幕，时间轴同样加集偏移
             if do_translate and not skip_local_ai:
@@ -2730,6 +2814,16 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                         "text": str(t),
                         "_refined": s.get("_refined", False),
                     })
+
+        # 缺字幕清单：整轮只写一次，异常不中断后续（翻译修复轮/导出收尾照常）
+        _sync_jd = _resolve_pipeline_job_dir(job_dir, video_paths)
+        if _sync_jd and (failed_eps or repaired_eps):
+            try:
+                jm.sync_subtitle_missing(_sync_jd, failed_eps=failed_eps,
+                                         repaired_eps=repaired_eps)
+                print(f"  🧾 缺字幕清单: {jm.subtitle_missing(_sync_jd) or '（空）'}")
+            except Exception as e:
+                print(f"  ⚠️ 缺字幕清单落盘失败: {type(e).__name__}: {e}")
 
         # 翻译空位修复轮：主循环结束后对留空集重跑全链，最多 3 轮、轮间退避
         # 120s/300s —— GLM 夜间抖动常持续数分钟，单轮立即重试大概率仍撞墙；
@@ -2894,7 +2988,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         _eps_arg = ",".join(str(e) for e in _missing_eps_pending)
         with timed_step("残缺集补翻"):
             _rc = subprocess.call(
-                [sys.executable, "-u", _repair, _pub_name, "--eps", _eps_arg])
+                [sys.executable, "-u", _repair, _pub_name, "--eps", _eps_arg],
+                creationflags=NO_WINDOW)
         if _rc != 0:
             print(f"  ✗ 自动补翻脚本退出码 {_rc}")
         # 复验：repair 直接改的是已发布草稿文件，需从磁盘重读
@@ -2950,6 +3045,14 @@ def run_pipeline(draft_name_or_path, video_paths=None,
 
     # ━━━━ Step 11: 导出 ━━━━
     if do_export:
+        # 无字幕策略：导出前硬拦。文件清单 ∪ 本轮内存失败集（job.json 尚未生成时兜底）
+        _export_jd = _resolve_pipeline_job_dir(job_dir, video_paths)
+        _missing = (set(jm.subtitle_missing(_export_jd)) if _export_jd else set()) | failed_eps
+        if _missing:
+            print(f"  ⛔ {jm.ExportBlocked(sorted(_missing))}")
+            print("     请重剪这些集，确认字幕非空后重跑；未修复前不会导出。")
+            do_export = False
+    if do_export:
         print("━ [11] 导出 (robust_auto_export) ━━━━━━━━━━━━━━━━━━━━━")
         try:
             from export_config import export_mp4_path, get_export_dir
@@ -2964,7 +3067,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             with timed_step("导出"):
                 rc = subprocess.call(
                     [sys.executable, "-u", exporter, draft_name_or_path, out_path, "--move",
-                     "--fallback-dir", get_export_dir()])
+                     "--fallback-dir", get_export_dir()],
+                    env=hidden_child_env(), creationflags=NO_WINDOW)
             if rc == 0:
                 print(f"  ✅ 导出完成!")
             else:

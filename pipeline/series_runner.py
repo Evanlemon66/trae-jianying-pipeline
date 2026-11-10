@@ -33,11 +33,17 @@ sys.stdout.reconfigure(encoding="utf-8")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 _SCRIPTS = os.path.join(_ROOT, "scripts")
+_LIB = os.path.join(_ROOT, "lib")
 sys.path.insert(0, _SCRIPTS)
 sys.path.insert(0, _HERE)
+sys.path.insert(0, _LIB)
 
 from utils.notifier import toast  # noqa: E402
 from export_config import export_mp4_path, get_export_dir  # noqa: E402
+import export_config as pc  # noqa: E402
+import job_manifest as jm  # noqa: E402
+import subtitle_guard  # noqa: E402
+from no_window import NO_WINDOW, hidden_child_env  # noqa: E402
 
 STATE_PATH = os.path.join(_HERE, "_series_queue_state.json")
 BATCH_RUNNER = os.path.join(_HERE, "batch_runner.py")
@@ -122,7 +128,8 @@ def _run_pipeline(series_dir: str, slug: str, overrides: dict | None = None) -> 
     log_path = os.path.join(_HERE, f"_stream_{slug}.log")
     err_path = os.path.join(_HERE, f"_stream_{slug}.err.log")
     with open(log_path, "ab") as out, open(err_path, "ab") as err:
-        proc = subprocess.run(cmd, cwd=_ROOT, stdout=out, stderr=err)
+        proc = subprocess.run(cmd, cwd=_ROOT, stdout=out, stderr=err,
+                              creationflags=NO_WINDOW)
     return proc.returncode == 0
 
 
@@ -202,13 +209,55 @@ def _progress_mtime(out_mp4: str) -> float:
     return ts
 
 
-def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = False) -> bool:
+def _job_dir_for(target: str, is_draft: bool) -> str | None:
+    """解析 target 对应的 cover_job（含 job.json 才返回）。
+
+    剧集目录：<target>/cover_job；草稿名：遍历 presets.json watch.roots，
+    取剧名目录名与草稿名前缀匹配最长且唯一的一组；多命中不自动拦截。
+    """
+    if not is_draft:
+        cand = os.path.join(target, "cover_job")
+        return cand if os.path.isfile(os.path.join(cand, "job.json")) else None
+    hits: list[tuple[int, str]] = []
+    for root in (pc.get_watch_config().get("roots") or []):
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for d in names:
+            if not target.startswith(d):
+                continue
+            cand = os.path.join(root, d, "cover_job")
+            if os.path.isfile(os.path.join(cand, "job.json")):
+                hits.append((len(d), cand))
+    if not hits:
+        return None
+    hits.sort(reverse=True)
+    best = [c for n, c in hits if n == hits[0][0]]
+    if len(best) > 1:
+        print(f"  ⚠️ 草稿 {target} 匹配到多个 cover_job: {'、'.join(best)}，不自动拦截")
+        return None
+    return best[0]
+
+
+def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = False,
+                job_dir: str | None = None) -> bool:
     """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。
 
     timeout 按「无进展」计：进度 json 每 30s 刷新一次，超过 timeout 秒没有任何刷新
     才判定卡死并杀进程（导出慢但一直在写盘不会被误杀）。
     cold_start: 导出前冷启动剪映（每部剧一次，规避上一部刚导完时的 UI 假死）。
+    job_dir: 显式 cover_job；为空时按草稿名解析。缺字幕清单非空时直接拦截，
+    不建目录、不清理残留、不启动导出子进程。
     """
+    job_dir = job_dir or _job_dir_for(draft_name, True)
+    if job_dir:
+        try:
+            jm.require_export_allowed(job_dir)
+        except jm.ExportBlocked as e:
+            print(f"⛔ {e}")
+            print("   请重剪这些集，确认字幕非空后重跑；未修复前不会导出。")
+            return False
     out_mp4 = export_mp4_path(draft_name)
     out_dir = os.path.dirname(out_mp4)
     # 只建父目录：剧名目录留给剪映自己创建，否则剪映会把成品写进「剧名(1)」
@@ -219,7 +268,8 @@ def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = Fa
     if cold_start:
         cmd.append("--cold-start")
 
-    proc = subprocess.Popen(cmd, cwd=_ROOT)
+    proc = subprocess.Popen(cmd, cwd=_ROOT, env=hidden_child_env(),
+                            creationflags=NO_WINDOW)
     last_beat = time.time()
     while proc.poll() is None:
         time.sleep(5)
@@ -349,9 +399,24 @@ def main() -> int:
             _save_state(state)
             continue
         print(f"\n📤 [{i+1}/{len(targets)}] 导出: {draft}")
+        job_dir = _job_dir_for(target, is_draft)
+        if job_dir:
+            try:
+                jm.require_export_allowed(job_dir)
+            except jm.ExportBlocked as e:
+                # 缺字幕未修复：该剧整轮跳过导出，只收尾通知一条，不进入失败重试计数
+                print(f"⛔ {name} {e}")
+                print("   请重剪这些集，确认字幕非空后重跑；未修复前不会导出。")
+                st["status"] = "blocked"
+                _save_state(state)
+                # full 模式的生成阶段已由 batch_runner 收尾通知；export 模式才在这里补一条
+                if args.mode == "export":
+                    subtitle_guard.notify(job_dir)
+                failed.append(name)
+                continue
         st["status"] = "exporting"
         _save_state(state)
-        if _run_export(draft, args.timeout):
+        if _run_export(draft, args.timeout, job_dir=job_dir):
             st["status"] = "done"
             _save_state(state)
             print(f"✅ 完成: {name}")

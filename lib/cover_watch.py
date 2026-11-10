@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -69,9 +70,35 @@ import failure_class as fc  # noqa: E402  # 第 3 项：失败分类器 + 自愈
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BATCH_RUNNER = os.path.join(_REPO, "pipeline", "batch_runner.py")
+
+
+def _ensure_streams_to_log() -> None:
+    """托管启动（pythonw）时 stdout/stderr 为 None：把输出接到 pipeline/_work/watcher_console.log。
+
+    隐藏控制台不等于丢日志：print 与未捕获 traceback（走 sys.stderr）都仍落盘。
+    手工在终端里跑时 streams 正常，本函数不做事，行为不变。
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    path = os.path.join(_REPO, "pipeline", "_work", "watcher_console.log")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        stream = open(path, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+
+
+_ensure_streams_to_log()
+
 sys.path.insert(0, os.path.join(_REPO, "pipeline"))
 import export_config as pc  # noqa: E402  # 本机配置（presets.json）唯一读取入口
+from no_window import NO_WINDOW, install_default_hidden  # noqa: E402  # pythonw 托管下子进程一律不弹控制台
 import series_runner as sr  # noqa: E402  # 复用 _run_export（preclean+导出+归拢）
+install_default_hidden()  # 无控制台托管时兜底隐藏所有子进程窗口（有控制台不生效）
 sys.path.insert(0, os.path.join(_REPO, "scripts", "utils"))
 try:
     from notifier import toast  # noqa: E402
@@ -89,6 +116,18 @@ EXPORT_POLICIES = ("immediate", "after_edit_queue_drained", "manual")
 _WORK_DIR = os.path.join(_REPO, "pipeline", "_work")
 HEARTBEAT_NAME = "watcher_heartbeat.json"
 HEARTBEAT_INTERVAL_S = 30.0
+# 心跳超过 3 个周期未刷新 → 认为 watcher 已不在运行（放行语义按「没跑」处理）
+HEARTBEAT_STALE_S = HEARTBEAT_INTERVAL_S * 3
+# 人工放行前比对代码指纹的关键模块（只覆盖调度/执行链，避免无关文件误报）
+CODE_FINGERPRINT_FILES = (
+    "lib/cover_watch.py",
+    "lib/job_manifest.py",
+    "lib/edit_state.py",
+    "lib/export_state.py",
+    "lib/failure_class.py",
+    "pipeline/batch_runner.py",
+    "pipeline/pipeline.py",
+)
 
 
 def _norm_job_dir(path: str) -> str:
@@ -170,7 +209,8 @@ def _pid_alive(pid: int) -> bool:
         return False
     try:
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                             capture_output=True, text=True, timeout=10).stdout.strip()
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=NO_WINDOW).stdout.strip()
         for line in out.splitlines():
             cols = [c.strip('"') for c in line.split('","')]
             if len(cols) > 1 and cols[1] == str(pid):
@@ -298,6 +338,20 @@ def _log(job_dir: str, msg: str) -> None:
         pass
 
 
+def _code_fingerprint() -> str:
+    """关键模块内容哈希（16 进制短串）：watcher 启动时写进心跳，供放行前比对。"""
+    h = hashlib.sha256()
+    for rel in CODE_FINGERPRINT_FILES:
+        p = os.path.join(_REPO, rel.replace("/", os.sep))
+        h.update(rel.encode("utf-8"))
+        try:
+            with open(p, "rb") as f:
+                h.update(f.read())
+        except OSError:
+            h.update(b"<missing>")
+    return h.hexdigest()[:12]
+
+
 class _WatcherHeartbeat:
     """进程心跳：后台 daemon 线程每 30s 原子写，主循环按轮次更新上下文。
 
@@ -315,12 +369,14 @@ class _WatcherHeartbeat:
             "stage": "starting", "job": None, "phase": None, "round": 0,
         }
         self._started_ts = time.time()
+        self._code_fingerprint = _code_fingerprint()
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         if self._thread is not None:
             return
         self._write()  # 先同步写一次，避免 supervisor 在启动初期读到旧心跳
+        print(f"[hb] watcher 启动 pid={os.getpid()} 代码指纹={self._code_fingerprint}")
         self._thread = threading.Thread(
             target=self._loop, name="watcher-heartbeat", daemon=True)
         self._thread.start()
@@ -345,6 +401,7 @@ class _WatcherHeartbeat:
                 "pid": os.getpid(),
                 "updated_ts": time.time(),
                 "started_ts": self._started_ts,
+                "code_fingerprint": self._code_fingerprint,
                 "stage": self._state.get("stage"),
                 "job": self._state.get("job"),
                 "phase": self._state.get("phase"),
@@ -354,6 +411,48 @@ class _WatcherHeartbeat:
             _sio.atomic_write(self._work_dir, HEARTBEAT_NAME, payload)
         except OSError as e:
             print(f"[warn] 心跳写入失败: {e}", file=sys.stderr)
+
+
+def check_release_safe(phase: str, *, heartbeat_path: Optional[str] = None,
+                       now: Optional[float] = None,
+                       fingerprint: Optional[str] = None) -> Optional[str]:
+    """人工 --phase 放行（清 paused/强制阶段）前的代码一致性校验。
+
+    返回拒绝原因；None 表示放行。语义区分三种情况：
+      - 心跳缺失/不可解析/已过期（超过 3 个周期）或 pid 已退出 → watcher 没在跑，放行；
+      - 心跳新鲜且进程存活、但指纹缺失（旧版心跳）或不一致 → 拒绝，提示先重启；
+      - 心跳新鲜、指纹一致 → 放行。
+    """
+    path = heartbeat_path or os.path.join(_WORK_DIR, HEARTBEAT_NAME)
+    try:
+        with open(path, encoding="utf-8") as f:
+            hb = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(hb, dict):
+        return None
+    now_ts = time.time() if now is None else now
+    try:
+        updated = float(hb.get("updated_ts") or 0)
+    except (TypeError, ValueError):
+        updated = 0.0
+    if now_ts - updated > HEARTBEAT_STALE_S:
+        return None  # 心跳过期：watcher 已不在运行
+    try:
+        pid = int(hb.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid <= 0 or not _pid_alive(pid):
+        return None  # pid 已退出：watcher 没在跑
+    old_fp = str(hb.get("code_fingerprint") or "").strip()
+    cur_fp = fingerprint or _code_fingerprint()
+    if not old_fp:
+        return (f"watcher（pid={pid}）心跳未携带代码指纹，运行的是旧代码；"
+                f"拒绝 {phase} 放行。请先重启 watcher")
+    if old_fp != cur_fp:
+        return (f"watcher（pid={pid}）仍运行旧代码（心跳指纹 {old_fp} ≠ 当前 {cur_fp}）；"
+                f"拒绝 {phase} 放行。请先重启 watcher")
+    return None
 
 
 # ── 导出失败退避 / 暂停（单一真源适配层）──────────────────────────
@@ -661,7 +760,14 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
     cut = _effective_cut(wf, job, job_dir, notify=notify, write_log=write_log)
 
     def _edit_cmd() -> list[str]:
-        cmd = [sys.executable, _BATCH_RUNNER, series_dir, "--force", "--no-export"]
+        # -u：stdout 必须无缓冲。watcher 用 pythonw 托管，子进程 stdout 被重定向到
+        # 06_publish/pipeline.log 后默认是块缓冲（8KB），进度迟迟不落盘；而
+        # _wait_edit_with_watchdog 只按该日志体积变化刷新 edit 心跳，缓冲期间会被
+        # 误判成 edit_stalled 而杀掉正在跑的剪辑。
+        cmd = [sys.executable, "-u", _BATCH_RUNNER, series_dir, "--force", "--no-export"]
+        start_ep = _read_start_ep(job_dir)
+        if start_ep > 1:
+            cmd += ["--only", f"{start_ep}.."]
         if cut:
             cmd += ["--cut", str(cut)]
         return cmd
@@ -748,6 +854,30 @@ def _read_export_config(job_dir: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"{EXPORT_CONFIG_NAME} 应为 JSON 对象")
     return data
+
+
+def _read_start_ep(job_dir: str) -> int:
+    """export_config.json 的 start_ep：起始集号，缺省/非法一律按 1（只告警不抛异常）。
+
+    start_ep > 1 时 watcher 拼编辑命令追加 --only <start_ep>..（从该集起重剪到最后一集）；
+    缺省或 <=1 时不加，行为与旧版完全一致。
+    """
+    p = os.path.join(job_dir, EXPORT_CONFIG_NAME)
+    if not os.path.isfile(p):
+        return 1
+    try:
+        with open(p, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"  ⚠️ {EXPORT_CONFIG_NAME} 读取失败，start_ep 按 1 处理: {e}")
+        return 1
+    if not isinstance(data, dict) or "start_ep" not in data:
+        return 1
+    raw = data.get("start_ep")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        print(f"  ⚠️ export_config.start_ep 非法（{raw!r}），按 1 处理")
+        return 1
+    return raw
 
 
 def apply_export_config(job_dir: str) -> Optional[list[str]]:
@@ -839,6 +969,13 @@ def note_edit_result(job_dir: str, name: str, ok: bool, *,
     if ok:
         eds.succeed(job_dir)
         _log(job_dir, "edit 状态置 done（计数清零）")
+        # 无字幕策略：只有本轮剪辑后清单已空（缺字幕集已真正修好）才解除导出终态拦截
+        if not jm.subtitle_missing(job_dir):
+            prev = _sio.read_raw(job_dir, es.STATE_NAME) or {}
+            if prev.get("status") == "failed" \
+                    and prev.get("failure_class") == "subtitle_missing":
+                es.clear_block(job_dir, failure_class="subtitle_missing")
+                _log(job_dir, "缺字幕已全部修复，导出闸门复位 pending")
         return
     if pause_after is None:
         # 阈值可由 presets.watch.edit_pause_after 覆盖（默认仍为 3，导出侧语义不受影响）
@@ -951,7 +1088,8 @@ def _kill_tree(pid: int) -> None:
         return
     try:
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, text=True, timeout=15)
+                       capture_output=True, text=True, timeout=15,
+                       creationflags=NO_WINDOW)
     except Exception as e:
         print(f"  [WARN] taskkill pid={pid} 失败: {e}")
 
@@ -977,7 +1115,8 @@ def _pid_owned_by_job(pid: int, series_dir: str) -> bool:
     )
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                             capture_output=True, text=True, timeout=20).stdout
+                             capture_output=True, text=True, timeout=20,
+                             creationflags=NO_WINDOW).stdout
     except Exception:
         return False
     return series in _norm_cmp_path(out)
@@ -990,7 +1129,8 @@ def _proc_tree_snapshot() -> dict[int, int]:
           "$_.ParentProcessId.ToString()) }")
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                             capture_output=True, text=True, timeout=20).stdout
+                             capture_output=True, text=True, timeout=20,
+                             creationflags=NO_WINDOW).stdout
     except Exception as e:
         print(f"  [WARN] 进程表快照失败: {e}")
         return {}
@@ -1040,7 +1180,8 @@ def _kill_descendants(root_pid: int) -> list[int]:
             continue
         try:
             subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10,
+                           creationflags=NO_WINDOW)
             killed.append(pid)
         except Exception as e:
             print(f"  [WARN] taskkill pid={pid} 失败: {e}")
@@ -1206,12 +1347,12 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     try:
         jm.backfill_hashes(job_dir)
         job = jm.load_job(os.path.join(job_dir, "job.json"))
-        # 与 ingest_job 的归一保持一致：pending 先按 blocked 校验，避免 watcher
-        # 在 ingest 之前就把豆包写的 pending 拒掉（ingest 里保留同样归一，双保险）。
-        cleanup = job.get("cleanup")
-        if isinstance(cleanup, dict) and cleanup.get("status") == "pending":
-            cleanup["status"] = "blocked"
-        errors = jm.validate_job(job, job_dir)
+        # 先把 ingest 会做的「形态归一」在内存里做掉，再校验：避免写入方不规范
+        # （如 cover_map[].file 只有裸文件名、cleanup.status=pending）在闸门处被误判。
+        # 归一不落盘，真正的持久化留给随后的 ingest_job；两者规则一致、均幂等。
+        for note in jm.normalize_job_shape(job, job_dir):
+            _log(job_dir, f"归一: {note}")
+        errors = jm.validate_job(job, job_dir) + jm.cover_file_missing(job, job_dir)
     except Exception as e:
         _log(job_dir, f"validate 失败: {e}")
         toast("❌ 剪辑阶段失败", f"{name} validate: {e}", icon="error")
@@ -1221,6 +1362,8 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
         _log(job_dir, f"validate 失败: {msg}")
         toast("❌ 剪辑阶段失败", f"{name} validate: {msg}", icon="error")
         return _fail(msg)
+    for w in jm.title_id_warnings(job, job_dir):
+        _log(job_dir, f"⚠️ {w}")
     _log(job_dir, "validate ok")
     try:
         rep = jm.ingest_job(job_dir)
@@ -1248,7 +1391,8 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
               encoding="utf-8") as lf:
         lf.write(f"\n===== {jm.now_iso()} cover_watch edit 阶段 =====\n")
         lf.flush()
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, cwd=_REPO)
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, cwd=_REPO,
+                                creationflags=NO_WINDOW)
     _write_lock(job_dir, "edit", pipeline_pid=proc.pid)
     eds.heartbeat(job_dir, pid=proc.pid)
     rc = _wait_edit_with_watchdog(job_dir, proc, name)
@@ -1269,6 +1413,24 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     """export 阶段：reap(崩溃回收) → begin(exporting) → 导出 → verify → record-video
     → succeed(done) → 派生 video.status → derive。导出状态全程读写单一真源
     .export_state.json（lib/export_state.py），video.status 由真源派生。"""
+    # 无字幕策略：导出前硬拦。必须最先执行——先于 dry_run 预览、状态机、子进程，
+    # --phase export 人工放行也绕不过；清单为空才继续。
+    try:
+        jm.require_export_allowed(job_dir)
+    except jm.ExportBlocked as e:
+        prev = _sio.read_raw(job_dir, es.STATE_NAME) or {}
+        repeat = (prev.get("status") == "failed"
+                  and prev.get("failure_class") == "subtitle_missing")
+        if repeat:
+            _log(job_dir, f"export blocked（清单未变）: {e}")
+        else:
+            _log(job_dir, f"export blocked: {e}")
+            print(f"⛔ {e}")
+            print("   请重剪这些集，确认字幕非空后重跑；未修复前不会导出。")
+        if not dry_run:
+            es.fail(job_dir, str(e), retryable=False,
+                    failure_class="subtitle_missing", phase="export")
+        return False
     name = plan["name"]
     draft_name = os.path.basename(plan["draft"].rstrip("\\/"))
     out_mp4 = pc.export_mp4_path(draft_name)
@@ -1309,7 +1471,8 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     try:
         ok = sr._run_export(draft_name,
                             timeout=float(cfg.get("export_stall_timeout", 1800)),
-                            cold_start=bool(cfg.get("cold_start", True)))
+                            cold_start=bool(cfg.get("cold_start", True)),
+                            job_dir=job_dir)
     finally:
         export_lock.release()
     _log(job_dir, f"export {'ok' if ok else '失败'}")
@@ -1335,12 +1498,19 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     if verify and os.path.isfile(verify_script):
         _log(job_dir, "verify start")
         rc = subprocess.call([sys.executable, verify_script, draft_name, out_mp4],
-                             cwd=os.path.dirname(verify_script))
+                             cwd=os.path.dirname(verify_script),
+                             creationflags=NO_WINDOW)
         _log(job_dir, f"verify rc={rc}")
         if rc != 0:
             toast("⚠️ 导出完成但质检未通过", name, icon="warning")
     try:
-        rep = jm.record_video(job_dir)
+        # 本轮导出目标路径是确定的（与 _run_export 同一个 out_mp4），显式传下去：
+        # 不再依赖 stream manifest 自动探测，避免 manifest 缺 paths.export_file 时
+        # 登记失败、video.export_state 留 null、build_plan 判定需要再导一遍。
+        rep = jm.record_video(job_dir,
+                              export_dir=os.path.dirname(out_mp4) or None,
+                              export_file=out_mp4 if os.path.isfile(out_mp4) else None,
+                              draft_name=draft_name)
         _log(job_dir, f"record-video ok export_dir={rep['video']['export_dir']}")
     except Exception as e:
         _log(job_dir, f"record-video 失败: {e}")
@@ -1870,11 +2040,23 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as e:
         print(f"[FAIL] {e}")
         return 1
+    # --phase 是人工放行 paused/强制阶段的入口：先确认在跑的 watcher 不是旧代码，
+    # 否则旧进程会继续按旧逻辑空转、写坏缓存（2026-11-07 事故）。
+    forced_phase = getattr(args, "phase", None)
+    if forced_phase:
+        reason = check_release_safe(forced_phase)
+        if reason:
+            print(f"[FAIL] {reason}")
+            return 1
     jobs, roots = _collect_jobs(args, cfg)
-    if not jobs:
+    if not jobs and (args.once or args.dry_run or not roots):
         print("[FAIL] 没有可监听的任务：给 --job <cover_job>、--root <目录>，"
               "或在 pipeline/presets.json 的 watch 段配置 roots")
         return 1
+    if not jobs:
+        # 根目录存在但暂时没有 cover_job（如全部归档）：常驻空转、每轮重扫，
+        # 等新剧落盘后自动接上；一次性/预览模式仍在上面 fail-fast。
+        print(f"[idle] 本轮扫描无 cover_job（根目录: {', '.join(roots)}），持续监听中")
     settle = args.settle if args.settle is not None else float(cfg.get("settle", 30.0))
     interval = args.interval if args.interval is not None else float(cfg.get("interval", 5.0))
     args._settle = settle
@@ -1887,6 +2069,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     hb = _WatcherHeartbeat()
     hb.start()
     round_no = 0
+    empty_logged = False
     while True:
         round_no += 1
         hb.update(stage="scan", job=None, phase=None, round=round_no)
@@ -1903,6 +2086,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
         if args.interval is None:
             interval = float(cfg.get("interval", interval))
         hold_on = args.hold or bool(cfg.get("hold", False))
+        # 空转态只在新旧切换时打一行，避免每轮 5s 刷屏（日志按 10MB×5 轮转）
+        if not jobs and not empty_logged:
+            print(f"[idle] 第 {round_no} 轮扫描：无 cover_job"
+                  f"（根目录: {', '.join(roots) or '无'}），继续监听")
+            empty_logged = True
+        elif jobs and empty_logged:
+            print(f"[idle] 第 {round_no} 轮扫描：发现待处理剧集，恢复调度")
+            empty_logged = False
         fresh = [j for j in jobs if j.lower() not in known]
         for j in fresh:
             print(f"[new] 自动发现任务: {j}")
