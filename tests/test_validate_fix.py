@@ -39,10 +39,10 @@ def make_fixture(name, *, gate, selected, stage="covers_ready"):
         os.makedirs(os.path.join(jd, d), exist_ok=True)
     with open(os.path.join(jd, "01_input", "synopsis.txt"), "w", encoding="utf-8") as f:
         f.write("测试简介")
+    _texts = {3: "标题三", 5: "标题五", 12: "标题十二"}
     with open(os.path.join(jd, "02_titles", "titles.json"), "w", encoding="utf-8") as f:
-        json.dump({"items": [{"id": "T3", "title": "标题三"},
-                              {"id": "T5", "title": "标题五"},
-                              {"id": "T12", "title": "标题十二"}]},
+        json.dump({"items": [{"id": f"T{i}", "title": _texts.get(i, f"标题{i}")}
+                             for i in range(1, 13)]},
                   f, ensure_ascii=False)
     with open(os.path.join(jd, "03_prompts", "prompts.json"), "w", encoding="utf-8") as f:
         json.dump({"items": [{"slot": 1}, {"slot": 2}, {"slot": 3}, {"slot": "vertical"}]}, f)

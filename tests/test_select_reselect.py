@@ -29,10 +29,15 @@ def new_job(tmp, name):
 
 
 def write_titles(job_dir, items):
+    """写候选：不足 12 条时补到 T1—T12（候选数须为 12 的整数倍）。"""
+    have = {it["id"] for it in items}
+    padded = list(items) + [{"id": f"T{i}", "title": f"标题{i}"}
+                            for i in range(1, 13) if f"T{i}" not in have]
+    padded.sort(key=lambda it: int(it["id"][1:]))
     path = os.path.join(job_dir, "02_titles", "titles.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"titles": items, "summary": {"recommended": []}}, f,
+        json.dump({"titles": padded, "summary": {"recommended": []}}, f,
                   ensure_ascii=False, indent=2)
 
 

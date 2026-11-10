@@ -24,6 +24,16 @@ def new_job(tmp, name):
 
 
 def write_titles(job_dir, items):
+    """补齐到 12 条（校验要求候选数为 12 的整数倍），补位条目无评分、不参与断言。"""
+    items = list(items)
+    used = {str(it.get("id") or it.get("title_id")) for it in items}
+    i = 1
+    while len(items) < 12:
+        tid = f"T{i}"
+        if tid not in used:
+            items.append({"id": tid, "text": f"填充标题{i}"})
+            used.add(tid)
+        i += 1
     path = os.path.join(job_dir, "02_titles", "titles.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -102,6 +112,49 @@ def main():
         check("⑤ score 非法 → title_id 保持 null",
               (job.get("vertical_cover") or {}).get("title_id") is None,
               job.get("vertical_cover"))
+        # ⑥ scores 数组：范围只限 selected 三条；未选中项分数更高也不参与
+        jd = new_job(tmp, "选中范围")
+        write_titles(jd, [
+            {"id": "T1", "text": "甲", "scores": [3, 3, 3, 3, 3, 3, 3], "total": 21},
+            {"id": "T2", "text": "乙", "scores": [4, 4, 4, 4, 4, 4, 4], "total": 28},
+            {"id": "T3", "text": "丙", "scores": [2, 2, 2, 2, 2, 2, 2], "total": 14},
+            {"id": "T4", "text": "丁（未选中）", "scores": [5, 5, 5, 5, 5, 5, 5], "total": 35},
+        ])
+        job = pick(jd, ["T1", "T2", "T3"])
+        check("⑥ scores 别名生效且只在选中三条内取最高 → T2",
+              job["vertical_cover"]["title_id"] == "T2",
+              job["vertical_cover"])
+        check("⑥b 未选中的 T4（35 分）未被绑定",
+              job["vertical_cover"]["title_id"] != "T4",
+              job["vertical_cover"])
+
+        # ⑦ scores 为 dict（繁体键，真实存量形态）：只在选中三条内取最高
+        jd = new_job(tmp, "dict评分")
+        trad = {"第一眼": 3, "與我有關": 3, "信息缺口": 3,
+                "情緒峰值": 3, "具體畫面": 3, "新鮮程度": 3, "內容兌現": 3}
+        write_titles(jd, [
+            {"id": "T1", "text": "甲", "scores": dict(trad)},
+            {"id": "T2", "text": "乙", "scores": dict(trad, **{"內容兌現": 5})},
+            {"id": "T3", "text": "丙", "scores": dict(trad)},
+            {"id": "T4", "text": "丁（未选中）",
+             "scores": {k: 5 for k in trad}},
+        ])
+        job = pick(jd, ["T1", "T2", "T3"])
+        check("⑦ scores dict 可读，仍只在选中三条内取最高 → T2",
+              job["vertical_cover"]["title_id"] == "T2", job["vertical_cover"])
+        check("⑦b 未选中的 T4（dict 满分）未被绑定",
+              job["vertical_cover"]["title_id"] != "T4", job["vertical_cover"])
+
+        # ⑧ scores dict 不合法（键数不对 / 值越界）→ 视为无评分，不绑定
+        jd = new_job(tmp, "dict非法")
+        write_titles(jd, [
+            {"id": "T1", "text": "甲", "scores": {"第一眼": 5, "与我有关": 4}},
+            {"id": "T2", "text": "乙", "scores": {k: v for k, v in trad.items()}},
+            {"id": "T3", "text": "丙", "scores": dict(trad, **{"內容兌現": 99})},
+        ])
+        job = pick(jd, ["T1", "T2", "T3"])
+        check("⑧ 非法 scores dict → title_id 保持 null",
+              (job.get("vertical_cover") or {}).get("title_id") is None, job.get("vertical_cover"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

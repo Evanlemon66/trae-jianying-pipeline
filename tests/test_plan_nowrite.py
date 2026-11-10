@@ -30,8 +30,8 @@ def check(name, cond, extra=""):
 def make_job(tmp):
     jd = jm.create_job(series="plan测试剧", synopsis="简介",
                        out_dir=os.path.join(tmp, "plan测试剧"))["job_dir"]
-    titles = [{"id": f"T{i}", "title": f"标题{i}", "score": {"情绪峰值": 10 - i}}
-              for i in range(1, 4)]
+    titles = [{"id": f"T{i}", "text": f"标题{i}", "score": {"情绪峰值": 10 - i}}
+              for i in range(1, 13)]
     tpath = os.path.join(jd, "02_titles", "titles.json")
     with open(tpath, "w", encoding="utf-8") as f:
         json.dump({"titles": titles, "summary": {"recommended": []}}, f,

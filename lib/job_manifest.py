@@ -316,6 +316,9 @@ def build_job(series: str, *, host: str = "trae") -> dict[str, Any]:
         "workflow": copy.deepcopy(WORKFLOW_DEFAULTS),
         "publish": {"status": "not_ready", "idempotency_key": None,
                     "platforms": [], "receipts": []},
+        # 派生结论：缺字幕集号清单（ASR 三档全失败/最终零字幕时写入，
+        # 重新剪辑且字幕非空后移除），导出前硬拦依据，见 handoff-contract §2。
+        "derived": {"subtitle_missing": []},
         "cleanup": default_cleanup(),
         "history": [],
     }
@@ -365,6 +368,149 @@ def _stage_index(stage: str) -> int:
     return STAGES.index(stage) if stage in STAGES else -1
 
 
+# 每套标题规范的候选数；现行允许 12（旧规范）或 12+12=24（叠加平台新规范）
+TITLES_PER_SET = 12
+# title_id 基本形态：字母前缀 + 序号（T1 / N12 / X3 都合法）；具体有效性靠候选集合引用校验
+_TITLE_ID_RE = re.compile(r"[A-Z]{1,3}\d{1,4}")
+
+
+def _norm_title_id(value: Any) -> str:
+    """title_id 归一（去空白、转大写）；空值返回空串。"""
+    if value is None or value == "":
+        return ""
+    return str(value).strip().upper()
+
+
+def _title_ref_errors(label: str, value: Any, cand_index: dict[str, dict[str, Any]]) -> list[str]:
+    """校验 title_id 引用：有候选表时要求存在；没有候选表时只做基本形态检查。"""
+    tid = _norm_title_id(value)
+    if not tid:
+        return []
+    if cand_index:
+        if tid not in cand_index:
+            return [f"{label} 在候选里不存在: {value}"]
+        return []
+    if not _TITLE_ID_RE.fullmatch(tid):
+        return [f"{label} 非法: {value}"]
+    return []
+
+
+def _cover_file_errors(label: str, value: Any) -> list[str]:
+    """封面路径形态校验：必须是 04_covers/<文件名>（存在性由 cover_file_missing 负责）。"""
+    rel = str(value or "").replace("\\", "/").strip()
+    if not rel:
+        return [f"{label} 缺少 file 字段"]
+    if not rel.startswith("04_covers/"):
+        return [f"{label} 文件应为 04_covers/<文件名>，实际: {rel}"]
+    return []
+
+
+def cover_file_missing(job: dict[str, Any], job_dir: str) -> list[str]:
+    """封面文件存在性检查（仅调度闸门用）：路径已规范但文件不在盘上时给出真实原因。
+
+    不放进 validate_job 通用路径：create_job / update_job 会早于封面生成写 job.json。
+    """
+    errors: list[str] = []
+    entries = [(f"slot {c.get('slot')}", c.get("file")) for c in (job.get("cover_map") or [])]
+    entries.append(("vertical_cover", (job.get("vertical_cover") or {}).get("file")))
+    for label, value in entries:
+        rel = str(value or "").replace("\\", "/").strip()
+        if rel.startswith("04_covers/") and not os.path.isfile(os.path.join(job_dir, rel)):
+            errors.append(f"{label} 文件不存在: {rel}")
+    return errors
+
+
+def _continuity_warnings(ids: list[str]) -> list[str]:
+    """候选编号连续性检查（仅告警）：同一前缀的序号应从 1 连续。"""
+    groups: dict[str, list[int]] = {}
+    for tid in ids:
+        m = re.fullmatch(r"([A-Z]{1,3})(\d{1,4})", _norm_title_id(tid))
+        if m:
+            groups.setdefault(m.group(1), []).append(int(m.group(2)))
+    warnings = []
+    for prefix, nums in sorted(groups.items()):
+        nums = sorted(nums)
+        missing = sorted(set(range(1, nums[-1] + 1)) - set(nums))
+        if missing:
+            warnings.append(f"候选编号不连续: {prefix} 组缺 "
+                            f"{','.join(f'{prefix}{n}' for n in missing)}")
+    return warnings
+
+
+def _entry_id(item: Any) -> str:
+    """候选编号：规范字段 id 优先，title_id 仅旧数据读取兼容。"""
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("id") or item.get("title_id") or "")
+
+
+def _title_entry_errors(items: list[Any]) -> tuple[list[str], list[str]]:
+    """候选条目级校验（record_titles / validate_job / ingest_job 共用）。
+
+    规范字段：`id`（唯一编号）、`text`（唯一正文）；其余字段可选、仅审计。
+    旧数据命名 `title_id` / `title` 只告警不阻断（兼容存量，写入方不得产出）。
+    返回 (errors, warnings)：errors 阻断，warnings 只打印。
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not items:
+        return ["titles.json 应为非空数组（候选在 items/titles 下）"], warnings
+    if len(items) % TITLES_PER_SET != 0:
+        errors.append(f"titles.json 候选数应为 {TITLES_PER_SET} 的整数倍"
+                      f"（如 12 或 24），实际 {len(items)}")
+
+    ids: list[str] = []
+    for idx, item in enumerate(items):
+        label = f"第 {idx + 1} 条候选"
+        if not isinstance(item, dict):
+            errors.append(f"{label}应为对象，实际: {item!r}")
+            continue
+        raw_id = item.get("id")
+        if raw_id in (None, ""):
+            alt = item.get("title_id")
+            if alt in (None, ""):
+                errors.append(f"{label}缺少 id（编号字段）")
+                continue
+            warnings.append(f"{label}使用旧字段名 title_id（规范字段为 id），建议改写")
+            raw_id = alt
+        tid = _norm_title_id(raw_id)
+        if not _TITLE_ID_RE.fullmatch(tid):
+            errors.append(f"{label} id 形态非法: {raw_id!r}（应为字母前缀+序号，如 T1 / N12）")
+            continue
+        ids.append(tid)
+        if _item_title_text(item) is None:
+            errors.append(f"{tid} 缺少正文（规范字段 text）")
+        elif not isinstance(item.get("text"), str) or not item.get("text", "").strip():
+            warnings.append(f"{tid} 使用旧字段名 title（规范字段为 text），建议改写")
+        if isinstance(item.get("scores"), dict):
+            warnings.append(f"{tid} 的 scores 是 dict（旧数据形态，规范为 7 元素数组），"
+                            f"已按读取兼容处理；写入方禁止产出 dict")
+        elif isinstance(item.get("score"), dict):
+            warnings.append(f"{tid} 使用旧别名 score（规范字段为 scores），建议改写")
+
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    if dup:
+        errors.append(f"titles.json 候选编号重复: {','.join(dup)}")
+    warnings.extend(_continuity_warnings(ids))
+    return errors, warnings
+
+
+def title_id_warnings(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str]:
+    """候选告警（不阻断）：编号不连续 + 旧字段名 title_id/title；读不到文件时返回空。"""
+    titles = job.get("titles") or {}
+    if not job_dir or not titles.get("file"):
+        return []
+    rel = str(titles["file"])
+    path = rel if os.path.isabs(rel) else os.path.join(job_dir, rel)
+    if not os.path.isfile(path):
+        return []
+    try:
+        items = _load_titles_items(path)
+    except (OSError, ValueError):
+        return []
+    return _title_entry_errors(items)[1]
+
+
 def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str]:
     errors: list[str] = []
 
@@ -398,6 +544,29 @@ def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str
             if not isinstance(wf.get("intent_revision"), int) or wf.get("intent_revision") < 0:
                 errors.append("workflow.intent_revision 应为非负整数（仅人工递增）")
 
+    derived = job.get("derived")
+    if derived is not None:
+        if not isinstance(derived, dict):
+            errors.append("derived 应为对象")
+        else:
+            missing = derived.get("subtitle_missing")
+            if missing is not None:
+                if not isinstance(missing, list):
+                    errors.append(f"derived.subtitle_missing 应为数组: {missing!r}")
+                else:
+                    bad = [x for x in missing
+                           if isinstance(x, bool) or not isinstance(x, int) or x <= 0]
+                    if bad:
+                        errors.append("derived.subtitle_missing 应为正整数集号: "
+                                      f"{bad!r}")
+                    elif missing != sorted(set(missing)):
+                        errors.append("derived.subtitle_missing 必须升序且去重: "
+                                      f"{missing!r}")
+
+    titles = job.get("titles") or {}
+    # 候选表：有 titles.json 时按「引用是否存在于候选集合」校验，读不到则退化为基本形态检查
+    cand_index = title_candidate_index(job_dir, titles.get("file"))
+
     cover_map = job.get("cover_map") or []
     if len(cover_map) != 3:
         errors.append(f"cover_map 应有 3 项，实际 {len(cover_map)}")
@@ -407,34 +576,60 @@ def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str
             errors.append(f"非法 slot: {slot}")
         if item.get("kind") != "horizontal":
             errors.append(f"slot {slot} 的 kind 应为 horizontal")
-        title_id = item.get("title_id")
-        if title_id is not None and not re.fullmatch(r"T(?:[1-9]|1[0-2])", str(title_id)):
-            errors.append(f"slot {slot} 的 title_id 非法: {title_id}")
-        if not str(item.get("file") or "").startswith("04_covers/"):
-            errors.append(f"slot {slot} 文件应位于 04_covers/")
+        errors.extend(_title_ref_errors(f"slot {slot} 的 title_id",
+                                        item.get("title_id"), cand_index))
+        errors.extend(_cover_file_errors(f"slot {slot}", item.get("file")))
 
     vertical = job.get("vertical_cover") or {}
     if vertical.get("slot") != "vertical":
         errors.append("vertical_cover.slot 应为 vertical")
     if vertical.get("kind") != "vertical" or vertical.get("role") != "video_cover":
         errors.append("vertical_cover 应为 kind=vertical / role=video_cover")
-    if not str(vertical.get("file") or "").startswith("04_covers/"):
-        errors.append("vertical_cover 文件应位于 04_covers/")
+    errors.extend(_title_ref_errors("vertical_cover 的 title_id",
+                                    vertical.get("title_id"), cand_index))
+    errors.extend(_cover_file_errors("vertical_cover", vertical.get("file")))
 
-    titles = job.get("titles") or {}
-    if titles.get("count") != 12:
-        errors.append("titles.count 应为 12")
+    count = titles.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) \
+            or count < TITLES_PER_SET or count % TITLES_PER_SET != 0:
+        errors.append(f"titles.count 应为 {TITLES_PER_SET} 的整数倍（如 12 或 24），"
+                      f"实际: {count!r}")
+    # spec_version 纯元信息：只校验类型/长度，缺失按 legacy 处理（不报错、不回写）
+    spec = titles.get("spec_version")
+    if spec is not None and (not isinstance(spec, str) or not 1 <= len(spec.strip()) <= 64):
+        errors.append(f"titles.spec_version 应为长度 1-64 的字符串，实际: {spec!r}")
+    # 条目级字段：与 record_titles 共用，堵住「绕过 record-titles 直接落盘」的洞
+    if job_dir and titles.get("file"):
+        rel = str(titles["file"])
+        tp = rel if os.path.isabs(rel) else os.path.join(job_dir, rel)
+        if os.path.isfile(tp):
+            try:
+                entry_items = _load_titles_items(tp)
+            except (OSError, ValueError):
+                entry_items = []
+            if entry_items:
+                errors.extend(_title_entry_errors(entry_items)[0])
     if titles.get("gate") not in ("pending", "done"):
         errors.append(f"titles.gate 非法: {titles.get('gate')}")
     selected = titles.get("selected") or []
     if len(selected) not in (0, 3):
         errors.append("titles.selected 应为空或 3 项")
+    seen_ids: dict[str, Any] = {}
     for entry in selected:
         if not isinstance(entry, dict):
             errors.append(f"selected 条目应为对象 {{slot,title_id,title}}，实际: {entry!r}")
             continue
-        if not re.fullmatch(r"T(?:[1-9]|1[0-2])", str(entry.get("title_id"))):
-            errors.append(f"selected 中 title_id 非法: {entry.get('title_id')}")
+        tid = _norm_title_id(entry.get("title_id"))
+        if not tid:
+            errors.append("selected 条目缺少 title_id")
+        else:
+            errors.extend(_title_ref_errors("selected 中 title_id",
+                                            entry.get("title_id"), cand_index))
+            if tid in seen_ids:
+                errors.append(f"selected 中 title_id 重复: {entry.get('title_id')}"
+                              f"（slot {seen_ids[tid]} 与 slot {entry.get('slot')}）")
+            else:
+                seen_ids[tid] = entry.get("slot")
         if entry.get("slot") not in (1, 2, 3):
             errors.append(f"selected 中 slot 非法: {entry.get('slot')}")
     if titles.get("selected_by") not in (None, "user", "auto"):
@@ -555,6 +750,111 @@ def update_job(job_dir: str, patch: dict[str, Any], *,
     return job
 
 
+# ── 缺字幕清单（derived.subtitle_missing）：记录 / 清除 / 导出闸门 ───────────
+
+class ExportBlocked(RuntimeError):
+    """导出前硬拦：存在重新剪辑后仍未产出字幕的集。"""
+
+    def __init__(self, missing):
+        self.missing = sorted({int(x) for x in missing})
+        super().__init__(f"缺字幕未修复：{format_episodes(self.missing)}")
+
+
+def format_episodes(eps) -> str:
+    """[1, 3, 8] -> 第1、3、8集；空 -> （无）。"""
+    nums = sorted({int(x) for x in eps})
+    if not nums:
+        return "（无）"
+    return "第" + "、".join(str(n) for n in nums) + "集"
+
+
+def get_subtitle_missing(job: dict) -> list[int]:
+    """从 job 里取缺字幕集号（只认正整数，升序去重）。"""
+    raw = (job.get("derived") or {}).get("subtitle_missing") or []
+    if not isinstance(raw, list):
+        return []
+    return sorted({x for x in raw
+                   if isinstance(x, int) and not isinstance(x, bool) and x > 0})
+
+
+def subtitle_missing(job_dir: str) -> list[int]:
+    """读 job.json 的缺字幕清单；文件不存在返回 []，解析失败告警后按空处理。"""
+    path = os.path.join(job_dir, "job.json")
+    if not os.path.isfile(path):
+        return []
+    try:
+        return get_subtitle_missing(load_job(path))
+    except (OSError, ValueError) as exc:
+        print(f"[subtitle_missing] 读取 job.json 失败，按空清单处理: {exc}",
+              file=sys.stderr)
+        return []
+
+
+def _positive_eps(values) -> set:
+    return {int(x) for x in values
+            if isinstance(x, int) and not isinstance(x, bool) and x > 0}
+
+
+def sync_subtitle_missing(job_dir: str, *, failed_eps=(), repaired_eps=()) -> list[int]:
+    """按本轮结果合并缺字幕清单：new = (已有 ∪ 本轮失败) − 本轮真正修复。
+
+    repaired_eps 只应由「重新剪辑且本集字幕非空」的调用方传入；仅重跑仍为零字幕时
+    仍算 failed，清单不会被移除。清单变化时经 update_job 落盘（revision/history 一致）。
+    无 job.json 时不创建文件（创建仍只由 create_job 负责），只返回内存结论并告警。
+    """
+    current = subtitle_missing(job_dir)
+    failed = _positive_eps(failed_eps)
+    repaired = _positive_eps(repaired_eps)
+    new = sorted((set(current) | failed) - repaired)
+
+    if not os.path.isfile(os.path.join(job_dir, "job.json")):
+        print(f"[subtitle_missing] job.json 不存在，清单未落盘: {job_dir}",
+              file=sys.stderr)
+        return new
+
+    if new != current:
+        parts = []
+        added = sorted(set(new) - set(current))
+        removed = sorted(set(current) - set(new))
+        if added:
+            parts.append(f"新增缺字幕：{format_episodes(added)}")
+        if removed:
+            parts.append(f"已修复：{format_episodes(removed)}")
+        update_job(job_dir, {"derived": {"subtitle_missing": new}},
+                   event="subtitle_missing", detail="；".join(parts))
+    return new
+
+
+def require_export_allowed(job_dir: Optional[str]) -> list[int]:
+    """导出闸门：清单非空直接 raise ExportBlocked；返回空列表表示可导。"""
+    if not job_dir:
+        return []
+    missing = subtitle_missing(job_dir)
+    if missing:
+        raise ExportBlocked(missing)
+    return []
+
+
+def find_job_dir(start_path: Optional[str], *, max_depth: int = 8) -> Optional[str]:
+    """从视频路径/目录逐级向上找 cover_job/job.json；找不到返回 None。"""
+    if not start_path:
+        return None
+    path = os.path.abspath(start_path)
+    if os.path.isfile(path):
+        path = os.path.dirname(path)
+    for _ in range(max_depth + 1):
+        if os.path.isfile(os.path.join(path, "job.json")):
+            return path
+        cand = os.path.join(path, "cover_job")
+        if os.path.isfile(os.path.join(cand, "job.json")):
+            return cand
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return None
+
+
 # ── 调度意图：dispatch.json → job.json.workflow 归并 ──────────────────────
 
 def read_dispatch(job_dir: str) -> dict[str, Any]:
@@ -673,33 +973,152 @@ def merge_workflow(job_dir: str, *, dry_run: bool = False, notify=None) -> dict[
     return rep
 
 
-def _load_titles_items(titles_path: str) -> list[dict[str, Any]]:
-    with open(titles_path, encoding="utf-8") as f:
+# 唯一候选容器白名单：items（现行）/ titles（旧版）/ 裸数组。
+# 其它顶层数组一律视为「未知兄弟容器」：只在通过保守守卫时并入候选并告警，
+# 用于容忍写入方历史上自造的容器（如 placement），读取侧不再各自解析。
+_TITLE_CONTAINERS = ("items", "titles")
+# 已知非候选的顶层数组（业务数据），永不并入候选
+_TITLE_NON_CANDIDATE_KEYS = frozenset({
+    "selected", "selected_titles", "picks", "scores", "scorecards", "recommended",
+})
+
+
+def _candidate_entries(value: Any) -> Optional[list[dict[str, Any]]]:
+    """顶层数组若整体形似候选条目（全 dict 且 id 形态合法）则返回，否则 None。"""
+    if not isinstance(value, list) or not value:
+        return None
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        tid = _norm_title_id(item.get("id") or item.get("title_id"))
+        if not tid or not _TITLE_ID_RE.fullmatch(tid):
+            return None
+    return value
+
+
+def _merge_sibling_candidates(primary: list[dict[str, Any]],
+                              data: dict[str, Any]) -> list[dict[str, Any]]:
+    """保守合并规范外的顶层候选数组（三守卫：非业务键 / 12 整数倍 / id 合法且不重叠）。
+
+    规范只允许候选放在 items（旧版 titles）/ 裸数组，写入方自造容器（如 placement）
+    属规范外形态：读取侧兜底并入并告警，写入侧仍须按唯一容器落盘。
+    重叠的兄弟数组视为重复副本忽略，避免把顶层 selected 之类并进来撑破 12 倍数。
+    """
+    base_ids = {_norm_title_id(it.get("id") or it.get("title_id"))
+                for it in primary if isinstance(it, dict)}
+    merged = list(primary)
+    for key, value in data.items():
+        if key in _TITLE_CONTAINERS or key in _TITLE_NON_CANDIDATE_KEYS:
+            continue
+        extra = _candidate_entries(value)
+        if extra is None:
+            continue
+        if len(extra) % TITLES_PER_SET != 0:
+            print(f"[warn] titles.json 顶层 {key} 形似候选数组但 {len(extra)} 条"
+                  f"不是 {TITLES_PER_SET} 的整数倍，已跳过（请并入 {_TITLE_CONTAINERS[0]}）")
+            continue
+        extra_ids = {_norm_title_id(it.get("id") or it.get("title_id")) for it in extra}
+        overlap = extra_ids & base_ids
+        if overlap:
+            print(f"[warn] titles.json 顶层 {key} 的编号与候选重复"
+                  f"（{','.join(sorted(overlap))}），按重复副本忽略")
+            continue
+        merged.extend(extra)
+        base_ids |= extra_ids
+        print(f"[warn] titles.json 顶层 {key} 是规范外候选容器，已并入候选（+{len(extra)} 条）；"
+              f"请在写入侧并入 {_TITLE_CONTAINERS[0]} 数组")
+    return merged
+
+
+def _load_titles_payload(titles_path: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """读取 titles.json：返回 (候选列表, 顶层元信息)——全仓唯一解析入口。
+
+    唯一候选容器：{"items":[...]}（现行）、{"titles":[...]}（旧版）、裸数组。
+    规范外的顶层数组（如 placement）见 _merge_sibling_candidates 的保守兜底。
+    """
+    with open(titles_path, encoding="utf-8-sig") as f:
         data = json.load(f)
-    return data.get("titles") if isinstance(data, dict) else data
+    if isinstance(data, list):
+        return data, {}
+    if not isinstance(data, dict):
+        return [], {}
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = data.get("titles")
+    if not isinstance(items, list):
+        items = []
+    return _merge_sibling_candidates(items, data), data
+
+
+def _load_titles_items(titles_path: str) -> list[dict[str, Any]]:
+    return _load_titles_payload(titles_path)[0]
+
+
+def _item_title_text(item: dict[str, Any]) -> Optional[str]:
+    """候选标题文本：规范字段 text 优先，title 仅旧数据读取兼容。"""
+    for key in ("text", "title"):
+        v = item.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
+def title_candidate_index(job_dir: Optional[str],
+                          titles_file: Optional[str]) -> dict[str, dict[str, Any]]:
+    """候选集合：title_id（大写）→ 条目。文件缺失/损坏时返回空表（校验退化为形态检查）。"""
+    if not job_dir:
+        return {}
+    rel = str(titles_file or os.path.join("02_titles", "titles.json"))
+    path = rel if os.path.isabs(rel) else os.path.join(job_dir, rel)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        items = _load_titles_items(path)
+    except (OSError, ValueError):
+        return {}
+    idx: dict[str, dict[str, Any]] = {}
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        tid = _norm_title_id(it.get("id") or it.get("title_id")) or f"T{i + 1}"
+        idx[tid] = it
+    return idx
+
+
+def _meta_spec_version(meta: dict[str, Any]) -> Optional[str]:
+    """titles.json 顶层规范版本：规范名 spec_version；spec 仅旧数据兼容。"""
+    for key in ("spec_version", "spec"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def record_titles(job_dir: str, titles_path: str, prompt_path: Optional[str] = None,
                   prompt_version: Optional[str] = None) -> dict[str, Any]:
-    """Stage 1 落盘：登记 12 条标题与初始提示词，停在门禁前。"""
-    items = _load_titles_items(titles_path)
-    if not isinstance(items, list) or len(items) != 12:
-        raise ValueError(f"titles.json 应有 12 条，实际 {len(items) if isinstance(items, list) else '非数组'}")
-    ids = [str(item.get("id")) for item in items]
-    if ids != [f"T{i}" for i in range(1, 13)]:
-        raise ValueError("titles.json 的 id 必须依次为 T1—T12")
-    for item in items:
-        if not str(item.get("text") or "").strip():
-            raise ValueError(f"{item.get('id')} 缺少 text")
+    """Stage 1 落盘：登记标题候选（12 或其整数倍，旧规范 + 平台规范并存）与初始提示词。"""
+    items, meta = _load_titles_payload(titles_path)
+    entry_errors, entry_warns = _title_entry_errors(items)
+    for w in entry_warns:
+        print(f"[warn] {w}")
+    if entry_errors:
+        raise ValueError("; ".join(entry_errors))
+
+    titles_patch: dict[str, Any] = {
+        "file": rel_path(os.path.abspath(titles_path), job_dir),
+        "count": len(items),
+        "gate": "pending",
+        "selected": [],
+        "selected_at": None,
+    }
+    # spec_version 纯元信息：文件里有才透传，没有就不补（旧数据保持 legacy 语义）
+    spec = _meta_spec_version(meta)
+    if spec:
+        titles_patch["spec_version"] = spec
 
     patch: dict[str, Any] = {
         "stage": "titles_done",
-        "titles": {
-            "file": rel_path(os.path.abspath(titles_path), job_dir),
-            "gate": "pending",
-            "selected": [],
-            "selected_at": None,
-        },
+        "titles": titles_patch,
     }
     if prompt_path:
         prompt_abs = os.path.abspath(prompt_path)
@@ -712,15 +1131,87 @@ def record_titles(job_dir: str, titles_path: str, prompt_path: Optional[str] = N
                       detail=f"写入 {len(items)} 条标题，等待用户门禁")
 
 
+# 七维分项（与 scorecard.md 同序）：规范字段 scores 是 7 元素数组，索引即下表顺序
+SCORE_DIMS = ("第一眼", "与我有关", "信息缺口", "情绪峰值", "具体画面", "新鲜程度", "内容兑现")
+# dict 形态（旧数据）的维度别名：简体/繁体都认；认不出的键只作审计、不参与细分比较
+SCORE_DIM_ALIASES = (
+    ("第一眼",),
+    ("与我有关", "與我有關"),
+    ("信息缺口",),
+    ("情绪峰值", "情緒峰值"),
+    ("具体画面", "具體畫面"),
+    ("新鲜程度", "新鮮程度"),
+    ("内容兑现", "內容兌現"),
+)
+
+
+def _num(value: Any) -> Optional[float]:
+    """数字取值；bool / 非数字返回 None（bool 是 int 子类，必须排除）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _dims_from_score_dict(mapping: dict[str, Any], *, strict: bool) -> Optional[list[float]]:
+    """dict 形态 → 七维分项。
+
+    strict=True（规范外的 scores dict）：只按「7 个 0—5 的数字」判合法，
+    键名仅作审计——不硬匹配中文/繁体键，换一批语言的键也照样读。
+    strict=False（旧别名 score）：沿用历史宽松口径，已知维度名取分、其余按 0。
+    """
+    if strict:
+        if len(mapping) != len(SCORE_DIMS):
+            return None
+        values = [_num(v) for v in mapping.values()]
+        if any(v is None or not 0 <= v <= 5 for v in values):
+            return None
+    by_name = {str(k).replace(" ", ""): _num(v) for k, v in mapping.items()}
+    dims: list[float] = []
+    for aliases in SCORE_DIM_ALIASES:
+        dims.append(next((by_name[a] for a in aliases if by_name.get(a) is not None), 0.0))
+    return dims
+
+
+def _score_view(item: dict[str, Any]) -> Optional[tuple[list[float], float]]:
+    """统一评分视图：(七维分项, 分项合计)。三种形态，同一个 total 口径。
+
+    ① scores 数组（规范，7 元素）② scores dict（旧数据）③ score dict（旧别名）。
+    都不满足返回 None。总分口径：条目 total 有数字就用它，否则一律用分项合计；
+    因此同一条数据在 auto 兜底与竖版绑定两个入口算出的总分必然一致。
+    """
+    raw = item.get("scores")
+    if isinstance(raw, list) and len(raw) == len(SCORE_DIMS):
+        dims = [v if (v := _num(x)) is not None and 0 <= v <= 5 else 0.0 for x in raw]
+        return dims, sum(dims)
+    if isinstance(raw, dict):
+        dims = _dims_from_score_dict(raw, strict=True)
+        if dims is None:
+            return None
+        return dims, sum(v for v in (_num(x) for x in raw.values()) if v is not None)
+    legacy = item.get("score")
+    if isinstance(legacy, dict):
+        dims = _dims_from_score_dict(legacy, strict=False)
+        return dims, sum(v for v in (_num(x) for x in legacy.values()) if v is not None)
+    return None
+
+
+def _score_items(item: dict[str, Any]) -> Optional[list[float]]:
+    view = _score_view(item)
+    return view[0] if view else None
+
+
+def _has_score(item: dict[str, Any]) -> bool:
+    return _score_view(item) is not None
+
+
 def _score_tuple(item: dict[str, Any]) -> tuple:
     """排序键：总分 → 内容兑现 → 信息缺口 → 情绪峰值（与 scorecard 同序）。"""
-    score = item.get("score") or {}
-    total = item.get("total")
-    if not isinstance(total, (int, float)):
-        total = sum(v for v in score.values() if isinstance(v, (int, float)))
-    return (total,
-            score.get("內容兌現", 0), score.get("内容兑现", 0),
-            score.get("信息缺口", 0), score.get("情緒峰值", 0), score.get("情绪峰值", 0))
+    view = _score_view(item)
+    dims, summed = view if view else ([0.0] * len(SCORE_DIMS), 0.0)
+    total = _num(item.get("total"))
+    if total is None:
+        total = summed
+    return (total, dims[6], dims[6], dims[2], dims[3], dims[3])
 
 
 def auto_pick_titles(titles_path: str, top_n: int = 3,
@@ -740,23 +1231,21 @@ def auto_pick_titles(titles_path: str, top_n: int = 3,
     """
     if mode not in ("recommended", "score"):
         raise ValueError(f"未知兜底模式: {mode}")
-    with open(titles_path, encoding="utf-8") as f:
-        data = json.load(f)
-    items = data.get("titles") if isinstance(data, dict) else data
-    if not isinstance(items, list) or not items:
+    items, meta = _load_titles_payload(titles_path)
+    if not items:
         raise ValueError("titles.json 为空或格式非法，无法自动选择")
     for item in items:
-        if not isinstance(item.get("score"), dict):
-            raise ValueError(f"{item.get('id')} 缺少 score，无法自动选择；请先完成人工门禁")
+        if not isinstance(item, dict) or not _has_score(item):
+            raise ValueError(f"{item.get('id') if isinstance(item, dict) else item} 缺少七维评分"
+                             f"（scores 7 元素数组，或旧别名 score），无法自动选择；"
+                             f"请先完成人工门禁")
 
-    rec_pool: list[str] = []
-    if isinstance(data, dict):
-        rec_pool = [str(x) for x in ((data.get("summary") or {}).get("recommended") or [])]
+    rec_pool = [str(x) for x in ((meta.get("summary") or {}).get("recommended") or [])]
     rec_set = set(rec_pool)
 
     def _key(it: dict[str, Any]) -> tuple:
         st = _score_tuple(it)
-        return (st[0], str(it.get("id")) in rec_set, *st[1:])
+        return (st[0], _entry_id(it) in rec_set, *st[1:])
 
     ranked = sorted(items, key=_key, reverse=True)
 
@@ -774,8 +1263,9 @@ def auto_pick_titles(titles_path: str, top_n: int = 3,
         picked = ranked[:top_n]
 
     picks = [
-        {"slot": i + 1, "title_id": str(p["id"]), "title": p["text"],
-         "total": _score_tuple(p)[0], "recommended": str(p["id"]) in rec_set}
+        {"slot": i + 1, "title_id": _entry_id(p),
+         "title": _item_title_text(p) or "",
+         "total": _score_tuple(p)[0], "recommended": _entry_id(p) in rec_set}
         for i, p in enumerate(picked)
     ]
     return {"picks": picks, "mode": mode, "fallback": fallback, "pool": rec_pool}
@@ -785,9 +1275,10 @@ def _best_of_selected(job_dir: str, titles_file: Optional[str],
                       selected: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """从 selected 的 3 条里挑评分最高的一条，用于竖版绑定。
 
+    **范围严格限定在 selected 的三条内**（不是全部候选），未选中项分数再高也不参与。
     默认取总分最高；总分相同则按 selected 中出现的先后取靠前的一条。
     vertical_cover.title_id 已由人工指定时由调用方保留、不覆盖。
-    评分数据缺失（titles.json 不在 / 条目无 score）时返回 None，不绑定。
+    评分数据缺失（titles.json 不在 / 条目无 scores 或 score）时返回 None，不绑定。
     """
     if len(selected) != 3:
         return None
@@ -795,18 +1286,14 @@ def _best_of_selected(job_dir: str, titles_file: Optional[str],
     if not os.path.isfile(path):
         return None
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+        items = _load_titles_items(path)
     except (OSError, ValueError):
         return None
-    items = data.get("titles") if isinstance(data, dict) else data
-    if not isinstance(items, list):
-        return None
-    by_id = {str(it.get("id")): it for it in items if isinstance(it, dict)}
+    by_id = {_entry_id(it): it for it in items if isinstance(it, dict)}
     best_entry, best_total = None, None
     for entry in selected:
         it = by_id.get(str(entry.get("title_id")))
-        if not it or not isinstance(it.get("score"), dict):
+        if not it or not _has_score(it):
             return None
         total = _score_tuple(it)[0]
         if best_total is None or total > best_total:
@@ -1020,13 +1507,66 @@ def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# 串流产物清单目录（pipeline 侧唯一写者仍是 stream_manifest.py；本模块只读 + 回写
+# export_file 这一个字段）。提为模块常量，便于测试整体重定向。
+STREAM_MANIFEST_DIR = os.path.join(_repo_root(), "pipeline", "_stream_manifests")
+
+
+def _manifest_safe_name(draft_name: str) -> str:
+    return draft_name.replace("/", "_").replace("\\", "_").replace(":", "_")
+
+
+def backfill_stream_manifest(draft_name: str, export_file: str) -> list[str]:
+    """把成品路径回写 pipeline/_stream_manifests（字段合并，幂等）。
+
+    只更新**已存在**的清单（按文件名或 draft_name 字段匹配），不新建；
+    只写 paths.export_file，不写 export_dir —— 清理/展示侧都由 export_file 派生目录，
+    多存一个目录键会被 show_all 当成独立产物重复统计。
+    返回被更新的 manifest（相对仓库根）；manifest 缺失或无需改动返回 []。
+    """
+    if not draft_name or not export_file:
+        return []
+    mdir = STREAM_MANIFEST_DIR
+    if not os.path.isdir(mdir):
+        return []
+    target = _manifest_safe_name(draft_name) + ".json"
+    norm_file = str(export_file).replace("\\", "/")
+    updated: list[str] = []
+    for fn in sorted(os.listdir(mdir)):
+        if not fn.endswith(".json"):
+            continue
+        mp = os.path.join(mdir, fn)
+        try:
+            with open(mp, encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if fn != target and data.get("draft_name") != draft_name:
+            continue
+        paths = data.setdefault("paths", {})
+        if paths.get("export_file") == norm_file:
+            continue
+        paths["export_file"] = norm_file
+        data["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(mp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            shown = rel_path(mp, _repo_root())
+        except ValueError:  # 跨盘（测试临时目录在别的盘）时退回绝对路径
+            shown = mp
+        updated.append(shown)
+    return updated
+
+
 def detect_stream_export(series_dir: Optional[str] = None,
                          draft_name: Optional[str] = None) -> Optional[dict[str, Any]]:
     """在 pipeline/_stream_manifests 里按 source_dir 或 draft_name 找导出记录。
 
     返回 {draft_name, manifest, export_file, export_dir, exists}；找不到返回 None。
     """
-    mdir = os.path.join(_repo_root(), "pipeline", "_stream_manifests")
+    mdir = STREAM_MANIFEST_DIR
     if not os.path.isdir(mdir):
         return None
     target_src = os.path.normpath(series_dir) if series_dir else None
@@ -1093,8 +1633,9 @@ def record_video(job_dir: str, *, export_dir: Optional[str] = None,
     if export_file and not export_dir:
         export_dir = os.path.dirname(export_file)
     if not export_dir and not export_file:
-        raise ValueError("未在 pipeline/_stream_manifests 找到该剧导出记录；"
-                         "请提供 --export-dir 或 --draft-name")
+        raise ValueError("未在 pipeline/_stream_manifests 找到该剧导出记录"
+                         "（manifest 可能缺 paths.export_file）；"
+                         "请提供 --export-dir 或 --export-file")
     if not export_file and export_dir and os.path.isdir(export_dir):
         mp4s = [n for n in os.listdir(export_dir) if n.lower().endswith(".mp4")]
         if len(mp4s) == 1:
@@ -1133,6 +1674,14 @@ def record_video(job_dir: str, *, export_dir: Optional[str] = None,
     if dry_run:
         return {"dry_run": True, "patch": patch, "overridden": overridden,
                 "detected": info, "companions": companions}
+
+    # 回写 manifest：本次已经知道成品真实路径，顺手补齐 paths.export_file，
+    # 以后 CLI 只传 --job 也能探测到（旧的缺字段 bug 不再复发）
+    if export_file and draft_name:
+        try:
+            backfill_stream_manifest(draft_name, export_file)
+        except Exception as e:
+            print(f"[warn] 回写 stream manifest 失败（忽略）: {e}")
 
     detail = f"导出目录: {patch['video']['export_dir']}"
     if overridden:
@@ -1457,25 +2006,33 @@ def detect_cover_files(job_dir: str, *, apply: bool = True) -> tuple[dict[Any, s
 
 
 def _title_texts(job_dir: str, titles_file: Optional[str]) -> dict[str, str]:
-    """titles.json 的 id → 标题文本映射（结构容错）。"""
+    """titles.json 的 id → 标题文本映射（统一走 _load_titles_payload）。"""
     rel = titles_file or "02_titles/titles.json"
     path = os.path.join(job_dir, rel)
     if not os.path.isfile(path):
         return {}
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+        items = _load_titles_items(path)
+    except (OSError, ValueError):
         return {}
-    items = data.get("items") or data.get("titles") or (data if isinstance(data, list) else [])
     texts: dict[str, str] = {}
     for idx, it in enumerate(items):
         if not isinstance(it, dict):
             continue
         tid = it.get("id") or it.get("title_id") or f"T{idx + 1}"
-        if it.get("title"):
-            texts[str(tid).upper()] = it["title"]
+        text = _item_title_text(it)
+        if text:
+            texts[str(tid).upper()] = text
     return texts
+
+
+def _resolve_numeric_title_id(num: int, texts: dict[str, str]) -> str:
+    """数字写法：优先 T<num>；候选里没有则找唯一同序号的其他前缀（如 N<num>）。"""
+    direct = f"T{num}"
+    if not texts or direct in texts:
+        return direct
+    hits = sorted(k for k in texts if re.fullmatch(rf"[A-Z]{{1,3}}{num}", k))
+    return hits[0] if len(hits) == 1 else direct
 
 
 def _normalize_selected(job_dir: str, titles_file: Optional[str],
@@ -1496,13 +2053,13 @@ def _normalize_selected(job_dir: str, titles_file: Optional[str],
             title_id = entry.get("title_id")
             title = entry.get("title")
         elif isinstance(entry, int):
-            title_id = f"T{entry}"
+            title_id = _resolve_numeric_title_id(entry, texts)
         elif isinstance(entry, str):
             s = entry.strip()
-            if re.fullmatch(r"T\d{1,2}", s, re.I):
+            if _TITLE_ID_RE.fullmatch(s.upper()):
                 title_id = s.upper()
             elif s.isdigit():
-                title_id = f"T{int(s)}"
+                title_id = _resolve_numeric_title_id(int(s), texts)
             else:
                 title = s
         if isinstance(slot, str):
@@ -1526,6 +2083,70 @@ def _normalize_selected(job_dir: str, titles_file: Optional[str],
         for i, e in enumerate(out, 1):
             e["slot"] = i
     return out, notes
+
+
+def normalize_job_shape(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str]:
+    """validate 前置归一：只做幂等形态修正（纯内存、不写盘），返回归一说明。
+
+    覆盖：stage 别名、封面/竖版裸文件名 → 04_covers/<name>、cleanup.status pending→blocked、
+    titles.selected 表示法归一、titles.count / spec_version 与 titles.json 对齐。
+    不做业务判断（不判门禁、不绑竖版标题、不改标题内容或选中项）；与 ingest_job 的归一一致。
+    """
+    notes: list[str] = []
+
+    raw_stage = job.get("stage")
+    stage = canon_stage(raw_stage)
+    if stage != raw_stage:
+        job["stage"] = stage
+        notes.append(f"stage {raw_stage}→{stage}")
+
+    def _fix_cover(entry: Any, label: str) -> None:
+        if not isinstance(entry, dict):
+            return
+        for key in ("file", "image"):
+            raw = entry.get(key)
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            fixed = raw.strip().replace("\\", "/")
+            if fixed.startswith("./"):
+                fixed = fixed[2:]
+            if "/" not in fixed:
+                fixed = f"04_covers/{fixed}"
+            if fixed != raw:
+                entry[key] = fixed
+                notes.append(f"{label}.{key} → {fixed}")
+
+    for cm in job.get("cover_map") or []:
+        _fix_cover(cm, f"cover_map[{cm.get('slot')}]")
+    _fix_cover(job.get("vertical_cover"), "vertical_cover")
+
+    # cleanup.status 归一：契约只允许 blocked/eligible/done/skipped
+    cleanup = job.get("cleanup")
+    if isinstance(cleanup, dict) and cleanup.get("status") == "pending":
+        cleanup["status"] = "blocked"
+        notes.append("cleanup.status pending→blocked")
+
+    titles = job.get("titles")
+    if isinstance(titles, dict):
+        cand_index = title_candidate_index(job_dir, titles.get("file"))
+        if cand_index and titles.get("count") != len(cand_index):
+            notes.append(f"titles.count {titles.get('count')}→{len(cand_index)}")
+            titles["count"] = len(cand_index)
+        if job_dir and titles.get("file"):
+            try:
+                _items, meta = _load_titles_payload(os.path.join(job_dir, titles["file"]))
+            except (OSError, ValueError):
+                meta = {}
+            spec = _meta_spec_version(meta)
+            if spec and titles.get("spec_version") != spec:
+                titles["spec_version"] = spec
+                notes.append(f"spec_version 透传自 titles.json: {spec}")
+        if titles.get("selected"):
+            norm, sel_notes = _normalize_selected(job_dir or "", titles.get("file"),
+                                                  list(titles["selected"]))
+            titles["selected"] = norm
+            notes.extend(sel_notes)
+    return notes
 
 
 def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
@@ -1553,6 +2174,34 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
                               "renamed": []}
     if report_stage_alias:
         report["normalized"].append(report_stage_alias)
+
+    # ── 候选总数与规范版本：以 titles.json 为准（只读同步，不补写旧数据缺失字段）
+    cand_index = title_candidate_index(job_dir, titles.get("file"))
+    if cand_index and titles.get("count") != len(cand_index):
+        report["normalized"].append(f"titles.count {titles.get('count')}→{len(cand_index)}")
+        titles["count"] = len(cand_index)
+    if titles.get("file"):
+        try:
+            _items, meta = _load_titles_payload(os.path.join(job_dir, titles["file"]))
+        except (OSError, ValueError):
+            meta = {}
+        spec = _meta_spec_version(meta)
+        if spec and titles.get("spec_version") != spec:
+            titles["spec_version"] = spec
+            report["normalized"].append(f"spec_version 透传自 titles.json: {spec}")
+
+    # 条目级字段：与 record_titles 共用（旧字段名只告警；格式/缺字段阻断）
+    if titles.get("file"):
+        try:
+            entry_items = _load_titles_items(os.path.join(job_dir, titles["file"]))
+        except (OSError, ValueError):
+            entry_items = []
+        if entry_items:
+            entry_errors, entry_warns = _title_entry_errors(entry_items)
+            for w in entry_warns:
+                print(f"[warn] {w}")
+            if entry_errors:
+                raise ValueError("; ".join(entry_errors))
 
     # ── 标题门禁：优先读 selection.json（agent 只需交编号清单，不写 job.json）
     sel_file = os.path.join(job_dir, "02_titles", "selection.json")
@@ -2026,6 +2675,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if errors:
             print("[FAIL] " + "；".join(errors))
             return 1
+        for w in title_id_warnings(job, job_dir):
+            print(f"[warn] {w}")
         print("[OK] job.json 通过校验")
         return 0
 
@@ -2049,14 +2700,16 @@ def _main(argv: Optional[list[str]] = None) -> int:
         titles_file = os.path.join(
             job_dir, (load_job(os.path.join(job_dir, "job.json"))
                       .get("titles") or {}).get("file") or "02_titles/titles.json")
-        items = {str(t.get("id")): t for t in _load_titles_items(titles_file)}
+        items = {_norm_title_id(t.get("id") or t.get("title_id")): t
+                 for t in _load_titles_items(titles_file) if isinstance(t, dict)}
         picks = []
         for slot, tid in enumerate(ids, start=1):
-            if tid not in items:
+            key = _norm_title_id(tid)
+            if key not in items:
                 print(f"[FAIL] 编号不存在: {tid}")
                 return 1
-            picks.append({"slot": slot, "title_id": tid,
-                          "title": items[tid]["text"]})
+            picks.append({"slot": slot, "title_id": key,
+                          "title": _item_title_text(items[key]) or ""})
         job = select_titles(job_dir, picks, by="user")
         print(f"[OK] revision={job['revision']} stage={job['stage']} gate=done "
               f"selected={','.join(ids)}")

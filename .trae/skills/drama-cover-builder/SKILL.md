@@ -95,9 +95,11 @@ python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.c
    - `job.json` **全文**（字段一个不能少；无执行环境下 `reference_sha256` / `prompt_sha256` / `image_sha256` 等 hash 字段写 `null`，回到 Trae 时用 `validate` 补算）；
    - `01_input/synopsis.txt` 全文（即简介原文）。
 
-**Stage 1（12 条标题 + 门禁）**
+**Stage 1（12 或 24 条标题 + 门禁）**
 
-3. 用户回复“已建目录”后，读 `references/title-spec.md` 生成 12 条，把 `02_titles/prompt.txt`、`titles.json`、`titles.md` 三个文件**全文**输出给用户保存。**不需要输出 job.json**——`stage=titles_done` 由 Trae 侧 `record-titles` 登记。
+3. 用户回复“已建目录”后，读 `references/title-spec.md` 生成 12 条；用户要求叠加平台新规范时按 `references/platform-rules.md` 再加 12 条（编号 `N1—N12`），共 24 条并存。把 `02_titles/prompt.txt`、`titles.json`、`titles.md` 三个文件**全文**输出给用户保存。**不需要输出 job.json**——`stage=titles_done` 由 Trae 侧 `record-titles` 登记。
+   硬约束（候选容器唯一）：`titles.json` 的候选只能放进**同一个数组**——`{"items":[...]}`（现行）或 `{"titles":[...]}`（旧版）/裸数组。24 条时前 12 条 `{"id":"T1","text":"…"}` … `T12`、紧跟 12 条 `{"id":"N1","text":"…"}` … `N12`，**全部在 `items` 这一个数组里**；顶层只保留 `spec_version` 等元信息，**禁止另起第二个候选数组**（如 `placement`、`extra_titles`）各装 12 条——契约不承认，Trae 侧只会告警后按兼容兜底处理。
+   条目字段硬约束：`id`（编号）与 `text`（标题全文）是必填的**规范字段名**；`title_id` / `title` 仅是旧数据兼容名，禁止新写。其余字段（`chars`/`plan`/`version`/`hook`/`face_slap`/`source`/`scores`/`total`/`rec`/`std`/`slot`）可选、仅审计。**完整字段表以 `references/handoff-contract.md` §4「候选条目字段表」为准**；上面的人读表格（编号/方案×版本/标题全文/字数…）只是展示形式，不要据此改 JSON 键名。
 4. 停在门禁：用户回复 3 个编号后，只输出 `02_titles/selection.json`（`{"picks":["T9","T10","T7"],"selected_by":"user"}`）让用户保存。**不再手写 job.json**——`titles.selected`、`cover_map` 回填、`stage=titles_selected` 全部由 Trae 侧 `ingest`/`select` 生成。竖版标题默认取 `selected` 三条中**总分最高**的一条，同分取 `selected` 中靠前的一条；若 `vertical_cover.title_id` 已被人工显式写入则优先保留。硬约束：`titles.gate` 只允许 `pending` / `done` 两值，`titles.selected` 必须是 3 个对象 `{slot,title_id,title}`——禁止自造枚举（如 `gate="selected"`）或字符串数组；已有违规形态由 Trae 侧 `validate --fix` 修复。
 
 **Stage 2（即梦出图）**
@@ -143,7 +145,7 @@ Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用�
 
 1. **素材边界**：简介没写的事件一律不存在；只允许在 spec §2.1 的五个白名单维度上放大。
 2. **形式契约**：每条 60—80 字（版3 反问允许 55—70），全繁体、第三人称、无主角本名。
-3. **产出结构**：固定 3 方案 × 4 版本 = 12 条（版1/2/3 叙事版 + 版4 机制版），一条不多一条不少。
+3. **产出结构**：旧规范固定 3 方案 × 4 版本 = 12 条（版1/2/3 叙事版 + 版4 机制版），一条不多一条不少；叠加平台新规范时另出 12 条（`N1—N12`），两套并存合计 24 条。
 
 生成流程按 spec §8 执行：素材圈定 → 白名单对照 → 12 格矩阵生成 → §6 质检 → 差异化检查 → 评分（`scorecard.md`）→ 交付门禁。
 
@@ -151,12 +153,12 @@ Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用�
 
 ### 5.1 交付格式（固定）
 
-12 条**平铺编号**（T1—T12），每条必须包含：
+12 或 24 条**平铺编号**（旧规范 `T1—T12`；叠加平台规范时 `N1—N12` 紧接其后，编号不限前缀、同批唯一即可），每条必须包含：
 
 | 编号 | 方案×版本 | 标题全文 | 字数 | 钩子手法 / 机制族 | 打脸式 | 简介出处 | 七维总分 | 推荐 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
-- 12 条必须完整可复制，不得只给摘要、骨架或占位；
+- 每套 12 条必须完整可复制，不得只给摘要、骨架或占位；
 - 版4 的「钩子手法」列写机制族（M1—M8）；
 - 「简介出处」写清该条最亮素材来自简介哪一句；
 - 「推荐」按 `scorecard.md` §3 标注，只推荐不排序、不删条；
@@ -168,7 +170,7 @@ Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用�
 
 ### 5.3 用户门禁（强制）
 
-12 条交付后**停下**，按 T 编号让用户依次为三个封面位各选 1 条：
+标题交付后**停下**，按编号（`T*` / `N*` 均可）让用户依次为三个封面位各选 1 条：
 
 1. 封面1（爆点构图）→ 用户回复一个编号
 2. 封面2（冷暖对比构图）→ 用户回复一个编号
@@ -176,7 +178,7 @@ Stage 1 开始前，先从简介中抽出要素，**以卡片形式呈现给用�
 
 - 每次只选一条，可以分三轮，也可以一次给出三个编号；
 - **不按版本锁定**：任意编号可选入任意封面位，构图由封面位决定；版4 被选中时沿用该封面位构图；
-- 12 条超过选择题上限，因此**不用 AskUserQuestion**，改为编号点选；
+- 候选条数超过选择题上限，因此**不用 AskUserQuestion**，改为编号点选；
 - 用户点满 3 个编号前不得进入 Stage 2；Agent 不代选、不预设默认项；
 - 用户也可绕过 12 条自带标题，此时先确认「该标题对应哪版构图」再合成。
 
@@ -250,7 +252,7 @@ Stage 2 出图前执行三步扫描：字面（A 层）→ 语义（承诺/迷�
 
 | 命令 | 作用 |
 | --- | --- |
-| `record-titles` | 登记 Stage 1 的 12 条标题与提示词快照 |
+| `record-titles` | 登记 Stage 1 的标题候选（12 或其整数倍，如 24）与提示词快照 |
 | `select` | 人工门禁：写 `titles.selected` 并回填 `cover_map` |
 | `resolve` | Stage 2 取上下文：标题+参考图+提示词，门禁未过自动选分（`--dry-run`/`--no-auto`） |
 | `record-video` | 登记 pipeline 导出目录（自动探测 stream manifest，只记录不复制 mp4；手工指定优先；挂 `cleanup.external`） |

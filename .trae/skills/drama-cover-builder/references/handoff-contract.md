@@ -14,7 +14,7 @@ D:\短剧\<剧名>\
 └── cover_job\                          # 唯一写入区
     ├── job.json
     ├── dispatch.json                   # 可选：豆包侧调度意图声明（mode/cut_s/derive/priority），ingest 归并进 job.json.workflow，见 §7
-    ├── export_config.json              # 可选（旧版兼容）：导出偏好（cut_s / derive），见 §7
+    ├── export_config.json              # 可选（旧版兼容）：导出/剪辑偏好（cut_s / derive / start_ep），见 §7
     ├── .export_state.json              # 运行态：导出状态机单一真源（真实导出开始时 cover_watch 自动写，无需手工建），见 §7.1
     ├── .export_retry.json              # 运行态（旧版，仅迁移来源）：首次读真源时迁入 .export_state.json 并备份 .bak
     ├── .edit_state.json                # 运行态：剪辑阶段失败退避/暂停状态机（首次 edit 闸门判定时自动写），见 §7.3
@@ -69,12 +69,13 @@ D:\短剧\<剧名>\
 | `input.reference_sha256` | string \| null | 防替换校验 |
 | `sizes` | object | `horizontal` / `vertical` 精确像素 |
 | `titles.file` | string | `02_titles/titles.json` |
-| `titles.count` | number | 固定 12 |
+| `titles.count` | number | 12 或其整数倍：`12`（旧规范一套）/ `24`（旧规范 12 + 平台新规范 12）；其它数量非法 |
+| `titles.spec_version` | string \| null | 元信息：本批候选按哪套规范生成（如 `title-spec-v4.2`），供以后统计；**不参与校验**，缺失按 `legacy` 理解，不迁移、不回写 |
 | `titles.gate` | string | 枚举只有 `pending` / `done` 两值；禁止自造（如 `selected`），违规用 `validate --fix` 修复 |
 | `titles.prompt_file` | string \| null | `02_titles/prompt.txt`，实际发出的提示词 |
 | `titles.prompt_sha256` | string \| null | 提示词快照校验 |
 | `titles.prompt_version` | string | 默认 `title-spec-v4.1` |
-| `titles.selected` | array | 门禁后三条：`{slot, title_id, title}` 对象数组；禁止字符串/数字数组，违规用 `validate --fix` 修复 |
+| `titles.selected` | array | 门禁后三条：`{slot, title_id, title}` 对象数组；禁止字符串/数字数组，违规用 `validate --fix` 修复。三条 `title_id` 必须各自存在于 `titles.json` 候选集合（`T1–T12` / `N1–N12` 等，不限定前缀）且互不重复 |
 | `titles.selected_at` | string \| null | 门禁时间 |
 | `titles.selected_by` | string \| null | `user`（人工门禁）/ `auto`（兜底自动选分，见 §5） |
 | `titles.auto_mode` | string \| null | 兜底模式：`recommended`（推荐池优先，默认）/ `score`（全量评分）；仅 `selected_by=auto` 时有值，人工选置 null |
@@ -103,6 +104,7 @@ D:\短剧\<剧名>\
 | `workflow.intent_revision` | number | **仅人工 +1**，程序只读不写；变大即视为人工最终意图 |
 | `workflow.intent_source` | string | `default` / `dispatch` / `manual` |
 | `workflow.merged_at` | string \| null | 最近一次归并时间 |
+| `derived.subtitle_missing` | array | 缺字幕集号清单：升序去重的正整数，缺省 `[]`。仅当该集三档 ASR 全失败、或裁剪后最终字幕条数为 0 时写入；该集**重新剪辑且字幕非空**后才移除（只重跑不消除）。非空时所有导出入口硬拦，见 §7.5 |
 | `publish.status` | string | `not_ready` / `ready` / `uploading` / `published` / `failed` |
 | `publish.platforms` | array | 每平台 `{name,status,video_id,url,cover_file,attempts,error,uploaded_at}` |
 | `publish.idempotency_key` | string \| null | 防重复上传 |
@@ -174,7 +176,7 @@ D:\短剧\<剧名>\
 | stage | 含义 | 谁写入 |
 | --- | --- | --- |
 | `prepared` | 目录与输入就绪 | `create_job`（历史事件仍记 `prepare`） |
-| `titles_done` | 12 条标题与初始提示词已落盘 | Stage 1 |
+| `titles_done` | 12（或 12 的整数倍，如 24）条标题与初始提示词已落盘 | Stage 1 |
 | `titles_selected` | 用户点满 3 个编号，`gate=done` | 门禁 |
 | `prompts_ready` | 4 条出图提示词已写入 | Stage 1.5 |
 | `covers_ready` | 4 张图齐且过四项质检 | Stage 2 |
@@ -202,6 +204,29 @@ D:\短剧\<剧名>\
 - 三条横版必须与标题一一对应；竖版标 `role=video_cover`。
 - 竖版绑定：门禁（`select`）或收口（`ingest`）时，默认绑定 `selected` 三条中**总分最高**的一条；**总分相同则按 `selected` 中出现的先后取靠前的一条**；无评分数据则保持 `title_id=null`。人工已显式指定 `vertical_cover.title_id`（经 `update` 写入或手改 job.json）时一律保留，不被默认绑定覆盖。
 - 门禁后 `selected` 冻结；改选必须显式操作，`revision` 递增，Stage 2 发现 revision 不一致要把旧图标 `stale`。
+- 候选集合：`titles.json` 可只放旧规范 12 条（`T1–T12`），也可叠加平台新规范 12 条（`N1–N12`）共 24 条；`id` 不限前缀，只要求同一批内唯一。校验只看「引用是否存在 + 三条是否互不重复」，不再按 `T1–T12` 白名单卡；编号不连续只告警（写一行日志），不阻断。
+- **候选条目字段表（硬约束）**：每条候选是一个对象，只有 `id`、`text` 必填，其余字段可选、仅审计、不参与校验。
+
+| 字段 | 类型 | 必填 | 语义 | 说明 |
+| --- | --- | --- | --- | --- |
+| `id` | string | **是** | 唯一编号 | 形态 `字母前缀+序号`（如 `T1` / `N12`），大写、同批唯一、不限前缀。**唯一规范编号字段**；`title_id` 仅旧数据读取兼容，写入方禁止产出 |
+| `text` | string | **是** | 标题全文 | **唯一规范正文字段**；`title` 仅旧数据读取兼容，写入方禁止产出；两字段并存时以 `text` 为准 |
+| `chars` | number | 否 | 字数（版1/2 60—80，版3 55—70） | 仅审计，不校验 |
+| `plan` | string \| number | 否 | 方案号（1/2/3） | 仅审计 |
+| `version` | string \| number | 否 | 版本号（1—4，4=机制版） | 仅审计 |
+| `hook` | string | 否 | 钩子手法 / 机制族（M1—M8） | 仅审计 |
+| `face_slap` | string | 否 | 打脸式 | 仅审计 |
+| `source` | string | 否 | 简介出处原句（或摘要） | 仅审计 |
+| `scores` | array[7] | 是（24 条全给） | 七维分项，每项 0—5，顺序同 `scorecard.md`（第一眼/与我有关/信息缺口/情绪峰值/具体画面/新鲜程度/内容兑现） | **规范形态只有 7 元素数组**；12 条与 N1—N12 共 24 条必须逐条给出，缺一条按缺评分处理。`scores` 为 dict、或旧别名 `score`（dict）都只是旧数据读取兼容，写入方禁止产出 |
+| `total` | number | 否 | 七维总分（缺省按 `scores` 求和） | 仅审计 / 排序 |
+| `rec` | boolean | 否 | 是否推荐（人工标注） | 仅审计；推荐池以顶层 `summary.recommended` 为准 |
+| `std` | string | 否 | 平台规范标识（N 组条目常用） | 仅审计 |
+| `slot` | number | 否 | 门禁槽位 | **工具写入字段**：`select` / `ingest` 会在 `titles.json` 原位重写（先清空再按选中项回填）；写入方不必产出，也不可依赖它做业务判断 |
+
+- **评分用途（竖版自动绑定）**：`scores` 是竖版封面自动选标题的打分依据——从 `titles.selected` 的**三条**里取总分最高的一条绑定 `vertical_cover.title_id`，同分取 `selected` 中靠前的一条。**比较范围严格限定在这三条选中项内，绝不遍历全部 12/24 条候选**（未选中项分数再高也不参与）；`vertical_cover.title_id` 已人工指定时保留原值。`auto` 兜底选分与竖版绑定使用同一套总分口径（条目 `total` 优先，缺省按分项合计），保证同一数据在两处算出的分数一致。
+- **顶层元信息**：`series`、`spec_version`（规范名；`spec` 仅旧数据兼容）、`generated_at`、`gate`、`summary{count_t, count_n, recommended}`、`selected_at`、`selected_by`。其中 `summary.recommended` 是编号字符串数组，仅作 `auto` 兜底推荐池；`summary.count_t` / `summary.count_n` 仅审计。
+- **候选容器唯一（硬约束）**：候选只允许放在三处之一——`{"items":[...]}`（现行）、`{"titles":[...]}`（旧版）、裸数组；同文件同时存在时以 `items` 为准、`titles` 次之。**禁止新增任何其它顶层候选容器**：需要 24 条就把 24 条放进**同一个数组**，不允许另起 `placement`、`extra_titles` 之类第二个数组各装 12 条（`placement` 属规范外写法，历史上由写入方自造，契约不承认）。
+- 读取侧兼容（`job_manifest._load_titles_payload`，全仓唯一解析入口）：对规范外顶层数组只做保守兜底——数组内每条都是 `{id: <合法编号>}`、长度为 12 的整数倍、且编号不与主集合重叠时才并入候选并打印 `[warn]`；长度不合规跳过并告警，与主集合重叠按重复副本忽略并告警。兜底只为消化存量数据，**写入侧不得再产出规范外容器**。
 - 文件名容错：`04_covers/` 内可用任意文件名（`cover_01_hit` / `封面图1` / `T2 封面` / `竖版` …），`ingest` 按「竖版宽高比/名称提示优先，横版按文件名编号 1/2/3，否则自然顺序」识别并**改名到契约名**，改名记录写入 `history` 与 `report.renamed`。
 
 ## 5. 跨阶段兜底链
@@ -352,7 +377,11 @@ python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存
 #   job.json 永远优先，dispatch 只补缺失不覆盖（冲突记 watcher.log + 桌面通知）
 #   人工改意图 = 直接编辑 job.json.workflow 并把 workflow.intent_revision +1（程序永不写该字段）
 
-# 旧版兼容：<cover_job>/export_config.json（{"cut_s": 7200, "derive": [...] }）仍被导出阶段读取，
+# 旧版兼容：<cover_job>/export_config.json（{"cut_s": 7200, "derive": [...], "start_ep": 1 }）仍被读取：
+#   cut_s / derive 由导出阶段消费；start_ep 由 watcher 剪辑阶段消费（整数，缺省 1）。
+#   start_ep > 1 时 watcher 拼编辑命令追加 --only <start_ep>..（从该集起重剪到最后一集）；
+#   缺省 / <=1 / 非整数 → 一律按 1（记一行日志，不中断），行为与旧版一致。
+#   注意：从中间集起跑会让串流草稿名变成「<剧名>_第NN-MM集串流」，不再是「第01-MM集」。
 # 但新任务一律用 dispatch.json；cut 解析优先级 workflow.cut_s > video.cut_s（set-cut 写的旧字段）
 
 # 任意阶段更新
@@ -466,6 +495,21 @@ edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读�
 - **回迁**：目录移回 roots 后不会自动恢复调度，仍需人工把 `job.json.stage` 改回 `video_ready`（或其他待办阶段）。
 - **`publish.status` 现状**：只有手工 `python lib/job_manifest.py publish-record ...` 会写 `published`；自动发布链**没有写入路径（暂未实现）**。因此不要依据 `publish.status` 判断「已发布」，归档准入实际以 `video.export_state=="cleaned"` 为准，或显式 `--force`。
 
+### 7.5 缺字幕导出硬拦（`derived.subtitle_missing`）
+
+- **记录**：pipeline 逐集统计，ASR 三档全失败、或裁剪后最终字幕条数为 0 → 记集号；整轮结束经 `job_manifest.sync_subtitle_missing` → `update_job(event="subtitle_missing")` 一次落盘（升序去重、`revision+1`、`history` 追加）。不中断整轮，后续集继续跑。
+- **清除**：只有该集重新剪辑并且**本集最终字幕条数 > 0** 才从清单移除；仅重跑仍为空时继续保留。清单清空后由 `cover_watch.note_edit_result(ok=True)` 调 `export_state.clear_block`，把 `failed` 复位为 `pending`。
+- **硬拦（所有导出入口）**：`job_manifest.require_export_allowed(job_dir)` 非空即抛 `ExportBlocked`，入口共五处：
+  1. `pipeline.run_pipeline` 的 `do_export` 分支（含本轮内存失败集兜底，job.json 缺失也能拦）；
+  2. `lib/cover_watch.py::run_export`（watcher 导出主链，先于状态机与子进程）；
+  3. `pipeline/batch_runner.py --auto-export`；
+  4. `pipeline/series_runner.py::_run_export`（多剧编排）；
+  5. `.trae/skills/jianying-editor/examples/robust_auto_export.py` 直调（打印集号后 `sys.exit(2)`）。
+  `--phase export` 人工放行**也不能绕过**该闸门。
+- **失败态**：watcher 导出入口被拦时写 `.export_state.json`：`status=failed`、`failure_class="subtitle_missing"`、`phase="export"`、`retryable=False`（不计数、不退避），等人工修复；重复检查只追加一行日志，不重复打全量集号。
+- **收尾通知**：整轮结束若清单非空，`lib/subtitle_guard.py::notify(job_dir)` 只弹**一条**「⚠️ 缺字幕需人工处理」，正文列全部集号；进程内按 `job_dir` 去重，绝不按集逐条弹。
+- **校验**：`validate_job` 要求该字段为非 bool 正整数数组且严格升序去重；违规形态由 `update_job` 拒绝落盘。
+
 ## 8. 各阶段产物与意义
 
 | 阶段 | 写入 | 产物 | 意义 |
@@ -475,5 +519,5 @@ edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读�
 | 门禁 | 只写 `job.json` + 标注 `titles.json` | `titles.selected`、`selected_by`、`cover_map` 回填；`titles.json` 选中条加 `selected/slot`、顶层记 `gate/selected_at/selected_by` | 最终选定结果只此两处（job.json 为事实源，titles.json 原位标注不复制文本） |
 | Stage 1.5 | `03_prompts/` | `prompts.json` / `prompts.md` | 4 条出图提示词，豆包/火山/Trae 三渠道共用 |
 | Stage 2 | `04_covers/` | 3 横版 + 1 竖版 + `derived/` | 平台用图；derived 放 YouTube 16:9 等派生尺寸 |
-| pipeline | 只写 `job.json` | `video.export_dir/export_file/draft_name/companions/export_state` | 只记录导出位置（允许绝对路径），不复制 mp4；`05_video/` 留作需要副本时的可选目录。`record_video` 置 `export_state=exported`；`stream_manifest.py clean` 真正删除成品后置 `cleaned`（history 记 `export_cleaned`） |
+| pipeline | 只写 `job.json` | `video.export_dir/export_file/draft_name/companions/export_state`；`derived.subtitle_missing` | 只记录导出位置（允许绝对路径），不复制 mp4；`05_video/` 留作需要副本时的可选目录。`record_video` 置 `export_state=exported`；`stream_manifest.py clean` 真正删除成品后置 `cleaned`（history 记 `export_cleaned`）。pipeline 每集统计漏字幕，整轮结束经 `update_job(event="subtitle_missing")` 一次落盘；该清单非空时不导出 |
 | Stage 3 | `06_publish/` | `<platform>.json` + `receipts/` | 每平台状态与回执，驱动 `cleanup` 判定；`receipts/` 由 `create_job` 预建占位，内容（回执）只在 Stage 3 首次写入时落盘，缺失不阻断前序阶段 |
