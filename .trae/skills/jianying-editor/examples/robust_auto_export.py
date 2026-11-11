@@ -738,6 +738,10 @@ class Exporter:
         except Exception as e:
             dprint(f"路径抓取失败 (尝试保底): {e}")
 
+        # 3.5 磁盘预检（真实盘）：剪映写到它自己记住的导出目录，不是 output_path 所在盘
+        if real_export_file:
+            _check_disk_space(real_export_file, expected_duration)
+
         # 4. 设置分辨率 (参考源代码逻辑)
         if resolution:
             try:
@@ -1000,6 +1004,13 @@ class Exporter:
 
 # 移植自老脚本 auto_exporter.py（2026-10-25）——第 3 项后仅作分类器不可用时的兜底
 _UI_RETRY_KEYWORDS = ("剪映窗口未找到", "导出按钮", "编辑窗口", "草稿", "未找到", "卡死", "超时")
+
+
+def _is_uia_com_error(e: BaseException) -> bool:
+    """UIA 句柄失效判定：剪映在打开大草稿/切换页面时会重建 UIA 树，
+    缓存的 Element 再调 GetFirstChildElement 等接口抛 _ctypes.COMError
+    （str 里没有类型名，关键字匹配抓不到，必须按类型判）。"""
+    return type(e).__name__ == "COMError"
 _EST_BYTES_PER_SEC = 1.05 * 1024 * 1024  # 1080P 导出码率经验估值（字节/秒）
 
 
@@ -1134,12 +1145,16 @@ def _sibling_bundle_dirs(output_dir, safe_name):
     return dirs
 
 
-def _temp_export_dirs(output_dir):
+def _temp_export_dirs(output_dir, *extra_roots):
     """剪映导出临时目录：导出中的字节先落在 .__jianying_export_temp_folder__ 里，
-    导出结束才落到最终路径。返回输出目录及其父目录下存在的临时目录。"""
+    导出结束才落到最终路径。返回输出目录、其父目录以及 extra_roots 下存在的临时目录。"""
     out = os.path.abspath(output_dir)
+    bases = [out, os.path.dirname(out)]
+    for r in extra_roots:
+        if r:
+            bases.append(os.path.dirname(os.path.abspath(r)))
     dirs = []
-    for base in (out, os.path.dirname(out)):
+    for base in bases:
         if not base:
             continue
         p = os.path.join(base, ".__jianying_export_temp_folder__")
@@ -1149,15 +1164,29 @@ def _temp_export_dirs(output_dir):
 
 
 def _watchdog_size(real_export_file, output_dir, safe_name):
-    """看门狗读取的总体积：UI 路径 + 输出目录（递归，含目录内临时目录）
-    + 剪映去重兄弟目录 + 导出根目录下的临时目录。任一处在长即视为有进度。"""
+    """看门狗读取的总体积：只统计剪映真正在写盘的地方——
+    UI 路径文件 + 同目录下同名/去重 mp4 + 该目录与其父目录下的临时分片目录。
+    ⚠️ 不能把 output_dir 整个递归算进去：那是本仓库代码目录（pylibs 恒定 253MB），
+    体积永远不变，会立刻被判成“卡死”。"""
     out = os.path.abspath(output_dir)
     targets = []
     if real_export_file:
         targets.append(real_export_file)
-    targets.append(out)
-    targets.extend(_sibling_bundle_dirs(out, safe_name)[1:])
-    targets.extend(d for d in _temp_export_dirs(out) if os.path.abspath(d) != out)
+        exp_dir = os.path.dirname(os.path.abspath(real_export_file))
+        try:
+            for name in os.listdir(exp_dir):
+                p = os.path.join(exp_dir, name)
+                # 剪映 5.9 编码期间写的是 UUID 临时名（如 e47af899-xxxx.mp4），
+                # 完成时才 rename 成「剧名.mp4」。旧逻辑只认 startswith(safe_name)，
+                # 会在长剧集导出中途看不到任何增长 → 1800s 误判卡死并杀掉剪映。
+                if name.lower().endswith(".mp4") and os.path.isfile(p):
+                    targets.append(p)
+        except OSError:
+            pass
+        targets.extend(_temp_export_dirs(exp_dir))
+        targets.extend(_temp_export_dirs(out))
+    else:
+        targets.append(out)
     seen, total = set(), 0
     for p in targets:
         ap = os.path.abspath(p)
@@ -1377,7 +1406,7 @@ def _restore_streams_from_backup(draft_name):
 
 
 def run(draft_name, output_path, move_output=False, expected_duration=None,
-        keep_open=False, fallback_dir=None, cold_start=False):
+        keep_open=False, fallback_dir=None, cold_start=False, resolution=None):
     _TASK.update(draft=draft_name, output=output_path, move=move_output,
                  status="running", stage="准备", start_time=time.time(),
                  expected_duration=expected_duration, real_file=None)
@@ -1442,7 +1471,7 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
     _TASK["phase"] = "export"
     export_started = time.time()
     try:
-        exporter.export(output_path, draft_name,
+        exporter.export(output_path, draft_name, resolution=resolution,
                         expected_duration=expected_duration, move_output=move_output)
     except Exception as e:
         # 异常抢救（移植自老脚本）：剪映可能在报错前已写出完整成品，校验通过则视为成功
@@ -1522,6 +1551,8 @@ if __name__ == "__main__":
                         help="UI 类失败重试次数（默认 2，即共 3 次尝试；非 UI 错误不重试）")
     parser.add_argument("--cold-start", action="store_true",
                         help="导出前冷启动剪映（杀进程→拉起→等首页），避免上一部刚导完时 UI 假死")
+    parser.add_argument("--resolution", default=None, choices=["480P", "720P", "1080P", "2K", "4K"],
+                        help="导出分辨率（默认 None=沿用剪映当前值）")
 
     args = parser.parse_args()
 
@@ -1544,7 +1575,8 @@ if __name__ == "__main__":
             run(args.draft_name, args.output_path,
                 move_output=args.move, expected_duration=args.expect_duration,
                 keep_open=args.keep_open, fallback_dir=args.fallback_dir,
-                cold_start=args.cold_start and attempt == 1)
+                cold_start=args.cold_start and attempt == 1,
+                resolution=args.resolution)
             sys.exit(0)
         except Exception as e:
             reason = str(e)
@@ -1565,8 +1597,13 @@ if __name__ == "__main__":
                 dprint("-" * 40)
                 dprint(traceback.format_exc())
                 _flush_task()
-                if sys.stdin.isatty():
-                    input("按回车键退出...")
+                # 非交互环境（pipeline 子进程 stdin 已关闭）input 会抛 EOFError，
+                # 把真实堆栈顶掉、还让退出码看起来是 input 的错而不是导出失败
+                try:
+                    if sys.stdin.isatty():
+                        input("按回车键退出...")
+                except (EOFError, OSError):
+                    pass
                 sys.exit(1)
             _TASK["errors"].append(f"[尝试 {attempt}] [{category}] {reason}")
             _flow(f"第 {attempt} 次尝试失败（{category}，动作={action}）：{reason[:160]}，自愈后重试")

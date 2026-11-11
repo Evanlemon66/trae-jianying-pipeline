@@ -1726,12 +1726,14 @@ BLANK_VIDEO_SEGMENT = {
 }
 
 
-def inject_videos_into_draft(draft, video_paths):
+def inject_videos_into_draft(draft, video_paths, normalize: bool = True):
     """
     往已有草稿里注入视频（追加主轨 + materials.videos）。
     - 多个视频按传入顺序（调用方按文件名 a→z 排序）串在同一条主 video track 上
     - 每集记录 start_us / duration_us / segment，供后续字幕和人声分离按集偏移
     - 如果已有 video 主轨且有 segments，先清空它们（让注入的视频做第一轨）
+    - normalize=False 时跳过自动转封装，直接引用原始视频（默认 True 保持旧行为：
+      HEVC/非常规尺寸先 normalize_video_for_jianying 再注入）
 
     返回: episodes 列表 [{"path", "name", "start_us", "duration_us", "segment", "material_id"}]
     """
@@ -1749,13 +1751,14 @@ def inject_videos_into_draft(draft, video_paths):
     first_size = None
 
     for vp in video_paths:
-        _norm = normalize_video_for_jianying(vp)
-        if _norm is None:
-            print(f"  ⚠️ 转封装失败，跳过: {os.path.basename(vp)}")
-            continue
-        if _norm != vp:
-            print(f"  🔧 自动转封装: {os.path.basename(vp)} → {os.path.basename(_norm)}")
-        vp = _norm
+        if normalize:
+            _norm = normalize_video_for_jianying(vp)
+            if _norm is None:
+                print(f"  ⚠️ 转封装失败，跳过: {os.path.basename(vp)}")
+                continue
+            if _norm != vp:
+                print(f"  🔧 自动转封装: {os.path.basename(vp)} → {os.path.basename(_norm)}")
+            vp = _norm
 
         dur_us = get_video_duration_us(vp)
         if dur_us is None:

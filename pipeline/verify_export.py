@@ -48,6 +48,10 @@ def _grab_clip(path, t, dur):
         r = subprocess.run([FF, "-v", "error", "-ss", f"{t:.3f}", "-t", f"{dur:.3f}", "-i", path,
                             "-vf", f"fps={FPS},scale={W}:{H},format=gray", "-f", "rawvideo", "-"],
                            capture_output=True, timeout=300, creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", "replace").strip()
+            print(f"  ⚠️ ffmpeg 取帧失败 rc={r.returncode}: {err[:200]}")
+            return None
         a = np.frombuffer(r.stdout, dtype=np.uint8)
         n = len(a) // (W * H)
         if n == 0:
