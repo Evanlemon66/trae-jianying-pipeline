@@ -8,6 +8,7 @@ _*.py
 
 # 个人配置（含个人预设名/密钥/导出目录，不入库；参考 *.example.json）
 pipeline/presets.json
+pipeline/vc_config.json
 
 # Python 缓存
 __pycache__/
@@ -77,3 +78,13 @@ dist/
 # 剪映本地资源 (体积大，由 sync_jy_assets 自动同步；仅根目录，技能内 assets 正常入库)
 /assets/
 /covers/
+
+# 剪映 UI 自动化：运行时产物、依赖与个人校准（随机器/环境变化，不入库）
+pipeline_ui/calibrations/
+pipeline_ui/ui_calibration.json
+pipeline_ui/logs/
+pipeline_ui/pylibs/
+pipeline_ui/*.bmp
+pipeline_ui/*.stall.png
+pipeline_ui/*.progress.json
+pipeline_ui/*.err
