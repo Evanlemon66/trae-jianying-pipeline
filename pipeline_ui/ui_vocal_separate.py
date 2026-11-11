@@ -993,6 +993,9 @@ def _wait_vocal_done_by_artifacts(timeout_sec: int, label: str = ''):
     video_segs = _draft_video_segment_count()
     expected = video_segs * 2   # 每段产人声+背景声 2 个文件
     while time.time() - t_wait < timeout_sec:
+        if expected <= 0:
+            video_segs = _draft_video_segment_count()
+            expected = video_segs * 2
         n, mb = _vocal_alg_artifacts()
         if n != prev_n:
             stable_since = None   # 还在增长，重置稳定计时
@@ -1001,8 +1004,8 @@ def _wait_vocal_done_by_artifacts(timeout_sec: int, label: str = ''):
         prev_n = n
         last_n = n
         stable_ok = (stable_since is not None) and (time.time() - stable_since >= 30)
-        if stable_ok:
-            dprint(f"  ✅ 分离产物稳定 30s：{n} 个文件，"
+        if stable_ok and expected > 0 and n >= expected:
+            dprint(f"  ✅ 分离产物完整且稳定 30s：{n} 个文件，"
                    f"{mb:.0f}MB（expected={expected} = {video_segs}段 × 2）")
             return True, n, expected
         elapsed = int(time.time() - t_wait)

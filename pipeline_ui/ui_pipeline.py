@@ -41,6 +41,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'pipeline')))
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, 'lib'))
+sys.path.insert(0, os.path.join(
+    _ROOT, '.trae', 'skills', 'jianying-editor', 'examples'))
+
+import export_lock
+from jy_instance import JyInstance
+from no_window import hidden_child_env
 import ui_calibration
 from ui_core import dprint, connect_jianying, op_timeline, take_op_marks
 
@@ -322,120 +330,175 @@ def step_export(workdir, draft_name=None, resolution=None):
     import subprocess
     t0 = time.time()
 
-    export_script = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        '.trae', 'skills', 'jianying-editor', 'examples', 'robust_auto_export.py'
-    )
-    if not os.path.exists(export_script):
-        dprint(f"  ⚠️ 找不到 {export_script}，跳过导出")
-        return {'ok': True, 'duration_s': round(time.time()-t0, 1), 'error': 'script_not_found'}
+    if not export_lock.acquire(owner='pipeline_ui export'):
+        dprint("  ⚠️ 全局导出锁被占用，取消本次导出")
+        return {'ok': False, 'duration_s': round(time.time()-t0, 1), 'error': 'export_lock_busy'}
+    proc = None
 
-    if not draft_name:
+    def _cleanup_export_process():
+        """返回 (首个清理中断, 包装进程已停止)；中断时也继续尝试后续清理。"""
+        if proc is None:
+            return None, True
+        cleanup_error = None
         try:
-            from ui_recognize_translate import _active_draft_name
-            draft_name = _active_draft_name()
-        except Exception:
-            draft_name = None
-    if not draft_name:
-        return {'ok': False, 'duration_s': round(time.time()-t0, 1), 'error': 'no_draft_name'}
-
-    os.makedirs(workdir, exist_ok=True)
-    output_path = os.path.join(os.path.abspath(workdir), f'{draft_name}.mp4')
-
-    # 草稿时长：传给导出脚本做「成品不得短于草稿 2s」的校验
-    expected_s = None
-    try:
-        from ui_recognize_translate import DRAFT_ROOT
-        with open(os.path.join(DRAFT_ROOT, draft_name, 'draft_content.json'), encoding='utf-8') as f:
-            expected_s = round(float(json.load(f).get('duration') or 0) / 1e6, 2) or None
-    except Exception as e:
-        dprint(f"  [warn] 读草稿时长失败，导出不做时长校验: {e}")
-
-    cmd = [sys.executable, export_script, draft_name, output_path, '--move']
-    if expected_s:
-        cmd += ['--expect-duration', str(expected_s)]
-    if resolution:
-        cmd += ['--resolution', resolution]
-    timeout = _step_timeout('export', expected_s)
-    dprint(f"  导出草稿「{draft_name}」→ {output_path}（时长 {expected_s}s，"
-           f"分辨率 {resolution or '沿用剪映当前值'}，导出后搬回 workdir，超时 {timeout}s）")
-
-    try:
-        # 清理上一轮导出残留（否则首读体积=旧产物，会骗过「已写盘」看门狗、干扰进度判读）
-        _tmp_root = os.path.join(os.environ.get('USERPROFILE', ''),
-                                 'Videos', '.__jianying_export_temp_folder__')
-        if os.path.isdir(_tmp_root):
-            import shutil
-            shutil.rmtree(_tmp_root, ignore_errors=True)
-            dprint("  已清理导出临时目录残留")
-        # 同理删除旧成品（同路径上轮产物会污染体积读数）
+            if proc.poll() is not None:
+                return None, True
+        except Exception as e:
+            dprint(f"  [warn] 读取导出进程状态失败，按仍在运行清理: {e}")
+        except BaseException as e:
+            cleanup_error = e
         try:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-                dprint("  已删除旧成品文件")
-        except OSError:
-            pass
+            JyInstance().kill()
+        except Exception as e:
+            dprint(f"  [warn] 停止剪映失败: {e}")
+        except BaseException as e:
+            if cleanup_error is None:
+                cleanup_error = e
+        try:
+            proc.kill()
+        except Exception as e:
+            dprint(f"  [warn] 终止导出包装进程失败: {e}")
+        except BaseException as e:
+            if cleanup_error is None:
+                cleanup_error = e
+        try:
+            proc.communicate()
+        except Exception as e:
+            dprint(f"  [warn] 回收导出包装进程失败: {e}")
+        except BaseException as e:
+            if cleanup_error is None:
+                cleanup_error = e
+        try:
+            stopped = proc.poll() is not None
+        except Exception as e:
+            dprint(f"  [warn] 无法确认导出包装进程已停止，保留导出锁: {e}")
+            stopped = False
+        except BaseException as e:
+            if cleanup_error is None:
+                cleanup_error = e
+            stopped = False
+        return cleanup_error, stopped
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding='utf-8', errors='replace',
-            stdin=subprocess.DEVNULL,   # 避免脚本失败路径 input() 在无 tty 时 EOFError
+    try:
+        export_script = os.path.join(
+            _ROOT, '.trae', 'skills', 'jianying-editor', 'examples', 'robust_auto_export.py'
         )
+        if not os.path.exists(export_script):
+            dprint(f"  ⚠️ 找不到 {export_script}，导出失败")
+            return {'ok': False, 'duration_s': round(time.time()-t0, 1), 'error': 'script_not_found'}
 
-        def _sizes_mb():
-            """(临时目录体积, 成品体积) MB——分开统计，防旧文件污染判读"""
-            tmp = 0
-            for dp, _d, files in os.walk(_tmp_root):
-                for fn in files:
-                    try:
-                        tmp += os.path.getsize(os.path.join(dp, fn))
-                    except OSError:
-                        pass
+        if not draft_name:
             try:
-                out = os.path.getsize(output_path)
+                from ui_recognize_translate import _active_draft_name
+                draft_name = _active_draft_name()
+            except Exception:
+                draft_name = None
+        if not draft_name:
+            return {'ok': False, 'duration_s': round(time.time()-t0, 1), 'error': 'no_draft_name'}
+
+        os.makedirs(workdir, exist_ok=True)
+        output_path = os.path.join(os.path.abspath(workdir), f'{draft_name}.mp4')
+
+        # 草稿时长：传给导出脚本做「成品不得短于草稿 2s」的校验
+        expected_s = None
+        try:
+            from ui_recognize_translate import DRAFT_ROOT
+            with open(os.path.join(DRAFT_ROOT, draft_name, 'draft_content.json'), encoding='utf-8') as f:
+                expected_s = round(float(json.load(f).get('duration') or 0) / 1e6, 2) or None
+        except Exception as e:
+            dprint(f"  [warn] 读草稿时长失败，导出不做时长校验: {e}")
+
+        cmd = [sys.executable, export_script, draft_name, output_path, '--move']
+        if expected_s:
+            cmd += ['--expect-duration', str(expected_s)]
+        if resolution:
+            cmd += ['--resolution', resolution]
+        timeout = _step_timeout('export', expected_s)
+        dprint(f"  导出草稿「{draft_name}」→ {output_path}（时长 {expected_s}s，"
+               f"分辨率 {resolution or '沿用剪映当前值'}，导出后搬回 workdir，超时 {timeout}s）")
+
+        try:
+            # 清理上一轮导出残留（否则首读体积=旧产物，会骗过「已写盘」看门狗、干扰进度判读）
+            _tmp_root = os.path.join(os.environ.get('USERPROFILE', ''),
+                                     'Videos', '.__jianying_export_temp_folder__')
+            if os.path.isdir(_tmp_root):
+                import shutil
+                shutil.rmtree(_tmp_root, ignore_errors=True)
+                dprint("  已清理导出临时目录残留")
+            # 同理删除旧成品（同路径上轮产物会污染体积读数）
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                    dprint("  已删除旧成品文件")
             except OSError:
-                out = 0
-            return tmp / 1e6, out / 1e6
+                pass
 
-        last_tmp = 0.0
-        deadline = t0 + timeout
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                proc.kill()
-                proc.communicate()
-                dprint(f"[6] 导出 MP4 ❌  超时 {timeout}s")
-                return {'ok': False, 'duration_s': round(time.time()-t0, 1),
-                        'error': f'export_timeout_{timeout}s', 'inputs': {'cmd': cmd}}
-            try:
-                proc.wait(timeout=min(30, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                tmp_mb, out_mb = _sizes_mb()
-                delta = tmp_mb - last_tmp
-                last_tmp = tmp_mb
-                dprint(f"  ...导出中（已 {time.time()-t0:.0f}s）"
-                       f"临时 {tmp_mb:.0f}MB / 成品 {out_mb:.0f}MB"
-                       + (f"（临时新增 {delta:.0f}MB，写盘中）" if delta > 0.5
-                          else "（临时无新增，准备阶段/未写盘）"))
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding='utf-8', errors='replace',
+                stdin=subprocess.DEVNULL,   # 避免脚本失败路径 input() 在无 tty 时 EOFError
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                env=hidden_child_env(),
+            )
 
-        out, err = proc.communicate()
-        elapsed = time.time() - t0
-        if proc.returncode == 0:
-            dprint(f"[6] 导出 MP4 ✅  耗时 {elapsed:.1f}s")
-            return {'ok': True, 'duration_s': round(elapsed, 1), 'error': None,
+            def _sizes_mb():
+                """(临时目录体积, 成品体积) MB——分开统计，防旧文件污染判读"""
+                tmp = 0
+                for dp, _d, files in os.walk(_tmp_root):
+                    for fn in files:
+                        try:
+                            tmp += os.path.getsize(os.path.join(dp, fn))
+                        except OSError:
+                            pass
+                try:
+                    out = os.path.getsize(output_path)
+                except OSError:
+                    out = 0
+                return tmp / 1e6, out / 1e6
+
+            last_tmp = 0.0
+            deadline = t0 + timeout
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    dprint(f"[6] 导出 MP4 ❌  超时 {timeout}s")
+                    return {'ok': False, 'duration_s': round(time.time()-t0, 1),
+                            'error': f'export_timeout_{timeout}s', 'inputs': {'cmd': cmd}}
+                try:
+                    proc.wait(timeout=min(30, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    tmp_mb, out_mb = _sizes_mb()
+                    delta = tmp_mb - last_tmp
+                    last_tmp = tmp_mb
+                    dprint(f"  ...导出中（已 {time.time()-t0:.0f}s）"
+                           f"临时 {tmp_mb:.0f}MB / 成品 {out_mb:.0f}MB"
+                           + (f"（临时新增 {delta:.0f}MB，写盘中）" if delta > 0.5
+                              else "（临时无新增，准备阶段/未写盘）"))
+
+            out, err = proc.communicate()
+            elapsed = time.time() - t0
+            if proc.returncode == 0:
+                dprint(f"[6] 导出 MP4 ✅  耗时 {elapsed:.1f}s")
+                return {'ok': True, 'duration_s': round(elapsed, 1), 'error': None,
+                        'inputs': {'cmd': cmd}}
+            else:
+                dprint(f"[6] 导出 MP4 ❌  返回码 {proc.returncode}")
+                dprint(f"  stderr: {(err or '')[-500:]}")
+                return {'ok': False, 'duration_s': round(elapsed, 1), 'error': (err or '')[-300:],
+                        'inputs': {'cmd': cmd}}
+        except Exception as e:
+            elapsed = time.time() - t0
+            dprint(f"[6] 导出 MP4 ❌  异常: {e}")
+            return {'ok': False, 'duration_s': round(elapsed, 1), 'error': str(e),
                     'inputs': {'cmd': cmd}}
-        else:
-            dprint(f"[6] 导出 MP4 ❌  返回码 {proc.returncode}")
-            dprint(f"  stderr: {(err or '')[-500:]}")
-            return {'ok': False, 'duration_s': round(elapsed, 1), 'error': (err or '')[-300:],
-                    'inputs': {'cmd': cmd}}
-    except Exception as e:
-        elapsed = time.time() - t0
-        dprint(f"[6] 导出 MP4 ❌  异常: {e}")
-        return {'ok': False, 'duration_s': round(elapsed, 1), 'error': str(e),
-                'inputs': {'cmd': cmd}}
+    finally:
+        cleanup_error, stopped = _cleanup_export_process()
+        if stopped:
+            export_lock.release()
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 STEP_IMPL = {
@@ -560,6 +623,7 @@ def run_pipeline_ui(workdir: str,
     # 确保剪映窗口就绪（[P] 只查 JSON、[0] 初始化草稿会自行打开，允许无窗口）
     dprint("检查剪映窗口...")
     win, page = connect_jianying()
+    ui_calibration.set_current_win(win)
     if not win:
         if any(k in ('precheck', 'init_draft') for k, _, _ in to_run):
             dprint("  ⚠️ 未找到剪映窗口，交给 [P]/[0] 处理")
@@ -715,7 +779,7 @@ def main():
 
     _power_keepalive(True)
     try:
-        run_pipeline_ui(
+        ok = run_pipeline_ui(
             workdir=args.workdir,
             only=args.only,
             from_step=args.from_step,
@@ -733,7 +797,8 @@ def main():
         )
     finally:
         _power_keepalive(False)
+    return 0 if ok else 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

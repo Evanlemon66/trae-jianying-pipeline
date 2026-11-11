@@ -934,7 +934,7 @@ def launch_and_connect(exe_path=None, max_wait=60):
         raise RuntimeError("未找到剪映可执行文件，请手动启动后再试")
 
     dprint(f"启动: {exe_path}")
-    subprocess.Popen([exe_path])
+    subprocess.Popen([exe_path], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
     t_launch = time.time()
     last_log = 0.0
@@ -1808,14 +1808,14 @@ def panel_edges(win=None, s=None):
     # 三级：比例兜底（显式 WARN，绝不静默）
     fallback_ratio = list(_gp('panel_edges', 'fallback_ratio'))
     if out['left_right'] is None:
-        out['left_right'] = int(round(fallback_ratio[1] * WW))
-        out['left_left'] = int(round(fallback_ratio[0] * WW))
+        out['left_right'] = WL + int(round(fallback_ratio[1] * WW))
+        out['left_left'] = WL + int(round(fallback_ratio[0] * WW))
         out['src']['left_right'] = out['src']['left_left'] = 'ratio(1920比例)'
         out['warn'].append(
             f"三级降级：左面板边缘用 1920 比例估算 → 右缘 {out['left_right']} "
             f"（4K 实测 2101，偏差约 -469；1920 下比例=实测无偏差）")
     if out['right_left'] is None:
-        out['right_left'] = int(round(fallback_ratio[2] * WW))
+        out['right_left'] = WL + int(round(fallback_ratio[2] * WW))
         out['src']['right_left'] = 'ratio(1920比例)'
         out['warn'].append(
             f"三级降级：右面板内容左缘用 1920 比例估算 → {out['right_left']} "

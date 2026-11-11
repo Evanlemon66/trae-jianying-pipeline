@@ -106,7 +106,8 @@ def _jianying_running():
     try:
         r = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq JianyingPro.exe'],
                            capture_output=True, text=True,
-                           encoding='mbcs', errors='replace', timeout=10)
+                           encoding='mbcs', errors='replace', timeout=10,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         return 'JianyingPro.exe' in (r.stdout or '')
     except Exception:
         return False
@@ -135,7 +136,8 @@ def _cold_restart():
     if not graceful:
         try:
             subprocess.run(['taskkill', '/F', '/IM', 'JianyingPro.exe', '/T'],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=15,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         except Exception as e:
             dprint(f'  [warn] taskkill 失败: {e}')
     t_kill = time.time()
@@ -204,9 +206,11 @@ def open_draft(name, timeout=60):
     for i in range(timeout):
         time.sleep(1)
         t_p = time.time()
-        _, pt = connect_jianying(retry=False)
+        win, pt = connect_jianying(retry=False)
         dur = time.time() - t_p
         if pt == 'edit':
+            import ui_calibration
+            ui_calibration.set_current_win(win)
             dprint(f'进入编辑页 (轮询{i + 1}次，本次检测 {dur:.1f}s，'
                    f'自 open_draft 起 {time.time()-t_open:.1f}s)')
             time.sleep(3)

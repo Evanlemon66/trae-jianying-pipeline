@@ -257,8 +257,8 @@ def pick_calibration(win=None) -> tuple[dict | None, str]:
 
 def check_env_match(calib: dict, cur_env: dict | None = None) -> bool:
     """环境指纹与校准时是否一致（分辨率/缩放/剪映版本）。
-    cur_env 可传入（避免重复读 env），否则自动调用 env_fingerprint()。"""
-    cur = cur_env or env_fingerprint()
+    cur_env 可传入（避免重复读 env），否则按当前剪映窗口所在屏读取。"""
+    cur = cur_env or env_fingerprint(_CURRENT_WIN)
     saved = calib.get('env', {})
     if cur['screen'] != saved.get('screen'):
         return False
@@ -324,8 +324,9 @@ def validate_calibration(calib: dict = None) -> dict:
     info.append(f"calibrated_at = {calib.get('calibrated_at', '未知')}")
 
     # 环境指纹：不匹配时 get_param 会静默退回默认值，必须提前拦截
-    if not check_env_match(calib):
-        cur, saved = env_fingerprint(), calib.get('env', {})
+    cur = env_fingerprint(_CURRENT_WIN)
+    if not check_env_match(calib, cur_env=cur):
+        saved = calib.get('env', {})
         diff = []
         if cur['screen'] != saved.get('screen'):
             diff.append(f"分辨率 {saved.get('screen')}→{cur['screen']}")
@@ -430,7 +431,7 @@ def get_param(section: str, key: str, default=None):
     所有 UI 操作函数的坐标/阈值/偏移统一从这里取。
     调用方不传 default 时自动查 DEFAULTS 集中表（杜绝散落硬编码）。"""
     calib = load_calibration()
-    if calib and check_env_match(calib):
+    if calib and check_env_match(calib, cur_env=env_fingerprint(_CURRENT_WIN)):
         has = isinstance(calib.get(section), dict) and key in calib[section]
         if has:
             value = calib[section][key]
@@ -455,7 +456,7 @@ def update_param(section: str, key: str, value, coord_tolerance: int = 5):
     calib = load_calibration()
     if not calib:
         return False
-    if not check_env_match(calib):
+    if not check_env_match(calib, cur_env=env_fingerprint(_CURRENT_WIN)):
         return False
     # 坐标写回守卫：偏差 ≤ 容差跳过
     old = calib.get(section, {}).get(key)

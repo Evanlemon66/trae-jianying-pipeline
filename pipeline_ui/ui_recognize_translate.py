@@ -1286,6 +1286,7 @@ def run_recognize_translate(target_lang: str = "英语",
     eng_now = eng_before
     eng_added = 0
     eng_ok = False
+    cn_ok = False
     last_cnt = texts_before
     last_cnt_change = start_poll   # 草稿 texts 最近一次变化时刻（用于快速失败判定）
     fast_fail_reason = None
@@ -1335,8 +1336,8 @@ def run_recognize_translate(target_lang: str = "英语",
             dprint(f"  t={elapsed}s 等待中... text={curr_text}/{pre_text + 2}, "
                    f"texts={cnt}, 英文+{eng_added}")
 
-    # 超时终检：英文译文必须在（不作假绿），中文以轨道或 texts 增量任一侧成立即算落地
-    if not success and eng_ok and ((curr_text >= pre_text + 1) or (cnt >= texts_before + 1)):
+    # 超时终检复用正常判据：英文必须在，中文轨道或 texts 增量也必须达到 +2。
+    if not success and eng_ok and cn_ok:
         dprint(f"  ⚠️ 超时但字幕已落地（轨道 +{curr_text - pre_text}、texts {texts_before}→{cnt}）、"
                f"英文译文 +{eng_added}，判定迟到完成")
         success = True

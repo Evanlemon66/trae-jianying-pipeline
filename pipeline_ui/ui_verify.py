@@ -11,7 +11,8 @@ UI 终检：三态对账（PASS / WARN / FAIL）
   PASS：逐行对上（类型一致 + |dy|<=3 + 隐藏状态一致），且类型判据均为 UIA 级
   WARN：两路读数冲突 / 某行类型只能靠颜色兜底 / 隐藏行类型不可验 / y 漂移 3~25px
         / 预期外多出行 —— 记录并继续，不阻断 pipeline
-  FAIL：预期有、实际扫不到（|dy|>25 视为缺轨）—— 阻断
+  FAIL：预期有、实际扫不到（|dy|>25 视为缺轨），或隐藏状态确定不符，
+        或无通道冲突的 UIA 类型确定不符 —— 阻断
 
 段数语义（校准旧口径「video: 3 段」实为行数）：
   segments_uia = 该行 ±25px 内 UIA 片段节点数。实测（2026-11-03 探针）：5.9 全窗
@@ -117,7 +118,10 @@ def _scan_with_evidence(win):
             'type_source': src, 'confidence': conf,
             'segments_uia': seg_n,
             'channel_conflict': bool(
-                uia_t and color_t and (uia_t == 'text') != (color_t == 'text')),
+                uia_t and color_t and (
+                    (color_t == 'nontext' and uia_t == 'text')
+                    or (color_t != 'nontext' and uia_t != color_t)
+                )),
         })
     return rows, img, WL, WT, WW, eye_x, tr, row_reports
 
@@ -175,12 +179,16 @@ def run_verify(workdir: str = ".") -> dict:
         act = min(cand, key=lambda rr: abs(rr['ymid'] - ey))
         dy = act['ymid'] - ey
         reasons = []
+        row_fail = False
         # 隐藏行无像素可测，type=unknown 时不判类型不符（另行标注不可验）
         if act['type'] != exp.get('type') and not (
                 act['hidden'] and exp.get('hidden') and act['type'] == 'unknown'):
             reasons.append(f"type_mismatch(exp={exp.get('type')},act={act['type']})")
+            if act['confidence'] == 'high' and not act['channel_conflict']:
+                row_fail = True
         if bool(act['hidden']) != bool(exp.get('hidden')):
             reasons.append(f"hidden_mismatch(exp={exp.get('hidden')},act={act['hidden']})")
+            row_fail = True
         if abs(dy) > Y_PASS:
             reasons.append(f'y_drift(dy={dy})')
         if act['confidence'] == 'color-only':
@@ -189,11 +197,13 @@ def run_verify(workdir: str = ".") -> dict:
             reasons.append('hidden_row_type_unverifiable')
         if act['channel_conflict']:
             reasons.append(f"channel_conflict(uia={act['uia_type']},color={act['color_type']})")
-        # 三态定义：缺轨才 FAIL；类型/隐藏不符、判据降级均属 WARN（读数冲突/置信度低）
-        verdict = 'warn' if reasons else 'pass'
+        # 确定的隐藏不符及无通道冲突的 UIA 类型不符 FAIL；低置信读数仍 WARN。
+        verdict = 'fail' if row_fail else ('warn' if reasons else 'pass')
         if reasons:
             diffs.append({'kind': 'row_diff', 'ymid_exp': ey, 'reasons': reasons})
-            if state == 'PASS':
+            if row_fail:
+                state = 'FAIL'
+            elif state == 'PASS':
                 state = 'WARN'
         recon.append({'expected': exp, 'actual': act, 'dy': dy,
                       'verdict': verdict, 'reasons': reasons})

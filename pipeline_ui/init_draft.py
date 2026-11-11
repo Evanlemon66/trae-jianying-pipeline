@@ -234,11 +234,21 @@ def init_draft(draft_name: str = DRAFT_NAME,
         cut_segs = crop_before_us(draft, cut_us)
         moved = rebase_timeline(draft, cut_us)
         after_us = int(get_main_video_duration(draft) or 0)
-        if after_us > 0:
-            draft['duration'] = after_us
-            total_us = after_us
+        main_after_us = 0
+        for seg in _main_track_segments(draft):
+            target = seg.get('target_timerange') or {}
+            end = int(target.get('start', 0) or 0) + int(target.get('duration', 0) or 0)
+            main_after_us = max(main_after_us, end)
+        if main_after_us <= 0:
+            error = (f'裁剪后主轨时长为 0（cut_s={float(cut_s):g}s，裁剪前总时长 '
+                     f'{total_us/1e6:.1f}s），请确保 cut_s 小于总时长；已取消保存和发布')
+            print(f"  ❌ {error}")
+            return {'ok': False, 'episodes': len(episodes_info),
+                    'duration_s': 0.0, 'error': error}
+        draft['duration'] = after_us
+        total_us = after_us
         print(f"  ✂️ 发布前裁剪 {float(cut_s):g}s：裁段 {len(cut_segs)} 条，左移 {moved} 段，"
-              f"总时长 → {(after_us or total_us)/1e6:.1f}s")
+              f"总时长 → {total_us/1e6:.1f}s")
         _phase('发布前时间线裁剪')
 
     # ── Step 4: 保存到暂存区 ──
