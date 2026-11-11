@@ -227,7 +227,10 @@ def run_extract_audio(workdir: str = ".", timeout_sec: int = 30) -> dict:
     # --- Step 5: 解除所有锁定和隐藏（阶段 6 边界：分离已完成，进入最终形态布局）---
     op_stage('6 草稿最终形态(只隐藏中文轨,其余解除隐藏)')
     dprint("\n[5/6] 解除所有轨道的锁定和隐藏")
-    restore_all_tracks(win, scan_hint=hint)
+    restore_result = restore_all_tracks(win, scan_hint=hint)
+    if not restore_result.get('ok'):
+        return {'ok': False, 'duration_s': round(time.time() - t0, 1),
+                'error': '恢复轨道失败：仍有轨道锁定或隐藏'}
 
     # --- Step 6: 只隐藏中文字幕轨（从上到下第二条字幕轨）---
     dprint("\n[6/6] 隐藏中文字幕轨（从上到下第二条）")

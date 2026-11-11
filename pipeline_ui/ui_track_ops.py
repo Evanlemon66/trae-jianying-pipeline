@@ -598,6 +598,7 @@ def restore_all_tracks(win, max_rounds=2, scan_hint=None) -> dict:
 
     total_unlocked = total_unhidden = 0
     ok = True
+    clean_confirmed = False
     rows = img = eye_x = None
     if scan_hint and scan_hint[0]:
         rows, img, eye_x = scan_hint[0], scan_hint[1], scan_hint[5]
@@ -649,17 +650,21 @@ def restore_all_tracks(win, max_rounds=2, scan_hint=None) -> dict:
                 break
             time.sleep(1)
         if not still_l and not still_h:
+            clean_confirmed = True
             rows = None          # 干净了，无需再扫
             break
         dprint(f"  ⚠️ 轻量复检未干净: 仍锁定={still_l} 仍隐藏={still_h}，回退完整扫描重试")
         rows = None              # 下一轮用完整 scan_tracks 重扫
 
-    # 最终验证：只有轻量复检未能确认干净时，才做一次完整 scan_tracks
-    if rows is not None:
+    # 最终验证：未被轻量复检明确确认干净时，必须完整扫描；扫不到行也不能判绿。
+    if not clean_confirmed:
         rows2, img2, _, WT2, _, _ = scan_tracks(win)
         still_locked = [r['ymid'] for r in rows2 if is_row_locked(img2, WT2, r['ymid'])]
         still_hidden = [r['ymid'] for r in rows2 if r['hidden']]
-        if still_locked or still_hidden:
+        if not rows2:
+            ok = False
+            dprint("  ⚠️ 收尾终验未扫到轨道，无法确认干净")
+        elif still_locked or still_hidden:
             ok = False
             dprint(f"  ⚠️ 收尾未干净: 仍锁定={still_locked} 仍隐藏={still_hidden}")
     if ok:

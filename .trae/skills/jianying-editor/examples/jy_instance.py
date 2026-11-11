@@ -145,7 +145,8 @@ class UIABackend(Backend):
     def kill(self) -> None:
         # 唯一允许 taskkill 的地方（经管理器 kill() 调用）
         subprocess.run(["taskkill", "/F", "/IM", "JianyingPro.exe"],
-                       capture_output=True)
+                       capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     def close_edit_to_home(self) -> bool:
         """编辑页右上角关闭按钮（TitleBarButton foundIndex=3）→ 回首页（不杀进程）。"""

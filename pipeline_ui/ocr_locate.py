@@ -59,7 +59,8 @@ def _ocr_window(win, region=None):
     wr = get_window_rect(win)
     if not wr:
         return []
-    WL, WT, WW, WH = wr
+    WL, WT, WR, WB = wr
+    WW, WH = WR - WL, WB - WT
     img = np.array(capture_region(WL, WT, WW, WH))
     ox, oy = 0, 0
     if region:
