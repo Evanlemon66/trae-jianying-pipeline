@@ -69,6 +69,9 @@ def test_parse_preset_profiles_multi():
     assert pc.parse_preset_profiles("presets_a，presets_b") == ["a", "b"]
     assert pc.parse_preset_profiles(["presets_a", "b", "a"]) == ["a", "b"]
     assert pc.parse_preset_profiles(" presets_b , a ") == ["b", "a"]
+    # 3+ 版本：不得截断（上限只作用于旧任务反推，不作用于显式声明）
+    assert pc.parse_preset_profiles("a,b,c,d") == ["a", "b", "c", "d"]
+    assert pc.parse_preset_profiles(["presets_a", "presets_b", "presets_c"]) == ["a", "b", "c"]
 
 
 def test_watcher_export_targets_and_missing(tmp_path, monkeypatch):
