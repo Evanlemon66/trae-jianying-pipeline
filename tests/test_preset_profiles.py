@@ -86,6 +86,35 @@ def test_watcher_export_targets_and_missing(tmp_path, monkeypatch):
     assert cw._export_targets("A_串流", ["a"]) == ["A_串流"]
 
 
+@pytest.mark.parametrize("stage,video,pending,expect_ok,reason_kw", [
+    ("video_ready", {"status": "done"}, ["A_串流_b"], True, None),
+    ("video_ready", {"status": "done"}, [], False, "无待补版本"),
+    ("video_ready", {"status": "exported"}, [], False, "无待补版本"),
+    ("video_ready", {"status": "done", "export_state": "cleaned"},
+     ["A_串流_b"], False, "cleaned"),
+    ("archived", {"status": "done"}, ["A_串流_b"], False, "archived"),
+])
+def test_check_trigger_video_ready_needs_pending_version(
+        tmp_path, monkeypatch, stage, video, pending, expect_ok, reason_kw):
+    """video_ready 只在有 pending 版本时放行；archived/cleaned 一律挡住。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import cover_watch as cw
+    jd = tmp_path / "cover_job"
+    (jd / "03_prompts").mkdir(parents=True)
+    (jd / "03_prompts" / "prompts.json").write_text("{}", encoding="utf-8")
+    (jd / "job.json").write_text("{}", encoding="utf-8")
+    job = {"stage": stage, "titles": {"gate": "done"}, "video": video}
+    monkeypatch.setattr(cw.jm, "detect_cover_files",
+                        lambda d, apply=False: ({1, 2, 3, "vertical"}, {}))
+    monkeypatch.setattr(cw.jm, "account_cover_errors", lambda d: [])
+    monkeypatch.setattr(cw.jm, "load_job", lambda p: job)
+    monkeypatch.setattr(cw, "_pending_account_outputs", lambda j, d: pending)
+    ok, reasons = cw.check_trigger(str(jd))
+    assert ok is expect_ok, reasons
+    if reason_kw:
+        assert any(reason_kw in r for r in reasons), reasons
+
+
 def test_unknown_profile_raises(cfg_file):
     cfg_file({"presets": [{"name": "默认"}]})
     with pytest.raises(RuntimeError):

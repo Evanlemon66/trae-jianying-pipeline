@@ -169,13 +169,28 @@ def check_trigger(job_dir: str) -> tuple[bool, list[str]]:
         # 归档剧显式硬拦：即使有人放宽 TRIGGER_STAGES 或误改 job.json，也不再进入调度
         reasons.append("stage=archived（已归档，不再调度）")
         return False, reasons
+    video = job.get("video") or {}
+    if str(video.get("export_state") or "").lower() == "cleaned":
+        # 成品已清理的剧不重导：clean 之后草稿可能还在，但重导会产生"已清理又冒出新成品"
+        reasons.append("video.export_state=cleaned（成品已清理，不再重导）")
+        return False, reasons
+    # 多账号：基础账号导完会把剧钉在 video_ready + status=done，是否还有事要做
+    # 只能看"声明版本里谁还没成品"。算一次，stage 与 status 两处判定共用。
+    pending_accounts = _pending_account_outputs(job, job_dir)
     if stage not in TRIGGER_STAGES:
-        reasons.append(f"stage={job.get('stage')} 不在可触发集合")
-    if (job.get("video") or {}).get("status") == "done":
+        if stage == "video_ready" and pending_accounts:
+            pass  # 已导完的剧补新版本：放行（其余前置条件仍已通过）
+        elif stage == "video_ready":
+            reasons.append("stage=video_ready 但无待补版本（所有声明版本均已导出）")
+        else:
+            reasons.append(
+                f"stage={job.get('stage')} 不在可触发集合"
+                f"（仅 {', '.join(TRIGGER_STAGES)} 及 video_ready+待补版本）")
+    if video.get("status") == "done":
         # 多账号：基础账号导完就把整部剧钉成 done 会挡住后来新增的账号草稿/成品。
-        # 只在 job 自己声明了多预设组时放行（全局默认组不追认老任务，避免批量误重跑）。
-        if not _pending_account_outputs(job, job_dir):
-            reasons.append("video 已导出（status=done）")
+        # 只在 job 自己声明了多预设组且确有未完成版本时放行（避免全导完后反复评估）。
+        if not pending_accounts:
+            reasons.append("video 已导出（status=done）且无待补版本")
     return (not reasons), reasons
 
 
