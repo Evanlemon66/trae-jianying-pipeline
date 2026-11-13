@@ -904,34 +904,140 @@ def connect_jianying(retry=True, max_wait=60):
     return None, None
 
 
-def launch_and_connect(exe_path=None, max_wait=60):
-    import subprocess, winreg
+# ================= 剪映可执行文件解析（版本强校验） =================
+# 5.9 是 UI 自动化唯一适配版本；本机若还装了新版（如 8.9/11.x），注册表命中
+# 往往是新版 —— 解析结果必须校验 exe 文件版本，绝不静默拉起错误版本。
+REQUIRED_JY_VERSION = '5.9.0.11632'
+_JY_EXE_NAME = 'JianyingPro.exe'
 
-    if not exe_path:
-        # 5.9 硬编码优先
-        p59 = r"D:\剪映5.9\JianyingPro\5.9.0.11632\JianyingPro.exe"
-        if os.path.exists(p59):
-            exe_path = p59
-        else:
+
+class _VS_FIXEDFILEINFO(ctypes.Structure):
+    _fields_ = [
+        ('dwSignature', ctypes.c_uint32), ('dwStrucVersion', ctypes.c_uint32),
+        ('dwFileVersionMS', ctypes.c_uint32), ('dwFileVersionLS', ctypes.c_uint32),
+        ('dwProductVersionMS', ctypes.c_uint32), ('dwProductVersionLS', ctypes.c_uint32),
+        ('dwFileFlagsMask', ctypes.c_uint32), ('dwFileFlags', ctypes.c_uint32),
+        ('dwFileOS', ctypes.c_uint32), ('dwFileType', ctypes.c_uint32),
+        ('dwFileSubtype', ctypes.c_uint32), ('dwFileDateMS', ctypes.c_uint32),
+        ('dwFileDateLS', ctypes.c_uint32),
+    ]
+
+
+def _exe_file_version(path):
+    """读 exe 的 VS_FIXEDFILEINFO 文件版本（如 5.9.0.11632）。失败返回空串。"""
+    try:
+        from ctypes import wintypes
+        ver = ctypes.windll.version
+        size = ver.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return ''
+        buf = ctypes.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(path, 0, size, buf):
+            return ''
+        ptr, ln = ctypes.c_void_p(), wintypes.UINT()
+        if not ver.VerQueryValueW(buf, '\\', ctypes.byref(ptr), ctypes.byref(ln)):
+            return ''
+        ffi = ctypes.cast(ptr, ctypes.POINTER(_VS_FIXEDFILEINFO)).contents
+        ms, ls = ffi.dwFileVersionMS, ffi.dwFileVersionLS
+        return f'{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}'
+    except Exception:
+        return ''
+
+
+def _jy_version_of(exe_path):
+    """版本口径：优先 exe 文件版本，读不到再退回安装目录末级目录名。"""
+    return (_exe_file_version(exe_path)
+            or os.path.basename(os.path.dirname(os.path.abspath(exe_path))))
+
+
+def _registry_jianying_exes():
+    """从卸载注册表收集剪映候选 exe（HKCU/HKLM × 32/64 位视图，可能多版本共存）。"""
+    import winreg
+    out = []
+    sub = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
             try:
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                    r"Software\Microsoft\Windows\CurrentVersion\Uninstall") as key:
+                with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ | view) as key:
                     for i in range(winreg.QueryInfoKey(key)[0]):
-                        sk_name = winreg.EnumKey(key, i)
-                        with winreg.OpenKey(key, sk_name) as sk:
-                            try:
+                        try:
+                            with winreg.OpenKey(key, winreg.EnumKey(key, i)) as sk:
                                 dn = winreg.QueryValueEx(sk, "DisplayName")[0]
-                                if "剪映专业版" in dn:
-                                    ico = winreg.QueryValueEx(sk, "DisplayIcon")[0]
-                                    exe_path = os.path.join(os.path.dirname(ico), "JianyingPro.exe")
-                                    break
-                            except Exception:
-                                continue
+                                if "剪映专业版" not in dn:
+                                    continue
+                                try:
+                                    ico = (winreg.QueryValueEx(sk, "DisplayIcon")[0] or '').strip('"')
+                                except Exception:
+                                    ico = ''
+                                if ico:
+                                    out.append((f'注册表 DisplayIcon({dn})',
+                                                os.path.join(os.path.dirname(ico), _JY_EXE_NAME)))
+                                try:
+                                    loc = (winreg.QueryValueEx(sk, "InstallLocation")[0] or '').strip()
+                                except Exception:
+                                    loc = ''
+                                if loc:
+                                    out.append((f'注册表 InstallLocation({dn})',
+                                                os.path.join(loc, _JY_EXE_NAME)))
+                        except Exception:
+                            continue
             except Exception:
-                pass
+                continue
+    return out
 
-    if not exe_path or not os.path.exists(exe_path):
-        raise RuntimeError("未找到剪映可执行文件，请手动启动后再试")
+
+def resolve_jianying_exe(required=REQUIRED_JY_VERSION):
+    """解析剪映可执行文件并强制校验版本。
+
+    优先级：presets.json 的 jianying_dir → 环境变量 JY_JIANYING_DIR → 卸载注册表。
+    非 required 版本的候选一律跳过并记录原因；全部不匹配时抛 RuntimeError，
+    绝不静默返回注册表指向的其它大版本（本机注册表就指向 8.9）。
+    """
+    cands = []
+    try:
+        _pipe = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              '..', 'pipeline'))
+        if _pipe not in sys.path:
+            sys.path.insert(0, _pipe)
+        from export_config import get_jianying_dir
+        jd = (get_jianying_dir() or '').strip()
+        if jd:
+            cands.append((f'presets.json jianying_dir={jd}', os.path.join(jd, _JY_EXE_NAME)))
+    except Exception as e:
+        ddebug(f'  [jy-path] 读取 presets.json 失败: {e}')
+    env_dir = (os.environ.get('JY_JIANYING_DIR') or '').strip()
+    if env_dir:
+        cands.append((f'JY_JIANYING_DIR={env_dir}', os.path.join(env_dir, _JY_EXE_NAME)))
+    cands.extend(_registry_jianying_exes())
+
+    problems = []
+    for src, p in cands:
+        if not p or not os.path.exists(p):
+            problems.append(f'{src} → 不存在: {p}')
+            continue
+        ver = _jy_version_of(p)
+        if ver != required:
+            problems.append(f'{src} → 版本 {ver or "unknown"} ≠ {required}: {p}')
+            continue
+        dprint(f'剪映可执行文件: {p}（版本 {ver}，来源: {src}）')
+        return p
+    raise RuntimeError(
+        f'未找到剪映 {required}（不会静默拉起其它版本）：\n  ' + '\n  '.join(problems) +
+        '\n请在 pipeline/presets.json 的 jianying_dir 指向 5.9.0.11632 安装目录')
+
+
+def launch_and_connect(exe_path=None, max_wait=60):
+    import subprocess
+
+    if exe_path:
+        if not os.path.exists(exe_path):
+            raise RuntimeError(f'指定的剪映可执行文件不存在: {exe_path}')
+        ver = _jy_version_of(exe_path)
+        if ver != REQUIRED_JY_VERSION:
+            raise RuntimeError(f'指定的剪映版本 {ver or "unknown"} ≠ {REQUIRED_JY_VERSION}，'
+                               f'拒绝启动: {exe_path}')
+    else:
+        exe_path = resolve_jianying_exe()
 
     dprint(f"启动: {exe_path}")
     subprocess.Popen([exe_path], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
