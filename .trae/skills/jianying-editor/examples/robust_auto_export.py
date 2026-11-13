@@ -419,6 +419,9 @@ def _cold_start_jianying(exporter, wait_home=jy_instance.HOME_READY_TIMEOUT_S):
     每部剧导出前执行，避开"上一部刚导完 / 进程刚拉起"时窗口存在但 UI 未就绪
     （此时 open_draft 会假死在草稿查找或加载阶段）。管理器内部全程墙钟 deadline，
     杀进程 → 拉起 → 等首页；无法定位安装路径时抛含「冷启动失败」关键词的异常。
+
+    wait_home 默认 180s（第 1 条稳定性修复）：窗口已出现但 HomePage 尚未渲染完时
+    视为"继续等待"，不再按旧默认 90s 提前判失败。
     """
     dprint("冷启动剪映：交由实例管理器（杀进程→拉起→等首页，唯一 kill 入口）...")
     _flow("冷启动剪映：管理器 restart")
@@ -678,7 +681,7 @@ class Exporter:
         # 剪映首页草稿通常在点击后会有短暂的“正在打开”状态
         draft_card.Click(simulateMove=False)
         
-        # 等待加载编辑页（墙钟 60s 上限；每次 UIA 探测另有 8s 超时，避免假死时无限挂起）
+        # 等待加载编辑页（墙钟按草稿规模放宽；每次 UIA 探测另有 8s 超时，避免假死时无限挂起）
         dprint("正在加载编辑器 (可能需要较长时间)...")
         load_start = time.time()
         while time.time() - load_start < editor_s:
@@ -811,6 +814,7 @@ class Exporter:
         start_time = time.time()
         completed = False
         last_size, last_growth = -1, time.time()
+        saw_bytes = False  # 是否曾检测到产物字节（用于区分「还没开始」与「合并中归零」）
         win_lost = 0
 
         while time.time() - start_time < 43200: # 最长 12 小时（长剧集导出可达数小时）
@@ -838,8 +842,11 @@ class Exporter:
             # 此时 UI 路径可能指向不存在的旧位置，改用实际在增长的 mp4 接管，避免误判卡死
             now = time.time()
             cur = _watchdog_size(real_export_file, output_dir, safe_name)
-            if cur > last_size:
+            # 体积变化（含回落）都算有进度：剪映长草稿会分段导出，分片转正式文件时总量会掉
+            if cur != last_size:
                 last_size, last_growth = cur, now
+                if cur > 0:
+                    saw_bytes = True
             else:
                 adopted = _adopt_growing_mp4(output_dir, safe_name, start_time - 5,
                                              current=real_export_file)
@@ -850,10 +857,13 @@ class Exporter:
                         real_export_file = adopted
                         _TASK["real_file"] = adopted
                         last_size, last_growth = adopted_size, now
+                        saw_bytes = True
             # 首字节宽限：无预期时长时 420s；有时按 60% 时长动态（420~1800s）。
-            # 已开始写盘后 180s 无增长才判卡死
+            # 已开始写盘后 180s 无增长才判卡死；曾写过分片又归零（合并/改名中）给 600s
             if last_size > 0:
                 stall_limit = 180
+            elif saw_bytes:
+                stall_limit = 600
             elif expected_duration:
                 stall_limit = max(420, min(1800, int(expected_duration * 0.6)))
             else:
@@ -1239,11 +1249,40 @@ def _temp_export_dirs(output_dir, *extra_roots):
     return dirs
 
 
+# 剪映导出中的临时产物名：UUID.mp4，编码完成才改名为正式文件
+_UUID_MP4_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4$", re.I)
+
+
+def _parent_temp_mp4s(output_dir):
+    """导出根目录（output_dir 的父级）下属于本剧的 mp4：
+    剪映在导出根目录先写 UUID.mp4 临时文件，完成后再改名为 <剧名>.mp4。
+    目标目录是 <export_dir>/<剧名> 时，这些文件落在父级，必须单独盯，
+    否则看门狗统计不到进度会误判卡死并把正常导出 kill 掉。"""
+    out = os.path.abspath(output_dir)
+    parent = os.path.dirname(out)
+    if not parent or not os.path.isdir(parent):
+        return []
+    out_base = os.path.basename(out)
+    res = []
+    try:
+        for name in os.listdir(parent):
+            p = os.path.join(parent, name)
+            if not os.path.isfile(p) or not name.lower().endswith(".mp4"):
+                continue
+            if _UUID_MP4_RE.match(name) or os.path.splitext(name)[0] == out_base:
+                res.append(p)
+    except OSError:
+        pass
+    return res
+
+
 def _watchdog_size(real_export_file, output_dir, safe_name):
     """看门狗读取的总体积：只统计剪映真正在写盘的地方——
-    UI 路径文件 + 同目录下同名/去重 mp4 + 该目录与其父目录下的临时分片目录。
-    ⚠️ 不能把 output_dir 整个递归算进去：那是本仓库代码目录（pylibs 恒定 253MB），
-    体积永远不变，会立刻被判成“卡死”。"""
+    UI 路径文件 + 同目录下同名/去重 mp4 + 该目录与其父目录下的临时分片目录，
+    以及剪映去重兄弟目录、导出根目录下本剧的临时/成品 mp4。任一处在长即视为有进度。
+    ⚠️ 已知真实导出文件时不能把 output_dir 整个递归算进去：那是本仓库代码目录
+    （pylibs 恒定 253MB），体积永远不变，会立刻被判成“卡死”。"""
     out = os.path.abspath(output_dir)
     targets = []
     if real_export_file:
@@ -1263,6 +1302,9 @@ def _watchdog_size(real_export_file, output_dir, safe_name):
         targets.extend(_temp_export_dirs(out))
     else:
         targets.append(out)
+    targets.extend(_sibling_bundle_dirs(out, safe_name)[1:])
+    targets.extend(d for d in _temp_export_dirs(out) if os.path.abspath(d) != out)
+    targets.extend(_parent_temp_mp4s(out))
     seen, total = set(), 0
     for p in targets:
         ap = os.path.abspath(p)
@@ -1274,27 +1316,29 @@ def _watchdog_size(real_export_file, output_dir, safe_name):
 
 
 def _adopt_growing_mp4(output_dir, safe_name, min_mtime, current=None):
-    """UI ExportPath 失效时接管真实产物：在输出目录、去重兄弟目录与导出临时目录里
-    找本次新生成的 mp4，取最大者。"""
+    """UI ExportPath 失效时接管真实产物：在输出目录、去重兄弟目录、导出临时目录
+    以及导出根目录（含剪映的 UUID 临时文件）里找本次新生成的 mp4，取最大者。"""
     best, best_size = None, 0
+    candidates = []
     for d in _sibling_bundle_dirs(output_dir, safe_name) + _temp_export_dirs(output_dir):
         if not os.path.isdir(d):
             continue
         for root, _subdirs, files in os.walk(d):
             for name in files:
-                if not name.lower().endswith(".mp4"):
-                    continue
-                p = os.path.join(root, name)
-                if current and os.path.abspath(p) == os.path.abspath(current):
-                    continue
-                if _mtime(p) < min_mtime:
-                    continue
-                try:
-                    size = os.path.getsize(p)
-                except OSError:
-                    continue
-                if size > best_size:
-                    best, best_size = p, size
+                if name.lower().endswith(".mp4"):
+                    candidates.append(os.path.join(root, name))
+    candidates.extend(_parent_temp_mp4s(output_dir))
+    for p in candidates:
+        if current and os.path.abspath(p) == os.path.abspath(current):
+            continue
+        if _mtime(p) < min_mtime:
+            continue
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            continue
+        if size > best_size:
+            best, best_size = p, size
     return best
 
 
