@@ -251,6 +251,22 @@ if ($LASTEXITCODE -ne 0) { throw "requirements.txt 安装失败" }
 Ok "requirements.txt 安装完成"
 
 # ============================================================
+Step 4b $TOTAL "UI 自动化 OCR 依赖 → pipeline_ui\pylibs（仓库内自包含，不装全局）"
+# ============================================================
+# admission_test / ui_pipeline 经 ocr_locate 导入 rapidocr_onnxruntime。
+# 按约定用 --target 装到 pipeline_ui\pylibs（.gitignore 已排除），不污染全局 site-packages。
+# numpy/opencv/pillow 按 requirements.txt 的硬约束版本同步定版。
+$uiPylibs = Join-Path $PSScriptRoot "..\pipeline_ui\pylibs"
+New-Item -ItemType Directory -Force -Path $uiPylibs | Out-Null
+& $Py @PyPre -m pip install --target $uiPylibs `
+    "rapidocr_onnxruntime==1.4.4" "numpy==2.2.4" "opencv-python==4.11.0.86" "pillow==13.0.0" @pipIdx
+if ($LASTEXITCODE -ne 0) { throw "pipeline_ui\pylibs OCR 依赖安装失败" }
+$ocrOut = & $Py @PyPre -c "import sys; sys.path.insert(0, r'$uiPylibs'); import rapidocr_onnxruntime; print('OCROK')" 2>&1
+if ($ocrOut -notmatch "OCROK") { throw "pylibs 内 rapidocr_onnxruntime 导入失败: $ocrOut" }
+Ok "rapidocr_onnxruntime 1.4.4 已装入 pipeline_ui\pylibs"
+$summary += "UI OCR: rapidocr_onnxruntime 1.4.4 -> pipeline_ui\pylibs"
+
+# ============================================================
 Step 5 $TOTAL "funasr-onnx 元数据补丁（numpy pin 过时会引发 pip 纠正性降级）"
 # ============================================================
 # 必须用 Python 以 utf-8 读写，禁止 PowerShell 重写 METADATA（BOM 会被破坏导致 pip show 崩溃）
