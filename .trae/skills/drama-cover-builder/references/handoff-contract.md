@@ -125,6 +125,7 @@ D:\短剧\<剧名>\
 | 版本名字符集 | `[a-z][a-z0-9]{0,7}`：小写字母开头，后接 0—7 位小写字母/数字（`b`、`c`、`d`、`b2`）；大写、下划线、中文一律非法 |
 | 成品名 | 与草稿同名；扩展版成品即 `<基础草稿>_<版本>.mp4` |
 | 成品 → 版本反查 | 先剥掉同版本重跑序号 `.v<n>`，再看 `_<版本>` 后缀；无该后缀即基础版 `a` |
+| 版本封面 | 各版草稿 `draft_cover.jpg` 必须取本组竖版图（基础版 `04_covers/cover_04_vertical.*`，扩展版 `04_covers/<组>/cover_04_vertical_<组>.*`），克隆/重建统一经 `job_manifest.resolve_profile_cover` 解析；缺失只告警不回落到 A，详见 §4「版本封面绑定」 |
 
 **配置声明**：`job.json` 的 `workflow.preset_profile`（或顶层 `preset_profile`）支持 `"a,b"` / `"a，b"` / `["a","b"]` / `"presets_a,presets_b"`，可声明 3 个以上版本（A/B/C…）。解析优先级：`workflow.preset_profile` > `job.preset_profile` > 全局 `watch.preset_profile` > 反推。
 

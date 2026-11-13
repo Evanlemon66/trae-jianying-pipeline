@@ -84,6 +84,7 @@ Read the individual rule files for specific tasks and constraints:
 - 基础版草稿/成品**不加后缀**（不写 `_a`），台账版本名记 `a`；扩展版 `<基础草稿>_<版本>`，版本名 `[a-z][a-z0-9]{0,7}`（`b`/`c`/`b2`），**一版一后缀**。
 - 同版本重跑：草稿重建后写 `_export_stale.json`，重导**不覆盖**旧成品，而把旧成品改名保留三件套 `<成品>.v<n>.mp4`、`<成品>.v<n>-封面.jpg`、`<成品>.v<n>.mp4.progress.json`；任一改名失败整组回滚并硬失败。从成品名反查版本：先剥 `.v<n>`，再看 `_<版本>` 后缀。
 - 各版本成品与状态记 `job.json.video.outputs.<版本>`（`{draft, export_dir, export_file, size_bytes, state, exported_at, history[]}`），每个版本独立判断「导过就不再导」；顶层 `video.export_file/export_dir/draft_name` 只是基础版聚合。命名细则见 `drama-cover-builder/references/handoff-contract.md` §2.1。
+- **版本封面**：`draft_cover.jpg` 是草稿目录级文件，克隆会共享；每个版本草稿必须写入本组竖版图（基础版 `04_covers/cover_04_vertical.*`，扩展版 `04_covers/<组>/cover_04_vertical_<组>.*`），由 `job_manifest.resolve_profile_cover` 解析。克隆/重建入口没写封面＝缺陷，B/C 版不得沿用 A 版封面。
 
 - `job.json.stage=archived` 是合法 stage，含义是「该剧已归档、不再参与调度」；由归档脚本写入，watcher 的触发判定对它**硬拦**，`--phase` / `--once` / `--job` 都绕不过去（硬拦发生在阶段/单剧过滤之前）。
 - 准入（默认需同时满足，`--force` 可跳过）：① `publish.status=published` 或 `video.export_state=cleaned`；② **所有声明版本都已完成**——`video.outputs` 里每个版本的 `state` ∈ `exported` / `cleaned`，任一版本未导出则跳过归档。首次归档时 `.watcher.lock` 的 pid 存活（活锁）或 `.export_state.json` `status=exporting` 会拒绝（续做只校验位置与目标）。

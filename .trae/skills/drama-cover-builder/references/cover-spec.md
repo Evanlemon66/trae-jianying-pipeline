@@ -45,6 +45,7 @@
   5. 天地比例：主角与财宝占画面约 2/3，天留约 1/3。
 - 禁止为制造差异新增剧情事实；受伤血迹、武器、小孩、文字元素始终按第一节硬约束剔除。
 - **落盘与登记**：A 组用基础契约名；B 组落 `04_covers/b_group/cover_01_hit_B.png` / `cover_02_contrast_B.png` / `cover_03_guard_B.png` / `cover_04_vertical_B.png`。manifest 记 `group`、`variant_of` 与源图 sha256；文件名容错与账号组识别见 `handoff-contract.md` §4 末条。
+- **版本封面绑定（硬约束）**：每组竖版图就是该版本草稿的封面——A 版取 `04_covers/cover_04_vertical.*`，B/C 版取各自 `04_covers/<组>/cover_04_vertical_<组>.*`。克隆/重建草稿时必须同步写入 `cover` composition 与 `draft_cover.jpg`（`job_manifest.resolve_profile_cover` 统一解析），**B/C 组缺竖版图就报错/告警，绝不回落到 A 的封面**。
 
 ## 三、身份锚点与技术流程
 
