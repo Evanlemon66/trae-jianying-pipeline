@@ -402,3 +402,82 @@ def test_pending_account_outputs_reads_job_profiles_only(tmp_path, monkeypatch):
     assert cw._pending_account_outputs({"workflow": {}}, job_dir) == []
     assert cw._pending_account_outputs(
         {"workflow": {"preset_profile": "a,b"}}, job_dir) == ["剧_串流_b"]
+
+
+def test_existing_clone_profiles_detects_clone_drafts(tmp_path, monkeypatch):
+    """草稿目录里的 `<基础>_<版本>` 克隆就是待补版本；非目录/非法版本名忽略。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import cover_watch as cw
+    monkeypatch.setattr(cw, "_draft_root", lambda: str(tmp_path))
+    (tmp_path / "剧_串流").mkdir()
+    (tmp_path / "剧_串流_b").mkdir()
+    (tmp_path / "剧_串流_c1").mkdir()
+    (tmp_path / "剧_串流_BAD").mkdir()
+    (tmp_path / "剧_串流_x.tmp").write_text("x", encoding="utf-8")
+    (tmp_path / "剧_串流_b2_backup").mkdir()
+    assert cw._existing_clone_profiles("剧_串流") == ["b", "c1"]
+
+
+def test_pending_account_outputs_uses_existing_clone_draft(tmp_path, monkeypatch):
+    """job 没声明多版本但 `_b` 草稿已建好：必须算 pending，否则补不了导出。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import cover_watch as cw
+    monkeypatch.setattr(cw, "_draft_root", lambda: str(tmp_path))
+    monkeypatch.setattr(cw, "_available_preset_profiles", lambda: [])
+    (tmp_path / "剧_串流").mkdir()
+    job_dir = str(tmp_path / "剧" / "cover_job")
+    # 没有克隆草稿：单账号旧任务，不能被判成 pending（否则会触发自动克隆）
+    assert cw._pending_account_outputs({"workflow": {}}, job_dir) == []
+    (tmp_path / "剧_串流_b").mkdir()
+    monkeypatch.setattr(cw, "_draft_exported", lambda n: False)
+    assert cw._pending_account_outputs({"workflow": {}}, job_dir) == ["剧_串流_b"]
+    # 克隆已导出：不再是待补版本
+    monkeypatch.setattr(cw, "_draft_exported", lambda n: True)
+    assert cw._pending_account_outputs({"workflow": {}}, job_dir) == []
+
+
+def test_check_trigger_passes_with_existing_clone_draft(tmp_path, monkeypatch):
+    """端到端：video_ready + 已导出 + 存在未导出的 `_b` 克隆草稿 → 放行。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import cover_watch as cw
+    monkeypatch.setattr(cw, "_draft_root", lambda: str(tmp_path))
+    monkeypatch.setattr(cw, "_available_preset_profiles", lambda: [])
+    monkeypatch.setattr(cw, "_draft_exported", lambda n: False)
+    (tmp_path / "剧_串流").mkdir()
+    (tmp_path / "剧_串流_b").mkdir()
+    jd = tmp_path / "剧" / "cover_job"
+    (jd / "03_prompts").mkdir(parents=True)
+    (jd / "03_prompts" / "prompts.json").write_text("{}", encoding="utf-8")
+    (jd / "job.json").write_text("{}", encoding="utf-8")
+    job = {"stage": "video_ready", "titles": {"gate": "done"},
+           "video": {"status": "done", "export_state": "exported"}}
+    monkeypatch.setattr(cw.jm, "detect_cover_files",
+                        lambda d, apply=False: ({1, 2, 3, "vertical"}, {}))
+    monkeypatch.setattr(cw.jm, "account_cover_errors", lambda d: [])
+    monkeypatch.setattr(cw.jm, "load_job", lambda p: job)
+    ok, reasons = cw.check_trigger(str(jd))
+    assert ok is True, reasons
+
+
+def test_build_plan_exports_existing_clone_when_base_done(tmp_path, monkeypatch):
+    """八零猎王场景：A 已导出、`_b` 已建但未导 → 计划只补导 `_b`。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import cover_watch as cw
+    monkeypatch.setattr(cw, "_draft_root", lambda: str(tmp_path))
+    monkeypatch.setattr(cw, "_available_preset_profiles", lambda: [])
+    monkeypatch.setattr(cw, "_effective_cut", lambda *a, **k: None)
+    monkeypatch.setattr(cw, "_migrate_ctx", lambda job: {})
+    monkeypatch.setattr(cw, "_progress_info", lambda p: (0.0, None, None))
+    monkeypatch.setattr(cw, "retry_gate", lambda *a, **k: None)
+    monkeypatch.setattr(cw, "_draft_exported", lambda n: n == "剧_串流")
+    (tmp_path / "剧_串流").mkdir()
+    (tmp_path / "剧_串流_b").mkdir()
+    jd = tmp_path / "剧" / "cover_job"
+    jd.mkdir(parents=True)
+    job = {"stage": "video_ready", "titles": {"gate": "done"},
+           "video": {"status": "done", "export_state": "exported"}}
+    plan = cw.build_plan(str(jd), job, {"export_policy": "immediate"}, pending_edit=0,
+                         notify=False, write_log=False)
+    assert plan["action"] == "export", plan
+    assert plan["profiles"] == ["a", "b"]
+    assert plan["export_targets"] == ["剧_串流_b"]

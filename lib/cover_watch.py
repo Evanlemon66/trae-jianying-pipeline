@@ -621,6 +621,38 @@ def _profile_of_draft(base_draft: str, draft_name: str) -> str:
     return draft_name[len(prefix):] if draft_name.startswith(prefix) else "a"
 
 
+def _existing_clone_profiles(base_draft: str) -> list[str]:
+    """草稿根目录下已存在的附加账号克隆草稿（`<基础>_<版本>`）→ 版本名列表。
+
+    A 版封面常直接放 04_covers 根目录（没有 `a_group`），只靠封面目录反推会漏掉
+    a，整部剧被判成单账号，已建好的 `_b` 草稿永远补不了导出。克隆草稿本身是
+    「要补哪个版本」最可靠的证据，因此以它为准。
+    """
+    try:
+        names = os.listdir(_draft_root())
+    except OSError:
+        return []
+    prefix = base_draft + "_"
+    out = set()
+    for n in names:
+        if not n.startswith(prefix) or not os.path.isdir(os.path.join(_draft_root(), n)):
+            continue
+        prof = n[len(prefix):]
+        if re.fullmatch(r"[a-z][a-z0-9]{0,7}", prof):
+            out.add(prof)
+    return sorted(out)
+
+
+def _with_existing_clones(profiles: list[str], base_draft: str) -> list[str]:
+    """未显式声明多版本时，用已存在的克隆草稿补全版本集合（基础草稿恒为 a）。"""
+    if len(profiles) >= 2:
+        return profiles
+    clones = _existing_clone_profiles(base_draft)
+    if not clones:
+        return profiles
+    return ["a"] + sorted((set(profiles) | set(clones)) - {"a"})
+
+
 def _missing_account_drafts(base_draft: str, profiles: list[str]) -> list[str]:
     """多账号预设里尚未生成的克隆草稿（基础草稿不在此列）。"""
     return [d for d in (_account_draft_name(base_draft, p) for p in profiles[1:])
@@ -639,7 +671,9 @@ def _job_profiles(job: dict[str, Any], job_dir: Optional[str] = None) -> list[st
 
     用途：判断「已 done 的任务是否还有账号成品没导」。若把全局 watch.preset_profile
     也算进来，改一次全局配置就会让所有历史 done 任务补克隆+重导，属于批量误操作。
-    未显式声明时按 job 自己的 prompts/covers 账号组反推（仍不读全局配置）。
+    未显式声明时按 job 自己的 prompts/covers 账号组反推（仍不读全局配置）；
+    反推不足 2 组时再看草稿目录里已存在的克隆草稿（`_b` 已建好但 A 版封面
+    放在 04_covers 根目录的旧任务，靠封面目录反推永远凑不齐 2 组）。
     """
     wf = job.get("workflow") or {}
     profiles = pc.parse_preset_profiles(
@@ -648,6 +682,11 @@ def _job_profiles(job: dict[str, Any], job_dir: Optional[str] = None) -> list[st
         inferred = _profiles_from_job_outputs(job_dir)
         if inferred:
             profiles = inferred
+        name = os.path.basename(os.path.dirname(job_dir.rstrip("\\/")))
+        draft = find_stream_draft(name)
+        if draft:
+            profiles = _with_existing_clones(
+                profiles, os.path.basename(draft.rstrip("\\/")))
     return profiles
 
 
@@ -940,11 +979,14 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
     draft = find_stream_draft(name)
     # 预设组（多账号）：job.json workflow.preset_profile / 顶层 preset_profile > 全局 watch.preset_profile
     # 支持单组 "presets_a" 或多组 "presets_a,presets_b" / ["a","b"]；
-    # 三处都没写时，从 prompts/covers 的账号组（A/B…）反推（少于 2 组不推导）。
+    # 三处都没写时，从 prompts/covers 的账号组（A/B…）反推（少于 2 组不推导）；
+    # 反推仍不足 2 组时，以草稿目录里已存在的克隆草稿为准（见 _with_existing_clones）。
     profiles = pc.parse_preset_profiles(
         wf.get("preset_profile") or job.get("preset_profile") or cfg.get("preset_profile"))
     if not profiles:
         profiles = _profiles_from_job_outputs(job_dir)
+    if draft:
+        profiles = _with_existing_clones(profiles, os.path.basename(draft.rstrip("\\/")))
     policy = str(cfg.get("export_policy", "immediate")).strip().lower()
     if policy not in EXPORT_POLICIES:
         policy = "immediate"
