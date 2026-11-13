@@ -120,16 +120,28 @@ HEARTBEAT_NAME = "watcher_heartbeat.json"
 HEARTBEAT_INTERVAL_S = 30.0
 # 心跳超过 3 个周期未刷新 → 认为 watcher 已不在运行（放行语义按「没跑」处理）
 HEARTBEAT_STALE_S = HEARTBEAT_INTERVAL_S * 3
-# 人工放行前比对代码指纹的关键模块（只覆盖调度/执行链，避免无关文件误报）
+# 人工放行前比对代码指纹的关键模块 = watcher 实际执行/拉起的代码（只覆盖调度/执行链，
+# 避免无关文件误报）。导出链路上的模块也算：这些文件改了却不重启 watcher，
+# --phase 放行后跑的仍是旧代码，所以必须一并纳入。
 CODE_FINGERPRINT_FILES = (
     "lib/cover_watch.py",
     "lib/job_manifest.py",
     "lib/edit_state.py",
     "lib/export_state.py",
     "lib/failure_class.py",
+    "lib/export_lock.py",        # 导出互斥锁/活锁判定
+    "lib/state_io.py",           # 状态文件原子写（export_state/edit_state 共用）
+    "lib/subtitle_guard.py",     # 导出前置的缺字幕通知
     "pipeline/batch_runner.py",
     "pipeline/pipeline.py",
     "pipeline/preset_ops.py",
+    "pipeline/series_runner.py",  # 导出编排：preclean/子进程/超时/归拢
+    "pipeline/export_config.py",  # 导出落点与导出根目录解析（presets.json）
+    "pipeline/no_window.py",      # 导出子进程 creationflags/env
+    "pipeline/verify_export.py",  # 导出后质检（watcher 以子进程调用）
+    # 真正执行导出的外部脚本（series_runner 以子进程拉起）
+    ".trae/skills/jianying-editor/examples/robust_auto_export.py",
+    ".trae/skills/jianying-editor/examples/jy_instance.py",
 )
 
 
