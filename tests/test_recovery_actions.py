@@ -48,10 +48,22 @@ class FakeMgr:
 
 
 class FakeExporter:
-    def __init__(self):
+    def __init__(self, kind="edit"):
         self.switch_calls = 0
         self.dismiss_calls = 0
         self._manager = None
+        self.kind = kind          # home / edit / other / raise（探测异常）
+
+    def _probe(self, want):
+        if self.kind == "raise":
+            raise RuntimeError("UIA 探测失败")
+        return self.kind == want
+
+    def is_home_page(self):
+        return self._probe("home")
+
+    def is_edit_page(self):
+        return self._probe("edit")
 
     def switch_to_home(self):
         self.switch_calls += 1
@@ -72,13 +84,37 @@ check("未走软关 switch_to_home", fe.switch_calls == 0, fe.switch_calls)
 check("未关弹窗", fe.dismiss_calls == 0)
 check("_TASK.recovery_action=kill_restart", rae._TASK["recovery_action"] == "kill_restart")
 
-print("\n== restart（ui_hang）→ 软关优先，不杀进程 ==")
-fm2, fe2 = FakeMgr(), FakeExporter()
+print("\n== restart（ui_hang）→ 在编辑页才软关，不杀进程 ==")
+fm2, fe2 = FakeMgr(), FakeExporter(kind="edit")
 rae._get_manager = lambda ex: fm2
 ret = rae._do_recovery("restart", exporter=fe2)
 check("返回 soft_home", ret == "soft_home", ret)
 check("走了软关 switch_to_home", fe2.switch_calls == 1, fe2.switch_calls)
 check("未走管理器 kill", fm2.restart_calls == 0, fm2.restart_calls)
+
+print("\n== restart：窗口类=other（启动画面/弹窗）→ 不盲目软关，直接强杀 ==")
+fm2b, fe2b = FakeMgr(), FakeExporter(kind="other")
+rae._get_manager = lambda ex: fm2b
+ret = rae._do_recovery("restart", exporter=fe2b)
+check("返回 kill_restart", ret == "kill_restart", ret)
+check("未盲目软关", fe2b.switch_calls == 0, fe2b.switch_calls)
+check("走了管理器 restart", fm2b.restart_calls == 1, fm2b.restart_calls)
+
+print("\n== restart：已在首页 → 什么都不做（skip）==")
+fm2c, fe2c = FakeMgr(), FakeExporter(kind="home")
+rae._get_manager = lambda ex: fm2c
+ret = rae._do_recovery("restart", exporter=fe2c)
+check("返回 none", ret == "none", ret)
+check("未软关", fe2c.switch_calls == 0, fe2c.switch_calls)
+check("未强杀", fm2c.restart_calls == 0, fm2c.restart_calls)
+
+print("\n== restart：窗口探测抛异常 → 按无法判定，直接强杀 ==")
+fm2d, fe2d = FakeMgr(), FakeExporter(kind="raise")
+rae._get_manager = lambda ex: fm2d
+ret = rae._do_recovery("restart", exporter=fe2d)
+check("返回 kill_restart", ret == "kill_restart", ret)
+check("探测异常不软关", fe2d.switch_calls == 0, fe2d.switch_calls)
+check("走了管理器 restart", fm2d.restart_calls == 1, fm2d.restart_calls)
 
 print("\n== dismiss_retry：弹窗关掉且就绪 → 只软回（dismiss）==")
 fm3, fe3 = FakeMgr(ready=True), FakeExporter()
@@ -113,7 +149,7 @@ rae._get_manager = lambda ex: fm4
 rae._do_recovery(a, exporter=fe4)  # export_timeout 的动作
 check("export_timeout 重试必走 kill 分支", fm4.restart_calls == 1 and fe4.switch_calls == 0)
 
-fe5, fm5 = FakeExporter(), FakeMgr()
+fe5, fm5 = FakeExporter(kind="edit"), FakeMgr()
 rae._get_manager = lambda ex: fm5
 rae._do_recovery(a2, exporter=fe5)  # ui_hang 的动作
 check("ui_hang 重试仍软关优先", fe5.switch_calls == 1 and fm5.restart_calls == 0)

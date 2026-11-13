@@ -62,6 +62,13 @@ check("未找到草稿 = asset_missing（非 ui_hang）",
 check("打开草稿超时 = ui_hang（非 export_timeout）",
       fc.classify("打开草稿超时，未能进入编辑界面。")[0] == fc.UI_HANG)
 check("磁盘不足优先于其它", fc.classify("磁盘空间不足，未找到草稿")[0] == fc.DISK_FULL)
+check("Find Control Timeout = ui_hang（非 unknown）",
+      fc.classify("Find Control Timeout(10s): {Name: '剪映专业版', ControlType: WindowControl}")[0]
+      == fc.UI_HANG)
+check("UIA COMError = ui_hang（非 unknown）",
+      fc.classify("COMError: (0x80004005, '未指定的错误')")[0] == fc.UI_HANG)
+check("英文 Timeout 不误落 export_timeout",
+      fc.classify("uiautomation Timeout waiting for window")[0] == fc.UI_HANG)
 
 print("\n== ④ 策略表：可重试性 / 计数 ==")
 check("asset_missing 不可重试", not fc.is_retryable(fc.ASSET_MISSING))

@@ -1423,6 +1423,31 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     return True
 
 
+def _run_verify(script: str, draft_name: str, mp4_path: str, job_dir: str) -> tuple[int, str]:
+    """调用导出后质检脚本，返回 (rc, 明细日志路径)。
+
+    watcher 由 pythonw 托管、没有控制台：子进程若继承空 stdout，
+    verify_export.py 里的 sys.stdout.reconfigure / print 会直接抛异常，
+    导致质检恒 rc=1 且没有任何明细。这里把子进程 stdout/stderr 显式落到
+    06_publish/verify.log，既是真实质检结论，也保留可回溯的明细。
+    """
+    log_dir = os.path.join(job_dir, "06_publish")
+    log_path = os.path.join(log_dir, "verify.log")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8", errors="replace") as logf:
+            logf.write(f"\n===== {jm.now_iso()} {draft_name} =====\n")
+            logf.flush()
+            rc = subprocess.call([sys.executable, script, draft_name, mp4_path],
+                                 cwd=os.path.dirname(script),
+                                 stdout=logf, stderr=subprocess.STDOUT,
+                                 creationflags=NO_WINDOW)
+        return rc, log_path
+    except OSError as e:
+        _log(job_dir, f"verify 启动失败: {e}")
+        return 2, log_path
+
+
 def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
                *, dry_run: bool, verify: bool = True, no_derive: bool = False) -> bool:
     """export 阶段：reap(崩溃回收) → begin(exporting) → 导出 → verify → record-video
@@ -1512,10 +1537,8 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     verify_script = os.path.join(_REPO, "pipeline", "verify_export.py")
     if verify and os.path.isfile(verify_script):
         _log(job_dir, "verify start")
-        rc = subprocess.call([sys.executable, verify_script, draft_name, out_mp4],
-                             cwd=os.path.dirname(verify_script),
-                             creationflags=NO_WINDOW)
-        _log(job_dir, f"verify rc={rc}")
+        rc, vlog = _run_verify(verify_script, draft_name, out_mp4, job_dir)
+        _log(job_dir, f"verify rc={rc}（明细 {vlog}）")
         if rc != 0:
             toast("⚠️ 导出完成但质检未通过", name, icon="warning")
     try:

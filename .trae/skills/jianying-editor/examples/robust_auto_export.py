@@ -413,7 +413,7 @@ def _poll_with_timeout(fn, timeout):
     return True, result["value"]
 
 
-def _cold_start_jianying(exporter, wait_home=90):
+def _cold_start_jianying(exporter, wait_home=jy_instance.HOME_READY_TIMEOUT_S):
     """冷启动剪映（第 2 项：薄封装转调实例管理器 restart，唯一 kill 入口）。
 
     每部剧导出前执行，避开"上一部刚导完 / 进程刚拉起"时窗口存在但 UI 未就绪
@@ -598,7 +598,9 @@ class Exporter:
             dprint("已在首页.")
             return
         try:
-            ok = _get_manager(self).go_home(timeout=60, allow_restart=True)
+            ok = _get_manager(self).go_home(
+                timeout=jy_instance.SOFT_HOME_TIMEOUT_S, allow_restart=True,
+                restart_timeout=jy_instance.HOME_READY_TIMEOUT_S)
         except jy_instance.JyInstanceError as e:
             raise Exception(f"重启后仍未回到首页：{e}")
         _rebind_from_manager(self)
@@ -643,8 +645,10 @@ class Exporter:
             return None, ""
 
         find_start = time.time()
+        find_s, editor_s = _open_draft_timeouts(draft_name)
+        dprint(f"打开草稿墙钟：找卡片 {find_s:.0f}s / 等编辑页 {editor_s:.0f}s")
         attempt = 0
-        while time.time() - find_start < 40:
+        while time.time() - find_start < find_s:
             attempt += 1
             ok, found = _poll_with_timeout(_find_card, timeout=10)
             if ok and found and found[0] is not None:
@@ -677,7 +681,7 @@ class Exporter:
         # 等待加载编辑页（墙钟 60s 上限；每次 UIA 探测另有 8s 超时，避免假死时无限挂起）
         dprint("正在加载编辑器 (可能需要较长时间)...")
         load_start = time.time()
-        while time.time() - load_start < 60:
+        while time.time() - load_start < editor_s:
             time.sleep(1)
             def _poll_edit_page():
                 self.connect(retry=False)
@@ -1013,6 +1017,67 @@ def _is_uia_com_error(e: BaseException) -> bool:
     return type(e).__name__ == "COMError"
 _EST_BYTES_PER_SEC = 1.05 * 1024 * 1024  # 1080P 导出码率经验估值（字节/秒）
 
+# ── 打开草稿墙钟（第 3 条稳定性修复）─────────────────────────────
+# 旧实现写死 40s 找卡片 + 60s 等编辑页（合计 100s）；84~183 集的大草稿在冷盘上
+# 常超过 100s，首轮因此必然"打开草稿超时"。改为：基础 120s（40 找卡片 + 80 等编辑页），
+# 90 集之后每集 +0.5s，上限 240s；基础值可用 presets.json 的 watch.draft_open_timeout_s 覆盖。
+_OPEN_DRAFT_BASE_S = 120.0
+_OPEN_DRAFT_PER_EP_S = 0.5
+_OPEN_DRAFT_MAX_S = 240.0
+_OPEN_DRAFT_FIND_S = 40.0   # 首页找草稿卡片的墙钟（不超过总预算一半）
+
+
+def _draft_episodes(draft_name):
+    """从草稿名解析集数（第01-146集串流 → 146；第50集 → 50）；解析不了返回 0。"""
+    name = str(draft_name or "")
+    m = re.search(r"第\s*\d+\s*[-–—~]\s*(\d+)\s*集", name) or re.search(r"第\s*(\d+)\s*集", name)
+    try:
+        return int(m.group(1)) if m else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _open_draft_timeouts(draft_name, config=None):
+    """返回 (找卡片秒, 等编辑页秒)。
+
+    config: 可注入 {"draft_open_timeout_s": 秒} 便于测试；None 时读 presets watch 段。
+    默认基础 120s（找卡片 40s + 等编辑页 80s）；集数 >90 时每集 +0.5s，总预算封顶 240s。
+    """
+    base = _OPEN_DRAFT_BASE_S
+    cfg = config
+    if cfg is None:
+        try:
+            import export_config as _pc
+            cfg = _pc.get_watch_config()
+        except Exception:
+            cfg = {}
+    try:
+        v = (cfg or {}).get("draft_open_timeout_s")
+        if v:
+            base = max(30.0, float(v))
+    except (TypeError, ValueError):
+        pass
+    eps = _draft_episodes(draft_name)
+    total = min(_OPEN_DRAFT_MAX_S, base + _OPEN_DRAFT_PER_EP_S * max(0, eps - 90))
+    find_s = min(_OPEN_DRAFT_FIND_S, total * 0.5)
+    return find_s, total - find_s
+
+
+def _window_kind(exporter):
+    """当前剪映窗口类：home / edit / other / none（探测异常按 none）。
+
+    第 2 条稳定性修复：自愈前先判窗口类，避免对"启动画面/弹窗/未就绪窗口"
+    盲目软关（soft_home 在非编辑页会点空，反而拖长恢复时间）。
+    """
+    try:
+        if exporter.is_home_page():
+            return "home"
+        if exporter.is_edit_page():
+            return "edit"
+        return "other"
+    except Exception:
+        return "none"
+
 
 def _classify_failure(reason):
     """第 3 项：把错误串 + 当前阶段分类，返回 (类别, 策略 dict)。
@@ -1051,7 +1116,7 @@ def _do_recovery(action, exporter=None):
     try:
         if action == "kill_retry":
             dprint("自愈动作：kill_restart（强制杀进程 → 拉起 → 等首页）")
-            _get_manager(exporter).restart(90)
+            _get_manager(exporter).restart(jy_instance.HOME_READY_TIMEOUT_S)
             _rebind_from_manager(exporter)
             executed = "kill_restart"
         elif action == "dismiss_retry":
@@ -1068,13 +1133,24 @@ def _do_recovery(action, exporter=None):
                 executed = "dismiss"
             else:
                 dprint("⚠️ 关闭弹窗后仍未就绪，当轮升级强杀重启（dismiss_then_kill）")
-                mgr.restart(90)
+                mgr.restart(jy_instance.HOME_READY_TIMEOUT_S)
                 _rebind_from_manager(exporter)
                 executed = "dismiss_then_kill"
         else:
-            # restart / unknown：软关优先，失败才重启兜底
-            exporter.switch_to_home()
-            executed = "soft_home"
+            # restart / unknown：先判窗口类，再决定软关还是强杀（第 2 条稳定性修复）
+            kind = _window_kind(exporter)
+            if kind == "home":
+                dprint("自愈动作：skip（已在首页，无需软关）")
+                executed = "none"
+            elif kind == "edit":
+                dprint("自愈动作：soft_home（当前在编辑页，点关闭按钮回首页）")
+                exporter.switch_to_home()
+                executed = "soft_home"
+            else:
+                dprint(f"自愈动作：kill_restart（窗口类={kind}，非编辑页/首页，跳过盲目软关）")
+                _get_manager(exporter).restart(jy_instance.HOME_READY_TIMEOUT_S)
+                _rebind_from_manager(exporter)
+                executed = "kill_restart"
     except Exception as e2:
         dprint(f"⚠️ 自愈恢复失败（仍将继续重试）: {e2}")
     _TASK["recovery_action"] = executed
@@ -1292,7 +1368,7 @@ def _restart_jianying_to_home(exporter):
     """
     dprint("重启剪映以回到首页（实例管理器）...")
     try:
-        ok = _get_manager(exporter).restart(90)
+        ok = _get_manager(exporter).restart(jy_instance.HOME_READY_TIMEOUT_S)
     except jy_instance.JyInstanceError as e:
         dprint(f"⚠️ 重启失败（不影响导出结果）: {e}")
         return

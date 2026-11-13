@@ -92,9 +92,12 @@ def classify(error: Optional[str], phase: Optional[str] = None) -> tuple[str, st
         return VERSION_DIALOG, STRATEGY[VERSION_DIALOG]["action"]
 
     # 5. UI 假死 / 就绪或打开草稿超时（含启动失败）：可重试，重启
+    #    英文 UIA 报错（"Find Control Timeout(10s): {Name: '剪映专业版'...}"）与
+    #    COMError 都不含中文关键词，旧规则会落 unknown；这里显式归入 ui_hang。
     if _has(e, "打开草稿超时", "未能进入编辑界面", "程序卡死",
             "无法自动启动", "未找到【剪映专业版】", "重启后仍未回到首页",
-            "冷启动失败", "未就绪"):
+            "冷启动失败", "未就绪",
+            "Find Control Timeout", "Timeout", "COMError"):
         return UI_HANG, STRATEGY[UI_HANG]["action"]
 
     # 6. 其余「超时 / 未找到 / 卡死 / 窗口」类（阶段辅助判断）→ UI 假死

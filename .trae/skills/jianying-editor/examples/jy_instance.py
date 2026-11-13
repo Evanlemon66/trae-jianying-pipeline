@@ -58,6 +58,15 @@ def _poll_with_timeout(fn: Callable[[], Any], timeout: float) -> tuple[bool, Any
     return True, result["value"]
 
 
+# ── 就绪墙钟（第 1 条稳定性修复）─────────────────────────────────
+# 大草稿 / 冷盘启动时，剪映进程与窗口常在，但 HomePage 还没渲染出来。
+# 旧默认（launch 60s / restart 90s）会把"窗口存在但页面未就绪"直接判成失败，
+# 于是首轮必挂、靠下一轮重试才成功。这里统一放宽到 180s；wait_ready 本身
+# 会在 deadline 前持续轮询，因此"存在但未就绪"= 继续等待，而不是提前失败。
+HOME_READY_TIMEOUT_S = 180.0
+SOFT_HOME_TIMEOUT_S = 60.0    # 软关编辑页（点关闭按钮）不重启的墙钟上限
+
+
 # ── 后端：把所有真实系统调用收口到这里（可在测试中整体替换）──────────
 
 class Backend:
@@ -253,8 +262,12 @@ class JyInstance:
             self._sleep(1)
         self.state = "stopped"
 
-    def launch(self, timeout: float = 60) -> bool:
-        """stopped → launching → home。返回是否在 timeout 内到达 home。"""
+    def launch(self, timeout: float = HOME_READY_TIMEOUT_S) -> bool:
+        """stopped → launching → home。返回是否在 timeout 内到达 home。
+
+        timeout 默认 180s：冷启动时窗口出现但 HomePage 未渲染完仍算"未就绪"，
+        wait_ready 会一直轮询到 deadline，不再按 60s 提前判失败。
+        """
         exe = self._find_exe() if self._find_exe else None
         if not exe:
             raise JyInstanceError("无法定位剪映安装路径，无法启动（冷启动失败）")
@@ -262,8 +275,8 @@ class JyInstance:
         self.state = "launching"
         return self.wait_ready("home", self._time() + timeout)
 
-    def restart(self, timeout: float = 90) -> bool:
-        """kill → launch → 等 home。返回是否到达 home。"""
+    def restart(self, timeout: float = HOME_READY_TIMEOUT_S) -> bool:
+        """kill → launch → 等 home。返回是否到达 home（默认 180s）。"""
         self._log("实例管理器：重启剪映（唯一 kill 入口）")
         self.kill()
         return self.launch(timeout)
@@ -290,7 +303,7 @@ class JyInstance:
             self.backend.close_edit_to_home()
         return self.wait_ready(state, deadline)
 
-    def ensure(self, state: str, timeout: float = 90) -> bool:
+    def ensure(self, state: str, timeout: float = HOME_READY_TIMEOUT_S) -> bool:
         """把实例带到 state。不达 deadline 就 restart 一次；再失败抛 JyInstanceError。
 
         绝不无限等待；异常消息含「未就绪/冷启动失败」关键词，供第 3 项分类为 ui_hang。
@@ -308,14 +321,19 @@ class JyInstance:
         raise JyInstanceError(
             f"剪映两次尝试均未达到状态 {state}（窗口未就绪/冷启动失败），已重启一次仍失败")
 
-    def go_home(self, timeout: float = 60, allow_restart: bool = True) -> bool:
-        """回首页：软关编辑页优先，失败按 allow_restart 决定是否重启兜底。"""
+    def go_home(self, timeout: float = SOFT_HOME_TIMEOUT_S, allow_restart: bool = True,
+                restart_timeout: float = HOME_READY_TIMEOUT_S) -> bool:
+        """回首页：软关编辑页优先，失败按 allow_restart 决定是否重启兜底。
+
+        restart_timeout 与软关墙钟分开（默认 180s）：旧实现把软关的 60s 直接
+        透传给 restart，导致冷启动根本等不到 HomePage，表现为"重启后仍未回到首页"。
+        """
         if self._reach("home", self._time() + timeout):
             self.backend.rebind_window()
             return True
         if not allow_restart:
             return False
-        ok = self.restart(timeout)
+        ok = self.restart(restart_timeout)
         if ok:
             self.backend.rebind_window()
         return ok

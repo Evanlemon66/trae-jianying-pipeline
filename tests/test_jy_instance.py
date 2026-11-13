@@ -153,5 +153,71 @@ check("软关后回到 home", ok is True and mgr.state == "home", mgr.state)
 check("软关走了关闭按钮", b.close_called == 1)
 check("软关未杀进程", b.kill_count == 0)
 
+print("\n== ⑦ 冷启动墙钟放宽（第 1 条稳定性修复）==")
+import inspect  # noqa: E402
+
+check("launch 默认墙钟 ≥120s",
+      inspect.signature(ji.JyInstance.launch).parameters["timeout"].default >= 120.0,
+      inspect.signature(ji.JyInstance.launch).parameters["timeout"].default)
+check("restart 默认墙钟 ≥120s",
+      inspect.signature(ji.JyInstance.restart).parameters["timeout"].default >= 120.0)
+check("go_home 的 restart_timeout 默认 ≥120s",
+      inspect.signature(ji.JyInstance.go_home).parameters["restart_timeout"].default >= 120.0)
+
+
+class DelayedHomeBackend(FakeBackend):
+    """拉起后 100s 才渲染出 HomePage（窗口一直在，但页面未就绪）。"""
+
+    def __init__(self, clk, delay=100.0, editable=False):
+        super().__init__()
+        self.clk = clk
+        self.delay = delay
+        self.editable = editable
+        self._t0 = None
+
+    def launch(self, exe):
+        super().launch(exe)
+        self.running = True
+        self.window = True
+        self.edit = self.editable
+        self._t0 = self.clk.time()
+
+    def is_home(self):
+        return self._t0 is not None and (self.clk.time() - self._t0) >= self.delay
+
+
+def make_with(backend, clk):
+    return ji.JyInstance(backend=backend, find_exe=lambda: "fake.exe",
+                         time_fn=clk.time, sleep_fn=clk.sleep,
+                         poll_interval=1.0, probe_timeout=2.0,
+                         log=lambda *_a: None)
+
+
+clk7 = FakeClock()
+b7 = DelayedHomeBackend(clk7, delay=100.0)
+mgr7 = make_with(b7, clk7)
+check("首页 100s 才就绪：默认 launch 能等到", mgr7.launch() is True, mgr7.state)
+
+clk7b = FakeClock()
+b7b = DelayedHomeBackend(clk7b, delay=100.0)
+mgr7b = make_with(b7b, clk7b)
+check("同一场景按旧 60s 会失败（对照）", mgr7b.launch(timeout=60) is False)
+
+print("\n== ⑧ go_home：软关无效时，restart 用 180s 而不是软关的 60s ==")
+clk8 = FakeClock()
+b8 = DelayedHomeBackend(clk8, delay=120.0, editable=True)
+
+
+def _soft_close_noop():
+    b8.edit = False          # 软关点空：没回到首页
+    return False
+
+
+b8.close_edit_to_home = _soft_close_noop
+mgr8 = make_with(b8, clk8)
+ok8 = mgr8.go_home()  # 默认 soft 60 + restart 180
+check("软关 60s 后重启，120s 才就绪仍能回到首页", ok8 is True, mgr8.state)
+check("确实走了强杀重启", b8.kill_count == 1, b8.kill_count)
+
 print(f"\n{'='*40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
 sys.exit(1 if fails else 0)
