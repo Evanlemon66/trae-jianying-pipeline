@@ -265,6 +265,7 @@ D:\短剧\<剧名>\
 - 读取侧兼容（`job_manifest._load_titles_payload`，全仓唯一解析入口）：对规范外顶层数组只做保守兜底——数组内每条都是 `{id: <合法编号>}`、长度为 12 的整数倍、且编号不与主集合重叠时才并入候选并打印 `[warn]`；长度不合规跳过并告警，与主集合重叠按重复副本忽略并告警。兜底只为消化存量数据，**写入侧不得再产出规范外容器**。
 - 文件名容错：`04_covers/` 内可用任意文件名（`cover_01_hit` / `封面图1` / `T2 封面` / `竖版` …），`ingest` 按「竖版宽高比/名称提示优先，横版按文件名编号 1/2/3，否则自然顺序」识别并**改名到契约名**，改名记录写入 `history` 与 `report.renamed`。
 - **多账号封面（可选扩展）**：基础 4 张（契约名）始终保留；某个账号需要自己的封面时，用后缀式 `cover_01_hit_<账号>.png` / `cover_04_vertical_<账号>.png`，或目录式 `04_covers/<账号>/cover_01_hit.png`。目录名带 `_group` / `-group` / `组` 会归一（`b_group` → `b`），目录内文件再带 `_B` 后缀也可识别（线上实际形态 `04_covers/b_group/cover_01_hit_B.png`）。账号图**不参与**基础契约识别与改名（避免 8/12 张互相覆盖）。门禁只要求「基础 4 张齐全」（数量可 >4），且每个出现过的账号 4 张齐全；完全没配的账号继续复用基础封面。
+- **版本封面绑定（硬约束）**：每个版本草稿的封面必须取该账号组的竖版图——A 版 = `job.vertical_cover`（`04_covers/cover_04_vertical.*`），B/C 版 = `04_covers/<账号>/`（或 `cover_04_vertical_<账号>.*`）里的竖版图，由 `job_manifest.resolve_profile_cover(job_dir, 组名)` 统一解析。克隆（`rebase_presets` / watcher 补克隆）、重建（按版本重跑）都必须重写草稿的 `cover` composition + `draft_cover.jpg`；**找不到组封面时不得静默复用源草稿封面**（打印告警并保持原样，交人工处理）。`draft_cover.jpg` 是目录级文件，复制草稿天然共用，故只在克隆/重建入口补齐，导出阶段不二次改写。
 - **导出失效标记**：草稿重建/克隆发布后写 `_export_stale.json`，watcher 不再认旧 mp4；导出成功才清除。重建后旧成品不覆盖，按 §2.1 改名为 `.v<n>` 三件套保留。
 - **多版本成品**：基础版成品记顶层 `video.export_file`（基础版聚合），各版本成品记 `video.outputs.<版本>`（`{draft, export_dir, export_file, size_bytes, state, exported_at, history[]}`）；旧 `video.account_outputs[]` 仅作存量读取兼容。命名与反查规则见 §2.1。
 

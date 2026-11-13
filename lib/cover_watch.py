@@ -1729,7 +1729,8 @@ def run_clone(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
         from preset_ops import clone_draft_with_presets
         for prof in plan.get("clone_profiles") or []:
             rep = clone_draft_with_presets(
-                plan["draft_name"], preset_profile=prof, overwrite=True)
+                plan["draft_name"], preset_profile=prof, overwrite=True,
+                job_dir=job_dir)
             _log(job_dir, f"clone ok {rep['target']}（{prof}）")
         toast("✅ 账号预设草稿就绪", f"{name}（下一轮导出）", icon="success")
         return True

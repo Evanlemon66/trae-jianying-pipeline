@@ -500,7 +500,8 @@ def main():
         for prof in profiles[1:]:
             try:
                 rep = _po.clone_draft_with_presets(
-                    draft_name, preset_profile=prof, overwrite=True)
+                    draft_name, preset_profile=prof, overwrite=True,
+                    job_dir=job_dir)
                 export_drafts.append(rep["target"])
                 print(f"  👥 账号预设草稿就绪: {rep['target']}（{prof}）")
             except Exception as e:

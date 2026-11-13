@@ -40,6 +40,9 @@ from pipeline import (  # noqa: E402
     write_preset_manifest,
 )
 
+import job_manifest as jm  # noqa: E402  # 版本封面解析（与 ingest/契约共用一套组目录规则）
+from jy_cover import set_cover_composition, set_draft_cover  # noqa: E402
+
 LEGACY_PRESET_MATERIAL_PREFIX = "我的预设"
 
 
@@ -253,11 +256,13 @@ def _read_stable_source(content_path, probes=4, interval=0.6):
 
 
 def clone_draft_with_presets(source, target_name=None, preset_profile=None,
-                             presets=None, overwrite=False):
+                             presets=None, overwrite=False, job_dir=None,
+                             cover_image=None):
     """复制已剪辑草稿 → 剥离旧预设层 → 合并 preset_profile 的预设 → 发布为独立新草稿。
 
     presets 为 None 时按 preset_profile 从 presets.json 解析。
-    返回统计 dict。
+    版本封面：cover_image 显式优先；否则按 job_dir + preset_profile 从该组竖版封面
+    取图（B/C 组绝不沿用源草稿的 A 封面）。返回统计 dict。
     """
     src_dir, _src_content, src_name = _resolve_source(source)
     if presets is None:
@@ -352,6 +357,15 @@ def clone_draft_with_presets(source, target_name=None, preset_profile=None,
     if presets and not new_manifest["tracks"]:
         print("  ⚠️ 新预设合并后没有任何轨道，请检查预设内容是否为组合预设")
 
+    # 版本封面：克隆不会自动带封面（draft_cover 是目录级文件，A/B 会共用同一张），
+    # 必须按该组自己的竖版封面重写 composition + draft_cover.jpg。
+    cover_src = cover_image or (jm.resolve_profile_cover(job_dir, preset_profile)
+                                if job_dir else None)
+    if cover_src:
+        set_cover_composition(draft, stage_dir, cover_src)
+    else:
+        print("  ⚠️ 未找到该预设组的竖版封面：沿用源草稿封面（B/C 版可能与 A 版同图）")
+
     now_us = int(time.time() * 1_000_000)
     draft["id"] = gen_uuid()
     draft["name"] = target_name
@@ -359,6 +373,9 @@ def clone_draft_with_presets(source, target_name=None, preset_profile=None,
     draft["update_time"] = now_us
     save_draft(draft, content_path)
     write_preset_manifest(stage_dir, new_manifest)
+    if cover_src:
+        set_draft_cover(stage_dir, cover_image=cover_src)
+        print(f"  🖼️ 版本封面: {os.path.basename(cover_src)} → draft_cover.jpg")
 
     target, final_content = publish_staged_draft(
         stage_dir, target_name, draft.get("duration", 0))
@@ -372,6 +389,7 @@ def clone_draft_with_presets(source, target_name=None, preset_profile=None,
         "content_path": final_content,
         "presets": [p["name"] for p in new_manifest["presets"]],
         "profile": preset_profile,
+        "cover": cover_src,
         "stripped": stat,
         "duration_us": draft.get("duration", 0),
     }

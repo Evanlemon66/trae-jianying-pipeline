@@ -2626,6 +2626,14 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         elif do_presets:
             warn_missing_presets(presets)
     PRESETS = presets
+    # 重建某个账号版本（B/C…）时，封面必须取该组的竖版图；A 组/未指定组保持调用方传参
+    # 或抽帧行为不变。
+    if not cover_image and job_dir:
+        _ver = preset_profile_name(preset_profile)
+        if _ver and _ver not in ("a", "base"):
+            cover_image = jm.resolve_profile_cover(job_dir, _ver)
+            if cover_image:
+                print(f"  🖼️ 版本封面（{_ver}）: {os.path.basename(cover_image)}")
     # 预设层清单：记录本次合并出的轨道/素材，克隆换预设时据此精确剥离
     preset_manifest = {
         "profile": preset_profile,

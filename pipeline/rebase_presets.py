@@ -12,6 +12,7 @@
 导出落点按草稿名分目录，两条草稿互不覆盖。
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -22,6 +23,34 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from preset_ops import clone_draft_with_presets  # noqa: E402
+
+
+def _infer_job_dir(source):
+    """从源草稿引用的视频路径反推 cover_job（找不到返回 None）。"""
+    from pipeline import DRAFT_ROOT
+    d = source if os.path.isdir(source) else os.path.join(DRAFT_ROOT, source)
+    cp = os.path.join(d, "draft_content.json")
+    if not os.path.isfile(cp):
+        return None
+    try:
+        with open(cp, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    for m in (data.get("materials") or {}).get("videos") or []:
+        p = m.get("path")
+        if not (p and os.path.isabs(p)):
+            continue
+        cur = os.path.dirname(p)
+        for _ in range(4):
+            jd = os.path.join(cur, "cover_job")
+            if os.path.isdir(jd):
+                return jd
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    return None
 
 
 def _export(draft_name):
@@ -46,8 +75,16 @@ def main():
                          "不传则用 default_preset_profile / presets 默认组")
     ap.add_argument("--name", default=None, help="新草稿名（默认 源草稿名_预设组名）")
     ap.add_argument("--overwrite", action="store_true", help="新草稿已存在时覆盖")
+    ap.add_argument("--job-dir", default=None,
+                    help="cover_job 目录（用于取该预设组的竖版封面）；不传则从草稿视频路径反推")
     ap.add_argument("--export", action="store_true", help="生成后立即导出")
     args = ap.parse_args()
+
+    job_dir = args.job_dir or _infer_job_dir(args.source)
+    if job_dir:
+        print(f"🗂️ 版本封面来源: {job_dir}")
+    else:
+        print("⚠️ 未定位到 cover_job，克隆草稿将沿用源封面")
 
     try:
         r = clone_draft_with_presets(
@@ -55,6 +92,7 @@ def main():
             target_name=args.name,
             preset_profile=args.profile,
             overwrite=args.overwrite,
+            job_dir=job_dir,
         )
     except Exception as e:
         print(f"❌ {e}")
@@ -63,6 +101,7 @@ def main():
     print(f"\n✅ 新草稿已生成: {r['target']}")
     print(f"   源草稿 : {r['source']}")
     print(f"   预设组 : {r['profile'] or '(无)'} → {r['presets'] or '未合并任何预设'}")
+    print(f"   封面   : {r['cover'] or '(未找到组封面，沿用源草稿)'}")
     print(f"   剥离   : 轨道 {r['stripped']['tracks']} / 素材 {r['stripped']['materials']}")
     print(f"   时长   : {r['duration_us'] / 1e6:.2f}s")
 

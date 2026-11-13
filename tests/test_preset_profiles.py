@@ -348,6 +348,65 @@ def test_account_cover_group_dir_with_suffix(tmp_path):
     assert jm.account_cover_errors(str(tmp_path)) == []
 
 
+def test_resolve_profile_cover_group_first_and_no_silent_fallback(tmp_path):
+    """版本封面解析：账号组优先；不存在的组必须返回 None，绝不回落到 A。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import job_manifest as jm
+    covers = tmp_path / "04_covers"
+    for n in _cover_names():
+        _png(covers / f"{n}.png")
+    _png(covers / "b_group" / "cover_04_vertical_B.png")
+    (tmp_path / "job.json").write_text(json.dumps(
+        {"vertical_cover": {"file": "04_covers/cover_04_vertical.png"}}), encoding="utf-8")
+
+    assert os.path.basename(jm.resolve_profile_cover(str(tmp_path), "a")) == "cover_04_vertical.png"
+    assert jm.resolve_profile_cover(str(tmp_path), "presets_b").endswith("cover_04_vertical_B.png")
+    assert jm.resolve_profile_cover(str(tmp_path), "c") is None
+
+
+def test_clone_applies_profile_cover(tmp_path, monkeypatch):
+    """克隆换预设必须同时换封面：draft_cover 与 cover composition 都指向 B 组竖版图。"""
+    src = tmp_path / "src_draft"
+    src.mkdir()
+    draft, mid = _draft_with_preset_tracks()
+    media = tmp_path / "a.mp4"
+    media.write_bytes(b"x")
+    draft["materials"]["videos"][0]["path"] = str(media)
+    draft.update({"id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                  "name": "A", "duration": 10_000_000})
+    (src / "draft_content.json").write_text(
+        json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+    (src / "draft_meta_info.json").write_text(
+        json.dumps({"draft_id": draft["id"], "draft_name": "A"}, ensure_ascii=False),
+        encoding="utf-8")
+    pl.write_preset_manifest(str(src), {
+        "tracks": ["t-preset"],
+        "materials": {"videos": [mid["preset"]], "drafts": [mid["draft"]]},
+    })
+
+    covers = tmp_path / "cover_job" / "04_covers"
+    (covers / "b_group").mkdir(parents=True)
+    cover_b = covers / "b_group" / "cover_04_vertical_B.jpg"
+    cover_b.write_bytes(b"\xff\xd8\xff\xd9")
+    (covers / "cover_04_vertical.jpg").write_bytes(b"\xff\xd8\xff\xda")
+
+    monkeypatch.setattr(preset_ops, "DRAFT_ROOT", str(tmp_path / "drafts"))
+    monkeypatch.setattr(preset_ops, "_STAGING_ROOT", str(tmp_path / "stage"))
+    monkeypatch.setattr(preset_ops, "get_main_video_duration", lambda _d: 10_000_000)
+    monkeypatch.setattr(pl, "DRAFT_ROOT", str(tmp_path / "drafts"))
+
+    r = preset_ops.clone_draft_with_presets(
+        str(src), target_name="A_b", presets=[], preset_profile="b",
+        job_dir=str(tmp_path / "cover_job"))
+
+    assert r["cover"] == str(cover_b)
+    out_dir = tmp_path / "drafts" / "A_b"
+    assert (out_dir / "draft_cover.jpg").read_bytes() == cover_b.read_bytes()
+    out, _ = pl.load_draft(r["content_path"])
+    ids = {d["id"] for d in out["materials"]["drafts"]}
+    assert out["cover"]["cover_draft_id"] in ids
+
+
 def test_validate_job_allows_multi_group_prompts(tmp_path):
     sys.path.insert(0, os.path.join(_ROOT, "lib"))
     import job_manifest as jm

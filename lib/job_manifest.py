@@ -2196,6 +2196,43 @@ def detect_account_cover_sets(job_dir: str) -> dict[str, dict[Any, str]]:
     return sets
 
 
+def resolve_profile_cover(job_dir: str, profile: Any = None) -> Optional[str]:
+    """取某个预设组对应的竖版封面绝对路径（没有则 None）。
+
+    账号组目录（`04_covers/b_group`、`04_covers/b` 等）优先；A 组/未指定组回落到
+    `job.vertical_cover`，再回落到 04_covers 根目录的契约竖版图。
+    用途：克隆/重建某版本草稿时，封面必须跟着版本走，不能沿用源草稿的封面。
+    """
+    key = str(profile or "").strip().lower()
+    if key.startswith("presets_"):
+        key = key[len("presets_"):]
+    for suf in ("_group", "-group", "组"):
+        if key.endswith(suf):
+            key = key[: -len(suf)].strip("_-")
+            break
+
+    sets = detect_account_cover_sets(job_dir)
+    p = (sets.get(key) or {}).get("vertical") if key else None
+    if p and os.path.isfile(p):
+        return p
+    if key not in ("", "a", "base"):
+        # 非 A 组必须有自己组的竖版封面，绝不静默回落到 A 的图
+        return None
+
+    try:
+        job = load_job(os.path.join(job_dir, "job.json"))
+    except Exception:
+        job = {}
+    rel = (job.get("vertical_cover") or {}).get("file")
+    if rel:
+        p = os.path.join(job_dir, rel.replace("/", os.sep))
+        if os.path.isfile(p):
+            return p
+    found, _ = detect_cover_files(job_dir, apply=False)
+    p = found.get("vertical")
+    return p if p and os.path.isfile(p) else None
+
+
 def account_cover_errors(job_dir: str) -> list[str]:
     """账号封面组完整性：只要某账号的封面出现过，就必须 4 张齐全。
 
