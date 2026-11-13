@@ -43,17 +43,20 @@ TEST_PREFIX = "[测试] "
 
 
 def _under_pytest() -> bool:
-    """廉价、无副作用的「当前进程在 pytest 下」判断。
+    """廉价、无副作用的「此刻是否有测试用例正在执行」判断。
 
-    - PYTEST_CURRENT_TEST 由 pytest 在每个用例执行期间设置；
-    - 或 pytest 已导入且带 __version__（不硬依赖 pytest，运行时未装也正常）。
-    任何异常都按「不在测试」处理，绝不影响主流程。
+    只认 PYTEST_CURRENT_TEST：该变量由 pytest 在每个用例 setup 前写入、
+    teardown 后清除，覆盖整个进程（子进程也会继承），是「正在跑用例」的
+    准确信号。
+
+    不能用「进程里 import 过 pytest」当判据：pytest 一旦被任何模块（例如
+    tests/conftest.py 顶层、或生产环境里某个三方库）导入，sys.modules 中
+    就会永久保留它，该判据从此恒为真，无法按用例切换——既会让测试无法
+    模拟生产态，也会把「只是间接 import 了 pytest」的生产进程误判成测试态
+    而静音真实通知。任何异常都按「不在测试」处理，绝不影响主流程。
     """
     try:
-        if os.environ.get("PYTEST_CURRENT_TEST"):
-            return True
-        mod = sys.modules.get("pytest")
-        return mod is not None and hasattr(mod, "__version__")
+        return bool(os.environ.get("PYTEST_CURRENT_TEST"))
     except Exception:
         return False
 
