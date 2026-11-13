@@ -219,5 +219,138 @@ ok8 = mgr8.go_home()  # 默认 soft 60 + restart 180
 check("软关 60s 后重启，120s 才就绪仍能回到首页", ok8 is True, mgr8.state)
 check("确实走了强杀重启", b8.kill_count == 1, b8.kill_count)
 
+print("\n== ⑨ 启动即死（20s 内消失）→ 结构化日志 + 立即重试一次成功 ==")
+clk9 = FakeClock()
+b9 = FakeBackend()
+logs9 = []
+die_at = {}
+
+
+def _eff9():
+    if b9.launch_count == 1:          # 首次：起来了但 5s 后就没了（13:25/13:59 现象）
+        b9.running, b9.window, b9.home = True, False, False
+        die_at["t"] = clk9.t + 5
+    else:                              # 重试：正常到首页
+        b9.running, b9.window, b9.home = True, True, True
+
+
+b9.launch_effect = _eff9
+b9.process_running = lambda: b9.running and (die_at.get("t") is None or clk9.t < die_at["t"])
+mgr9 = ji.JyInstance(backend=b9, find_exe=lambda: "fake.exe", time_fn=clk9.time,
+                     sleep_fn=clk9.sleep, poll_interval=1.0, probe_timeout=2.0,
+                     log=logs9.append)
+t9 = clk9.t
+ok9 = mgr9.launch(timeout=30)
+check("重试后到达 home", ok9 is True and mgr9.state == "home", mgr9.state)
+check("拉起两次（首试+重试）", b9.launch_count == 2, b9.launch_count)
+died9 = [l for l in logs9 if l.startswith("[startup-died]")]
+check("记了一条 [startup-died]", len(died9) == 1, died9)
+check("结构化字段齐全（pid/started/alive_s/app_log_bytes）",
+      bool(died9) and all(k in died9[0] for k in
+                          ("pid=", "started=", "alive_s=", "app_log=", "app_log_bytes=")),
+      died9[0] if died9 else "")
+check("标记为可重试 retry=1", bool(died9) and "retry=1" in died9[0], died9[0] if died9 else "")
+check("不等满 30s（≈首试5s+静默2s）", 6.9 <= (clk9.t - t9) <= 8.5, clk9.t - t9)
+
+print("\n== ⑩ 重试上限写死 1 次：两次都启动即死 → 失败，不再拉第三次 ==")
+clk10 = FakeClock()
+b10 = FakeBackend()
+logs10 = []
+
+
+def _eff10():
+    b10.running, b10.window, b10.home = True, False, False
+    b10._die_at = clk10.t + 5
+
+
+b10._die_at = None
+b10.launch_effect = _eff10
+b10.process_running = lambda: b10.running and (b10._die_at is None or clk10.t < b10._die_at)
+mgr10 = ji.JyInstance(backend=b10, find_exe=lambda: "fake.exe", time_fn=clk10.time,
+                      sleep_fn=clk10.sleep, poll_interval=1.0, probe_timeout=2.0,
+                      log=logs10.append)
+ok10 = mgr10.launch(timeout=30)
+check("返回 False（按原逻辑 fail）", ok10 is False)
+check("总拉起次数 == 2（不叠加成 3 次）", b10.launch_count == 2, b10.launch_count)
+died10 = [l for l in logs10 if l.startswith("[startup-died]")]
+check("两次即死各记一条，末条 retry=0",
+      len(died10) == 2 and "retry=0" in died10[-1], died10)
+# 预算按管理器计：导出层再次 attempt 重试调 launch 时不会再额外拉起
+ok10b = mgr10.launch(timeout=30)
+check("预算耗尽后再 launch 只拉一次（不随 attempt 倍增）",
+      ok10b is False and b10.launch_count == 3, b10.launch_count)
+
+print("\n== ⑪ 晚死（>20s）不触发立即重试 ==")
+clk11 = FakeClock()
+b11 = FakeBackend()
+logs11 = []
+
+
+def _eff11():
+    b11.running, b11.window, b11.home = True, False, False
+    b11._die_at = clk11.t + 25
+
+
+b11._die_at = None
+b11.launch_effect = _eff11
+b11.process_running = lambda: b11.running and (b11._die_at is None or clk11.t < b11._die_at)
+mgr11 = ji.JyInstance(backend=b11, find_exe=lambda: "fake.exe", time_fn=clk11.time,
+                      sleep_fn=clk11.sleep, poll_interval=1.0, probe_timeout=2.0,
+                      log=logs11.append)
+ok11 = mgr11.launch(timeout=60)
+check("返回 False", ok11 is False)
+check("不重试（只拉起一次）", b11.launch_count == 1, b11.launch_count)
+check("结构化日志标记 late=1", any("late=1" in l for l in logs11), logs11)
+
+print("\n== ⑫ restart：kill 与新进程之间留 2–5s 静默期 ==")
+clk12 = FakeClock()
+b12 = FakeBackend()
+b12.running = True
+marks12 = []
+_orig_kill12 = b12.kill
+
+
+def _kill12():
+    marks12.append(("kill", clk12.t))
+    _orig_kill12()
+
+
+def _eff12():
+    marks12.append(("launch", clk12.t))
+    b12.running, b12.window, b12.home = True, True, True
+
+
+b12.kill = _kill12
+b12.launch_effect = _eff12
+mgr12 = ji.JyInstance(backend=b12, find_exe=lambda: "fake.exe", time_fn=clk12.time,
+                      sleep_fn=clk12.sleep, poll_interval=1.0, probe_timeout=2.0,
+                      log=lambda *_a: None)
+ok12 = mgr12.restart(timeout=30)
+gap12 = marks12[1][1] - marks12[0][1]
+check("重启后到达 home", ok12 is True and mgr12.state == "home", mgr12.state)
+check("kill→launch 间隔在 2–5s", 2.0 <= gap12 <= 5.0, gap12)
+
+print("\n== ⑬ kill 后旧进程仍在：返回 False 并记一行 ==")
+clk13 = FakeClock()
+b13 = FakeBackend()
+b13.running = True
+logs13 = []
+
+
+def _immortal_kill():
+    b13.kill_count += 1          # taskkill 打了，但进程杀不掉
+
+
+b13.kill = _immortal_kill
+b13.launch_effect = lambda: (setattr(b13, "running", True) or
+                             setattr(b13, "window", True) or setattr(b13, "home", True))
+mgr13 = ji.JyInstance(backend=b13, find_exe=lambda: "fake.exe", time_fn=clk13.time,
+                      sleep_fn=clk13.sleep, poll_interval=1.0, probe_timeout=2.0,
+                      log=logs13.append)
+check("kill() 返回 False", mgr13.kill() is False)
+ok13 = mgr13.restart(timeout=30)
+check("restart 仍按流程拉起并到 home", ok13 is True, mgr13.state)
+check("记了『旧进程仍在运行』", any("旧进程仍在运行" in l for l in logs13), logs13)
+
 print(f"\n{'='*40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
 sys.exit(1 if fails else 0)

@@ -240,6 +240,13 @@ def _job_dir_for(target: str, is_draft: bool) -> str | None:
     return best[0]
 
 
+def _export_console_path(job_dir: str | None) -> str:
+    """导出子进程控制台日志落点：有 cover_job 写进 job，否则落 pipeline/_work。"""
+    base = job_dir or os.path.join(_HERE, "_work")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "export_console.log")
+
+
 def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = False,
                 job_dir: str | None = None) -> bool:
     """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。
@@ -268,19 +275,38 @@ def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = Fa
     if cold_start:
         cmd.append("--cold-start")
 
-    proc = subprocess.Popen(cmd, cwd=_ROOT, env=hidden_child_env(),
-                            creationflags=NO_WINDOW)
-    last_beat = time.time()
-    while proc.poll() is None:
-        time.sleep(5)
-        beat = _progress_mtime(out_mp4)
-        if beat:
-            last_beat = max(last_beat, beat)
-        if time.time() - last_beat > timeout:
-            print(f"  ⏱️ 导出 {timeout:.0f}s 无任何进展，判定卡死并终止子进程")
-            proc.kill()
-            proc.wait()
-            break
+    # 子进程输出落盘：pythonw 链路下没有控制台，dprint 原本全部丢失（13:25、13:59
+    # 两次冷启动失败零证据）。这里直接重定向 OS 句柄，并记录启动/pid/退出码。
+    log_path = _export_console_path(job_dir)
+    print(f"  📝 导出子进程日志: {log_path}")
+    with open(log_path, "a", encoding="utf-8", errors="replace") as logf:
+        logf.write(f"\n===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动导出子进程 "
+                   f"draft={draft_name} cold_start={int(cold_start)} =====\n")
+        logf.write("cmd: " + " ".join(cmd) + "\n")
+        logf.write(f"out: {out_mp4}\n")
+        logf.flush()
+        started = time.time()
+        proc = subprocess.Popen(cmd, cwd=_ROOT, env=hidden_child_env(),
+                                creationflags=NO_WINDOW,
+                                stdin=subprocess.DEVNULL,
+                                stdout=logf, stderr=subprocess.STDOUT)
+        logf.write(f"pid={proc.pid} started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        logf.flush()
+        last_beat = time.time()
+        while proc.poll() is None:
+            time.sleep(5)
+            beat = _progress_mtime(out_mp4)
+            if beat:
+                last_beat = max(last_beat, beat)
+            if time.time() - last_beat > timeout:
+                print(f"  ⏱️ 导出 {timeout:.0f}s 无任何进展，判定卡死并终止子进程")
+                proc.kill()
+                proc.wait()
+                break
+        logf.write(f"exit: code={proc.returncode} "
+                   f"duration_s={time.time() - started:.1f} "
+                   f"at={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        logf.flush()
 
     if proc.returncode == 0:
         _consolidate_bundle(draft_name, out_mp4)
