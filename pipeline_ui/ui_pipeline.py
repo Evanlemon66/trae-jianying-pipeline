@@ -257,14 +257,16 @@ def step_precheck(workdir):
 
 
 def step_init_draft(workdir, draft_name=None, video_dir=None, video_limit=None,
-                    video_range=None, cut_s=None, normalize=False):
+                    video_range=None, cut_s=None, normalize=False, preset_profile=None):
     """[0] 初始化草稿：创建/重置 → 注入视频 → 合并预设 → 发布 → 打开。
     video_limit=None 表示全部集数；传 N 表示取前 N 集。
-    normalize=False 直接引用原始视频（跳过逐集重编码）。"""
+    normalize=False 直接引用原始视频（跳过逐集重编码）。
+    preset_profile 选 presets.json 里的 presets_<组名>。"""
     from init_draft import init_draft
     t0 = time.time()
     kwargs = {'video_limit': video_limit, 'video_range': video_range,
-              'cut_s': cut_s, 'normalize': normalize}
+              'cut_s': cut_s, 'normalize': normalize,
+              'preset_profile': preset_profile}
     if draft_name:
         kwargs['draft_name'] = draft_name
     if video_dir:
@@ -514,12 +516,13 @@ STEP_IMPL = {
 
 
 def step_kwargs(step_key, workdir, vocal_mode, draft_name, video_dir, cut_s=None,
-                video_limit=None, video_range=None, normalize=False, export_resolution=None):
+                video_limit=None, video_range=None, normalize=False, export_resolution=None,
+                preset_profile=None):
     """每个步骤的实参（调度统一 impl(**kw)）。"""
     if step_key == 'init_draft':
         return {'workdir': workdir, 'draft_name': draft_name, 'video_dir': video_dir,
                 'video_limit': video_limit, 'video_range': video_range,
-                'cut_s': cut_s, 'normalize': normalize}
+                'cut_s': cut_s, 'normalize': normalize, 'preset_profile': preset_profile}
     if step_key == 'vocal_separate':
         return {'workdir': workdir, 'vocal_mode': vocal_mode}
     if step_key == 'cut_timeline':
@@ -562,6 +565,7 @@ def run_pipeline_ui(workdir: str,
                     video_range: str = None,
                     normalize: bool = False,
                     screen_policy: str = 'primary',
+                    preset_profile: str = None,
                     export_resolution: str = None):
     """
     执行纯 UI 自动化 pipeline。
@@ -670,7 +674,8 @@ def run_pipeline_ui(workdir: str,
 
         step_t0 = time.time()
         kw = step_kwargs(step_key, workdir, vocal_mode, draft_name, video_dir, cut_s,
-                         video_limit, video_range, normalize, export_resolution)
+                         video_limit, video_range, normalize, export_resolution,
+                         preset_profile=preset_profile)
         ui_calibration.take_trace()          # 清掉轨迹；UI 入参由准入测试记录落盘
         try:
             # step 子预算：用动态超时（准入基线×草稿时长×130%）；
@@ -762,6 +767,8 @@ def main():
     parser.add_argument('--video-dir', default=None, help='[0] 初始化草稿的视频目录（默认取 init_draft 配置）')
     parser.add_argument('--cut', dest='cut_s', type=float, default=None,
                         help='[2] 时间线裁剪起点（秒）；不传则不裁剪')
+    parser.add_argument('--profile', dest='preset_profile', default=None, metavar='A',
+                        help='[0] 预设组名（presets.json 里的 presets_<组名>），多账号各用各的预设')
     parser.add_argument('--limit', dest='video_limit', type=int, default=None,
                         help='[0] 取前 N 集；默认全部集数')
     parser.add_argument('--video-range', dest='video_range', default=None,
@@ -793,6 +800,7 @@ def main():
             video_range=args.video_range,
             normalize=args.normalize,
             screen_policy=args.screen_policy,
+            preset_profile=args.preset_profile,
             export_resolution=args.export_resolution,
         )
     finally:

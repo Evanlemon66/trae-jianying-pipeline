@@ -79,8 +79,14 @@ Read the individual rule files for specific tasks and constraints:
 
 导出成功不等于归档：剧集默认留在 `watch.roots` 下，只是 `video.status=done` 不再触发导出。需要「下线」时用 `pipeline/archive_job.py` 显式归档：
 
+**多版本成品命名（先对齐台账再归档）**：
+
+- 基础版草稿/成品**不加后缀**（不写 `_a`），台账版本名记 `a`；扩展版 `<基础草稿>_<版本>`，版本名 `[a-z][a-z0-9]{0,7}`（`b`/`c`/`b2`），**一版一后缀**。
+- 同版本重跑：草稿重建后写 `_export_stale.json`，重导**不覆盖**旧成品，而把旧成品改名保留三件套 `<成品>.v<n>.mp4`、`<成品>.v<n>-封面.jpg`、`<成品>.v<n>.mp4.progress.json`；任一改名失败整组回滚并硬失败。从成品名反查版本：先剥 `.v<n>`，再看 `_<版本>` 后缀。
+- 各版本成品与状态记 `job.json.video.outputs.<版本>`（`{draft, export_dir, export_file, size_bytes, state, exported_at, history[]}`），每个版本独立判断「导过就不再导」；顶层 `video.export_file/export_dir/draft_name` 只是基础版聚合。命名细则见 `drama-cover-builder/references/handoff-contract.md` §2.1。
+
 - `job.json.stage=archived` 是合法 stage，含义是「该剧已归档、不再参与调度」；由归档脚本写入，watcher 的触发判定对它**硬拦**，`--phase` / `--once` / `--job` 都绕不过去（硬拦发生在阶段/单剧过滤之前）。
-- 准入：`publish.status=published` 或 `video.export_state=cleaned`（`--force` 可跳过）；首次归档时 `.watcher.lock` 的 pid 存活（活锁）或 `.export_state.json` `status=exporting` 会拒绝（续做只校验位置与目标）。
+- 准入（默认需同时满足，`--force` 可跳过）：① `publish.status=published` 或 `video.export_state=cleaned`；② **所有声明版本都已完成**——`video.outputs` 里每个版本的 `state` ∈ `exported` / `cleaned`，任一版本未导出则跳过归档。首次归档时 `.watcher.lock` 的 pid 存活（活锁）或 `.export_state.json` `status=exporting` 会拒绝（续做只校验位置与目标）。
 - 归档池位置：`archive_root` 不能等于或位于 `watch.roots` 之下；`watch.roots` 为空时脚本直接拒绝执行（fail-closed）。建议与 roots 同盘、独立根（如 `D:/短剧_存档`）。
 - 断点可重入：`stage` 已 archived、源目录仍在而目标不存在时，重跑同一命令即续做移动；先写 stage 再搬目录，因此移动失败也不会再被调度。
 - 归档会同步改写 `pipeline/_stream_manifests/*.json` 的 `paths.source_dir`；不改写会导致后续 `stream_manifest.py clean` 按旧路径找不到源。

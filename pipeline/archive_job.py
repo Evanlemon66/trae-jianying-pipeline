@@ -141,6 +141,34 @@ def _eligible(job: dict) -> bool:
     return pub == "published" or exp == "cleaned"
 
 
+def _declared_profiles(job: dict) -> list[str]:
+    """job 声明的版本（workflow.preset_profile / 顶层 preset_profile）。"""
+    wf = job.get("workflow") or {}
+    try:
+        return pc.parse_preset_profiles(wf.get("preset_profile") or job.get("preset_profile"))
+    except Exception:
+        return []
+
+
+def _pending_outputs(job: dict) -> list[str]:
+    """所有声明版本里仍未导出的（缺 outputs 条目 / state 不是 exported|cleaned）。
+
+    归档会把整剧目录搬出 watch.roots，watcher 再也补不了未导出的版本；
+    因此必须要求声明版本全部完成，--force 才可跳过。
+    """
+    outputs = (job.get("video") or {}).get("outputs")
+    outputs = outputs if isinstance(outputs, dict) else {}
+    declared = _declared_profiles(job)
+    names = list(dict.fromkeys(declared + list(outputs)))
+    pending = []
+    for p in names:
+        v = outputs.get(p) or {}
+        st = str(v.get("state") or "").lower()
+        if st not in ("exported", "cleaned"):
+            pending.append(f"{p}({st or '未导出'})")
+    return pending
+
+
 def _rewrite_manifests(manifest_dir: str, old_dir: str, new_dir: str,
                        dry_run: bool) -> int:
     """把 paths.source_dir=旧剧集目录 的记录改写为新路径；返回命中记录数。"""
@@ -223,6 +251,11 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
         if not force and not _eligible(job):
             print("  [skip] 未满足准入（publish.status!=published 且 video.export_state!=cleaned）；"
                   "确需归档请加 --force")
+            return 1
+        pending = _pending_outputs(job)
+        if not force and pending:
+            print("  [skip] 仍有声明版本未完成导出: " + "、".join(pending)
+                  + "；归档后 watcher 无法再补，先补齐或加 --force")
             return 1
         if _lock_alive(job_dir):
             print("  [skip] 存在活锁（.watcher.lock pid 仍存活），请先停止该剧的调度")

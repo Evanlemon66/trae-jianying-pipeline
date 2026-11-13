@@ -31,15 +31,17 @@ from pipeline import (
     merge_preset_into_draft,
     publish_staged_draft,
     find_preset_by_name,
+    resolve_presets,
     save_draft,
+    write_preset_manifest,
     DRAFT_ROOT,
 )
 
 # ====== 默认配置（草稿名 = 视频目录名=剧名）======
 VIDEO_DIR = r"D:\剪映5.9\test\赶山救下小狐狸，所有猛兽都听我的"
 DRAFT_NAME = os.path.basename(VIDEO_DIR.rstrip('\\/'))
-# (预设名子串, alpha覆盖)。alpha=None 用预设原值；白板滤镜统一 2% 不透明度
-PRESETS = [("cici", None), ("sx", None), ("白板", 0.02)]
+# 预设默认从 pipeline/presets.json 读取（可用 profile 选 presets_<组名>）；
+# 传 presets=[("名", alpha), ...] 可显式覆盖
 VIDEO_GLOB = "第*集.mp4"
 VIDEO_LIMIT = 5                          # 取前 N 集，None 表示全部
 # ================================
@@ -139,6 +141,7 @@ def parse_video_range(spec, total):
 def init_draft(draft_name: str = DRAFT_NAME,
                video_dir: str = VIDEO_DIR,
                presets=None,
+               preset_profile: str = None,
                video_glob: str = VIDEO_GLOB,
                video_limit=VIDEO_LIMIT,
                video_range: str = None,
@@ -147,7 +150,14 @@ def init_draft(draft_name: str = DRAFT_NAME,
                open_after: bool = True) -> dict:
     """构建并（可选）打开测试草稿。返回 {'ok': bool, 'episodes': int, 'duration_s': float, 'error': str|None}
     normalize=False 时直接引用原始视频（HEVC/非常规尺寸也不重编码，剪映原生支持），省去逐集编码。"""
-    presets = PRESETS if presets is None else presets
+    if presets is None:
+        try:
+            presets, _src = resolve_presets(preset_profile)
+        except RuntimeError as e:
+            print(f"❌ {e}")
+            return {'ok': False, 'episodes': 0, 'duration_s': 0, 'error': str(e)}
+        if _src:
+            print(f"🧩 预设来源: {_src}")
     from ui_core import op_stage, op_stage_end
     op_stage('1 生成草稿（包含预设+时间线裁剪）')
 
@@ -199,13 +209,21 @@ def init_draft(draft_name: str = DRAFT_NAME,
     total_us = draft.get("duration", 0)
     print(f"   总时长: {total_us/1e6:.1f}s")
 
+    preset_manifest = {"profile": preset_profile, "presets": [], "tracks": [], "materials": {},
+                       "built_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     for pn, alpha in presets:
         pp = find_preset_by_name(pn)
         if not pp:
             print(f"  ⚠️ 未找到预设: {pn}，跳过")
             continue
-        print(f"\n🎨 合并预设: {pn}" + (f" (clip.alpha={alpha})" if alpha else ""))
-        merge_preset_into_draft(draft, pp, stretch_to_duration_us=total_us, clip_alpha=alpha)
+        print(f"\n🎨 合并预设: {pn}" + (f" (clip.alpha={alpha})" if alpha is not None else ""))
+        one = {}
+        merge_preset_into_draft(draft, pp, stretch_to_duration_us=total_us,
+                                clip_alpha=alpha, out_manifest=one)
+        preset_manifest["presets"].append({"name": pn, "alpha": alpha})
+        preset_manifest["tracks"].extend(one.get("tracks") or [])
+        for _mk, _ids in (one.get("materials") or {}).items():
+            preset_manifest["materials"].setdefault(_mk, []).extend(_ids)
     _phase('合并预设')
 
     # ── Step 3.5: 构建期校验（段数 / 轨道数 / 总时长）──
@@ -253,6 +271,7 @@ def init_draft(draft_name: str = DRAFT_NAME,
 
     # ── Step 4: 保存到暂存区 ──
     save_draft(draft, jp_new)
+    write_preset_manifest(stage_dir, preset_manifest)
     print(f"\n💾 暂存区草稿已保存")
     _phase('保存暂存区')
 
@@ -308,9 +327,12 @@ def main():
     ap.add_argument('--draft-name', default=DRAFT_NAME)
     ap.add_argument('--video-dir', default=VIDEO_DIR)
     ap.add_argument('--limit', type=int, default=VIDEO_LIMIT)
+    ap.add_argument('--profile', default=None, metavar='A',
+                    help='预设组名（presets.json 里的 presets_<组名>），多账号各用各的预设')
     ap.add_argument('--no-open', action='store_true', help='只发布，不在剪映中打开')
     args = ap.parse_args()
     r = init_draft(draft_name=args.draft_name, video_dir=args.video_dir,
+                   preset_profile=args.profile,
                    video_limit=args.limit, open_after=not args.no_open)
     if not r['ok']:
         print(f"❌ {r['error']}")

@@ -13,6 +13,7 @@
 """
 import json
 import os
+import re
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(_HERE, "presets.json")
@@ -54,6 +55,30 @@ def get_watch_config():
     """
     watch = _cfg().get("watch") or {}
     return watch if isinstance(watch, dict) else {}
+
+
+def preset_profile_name(value):
+    """预设组名归一化：presets_a / presets_A / a → a（去掉 presets_ 前缀）。"""
+    s = str(value or "").strip()
+    if s.lower().startswith("presets_"):
+        s = s[len("presets_"):]
+    return s.strip()
+
+
+def parse_preset_profiles(value):
+    """解析多预设组参数，返回去重保序的组名列表。
+
+    支持：'a' / 'a,b' / 'a，b' / 'presets_a,presets_b' / ['a', 'b']
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else re.split(r"[,;，；\s]+", str(value))
+    out = []
+    for item in items:
+        name = preset_profile_name(item)
+        if name and name not in out:
+            out.append(name)
+    return out
 
 
 def get_ffmpeg():

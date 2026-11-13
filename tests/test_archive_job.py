@@ -283,5 +283,27 @@ check("报错说明盘符根", "盘符根" in out, out.strip())
 check("盘符根源目录未移动", os.path.isdir(os.path.join(series, "cover_job")))
 check("盘符根 stage 未变", read_job(jd)["stage"] == "video_ready")
 
+print("\n== ⑯ 声明多版本未全部导出 → 跳过（--force 可绕过） ==")
+series, jd = make_job("multiver", publish_status="published")
+jm.update_job(jd, {"workflow": {"preset_profile": "a,b"},
+                   "video": {"outputs": {"a": {"state": "exported"}}}},
+              event="test_seed", detail="seed 多版本")
+rc = run(jd)
+check("b 版未导出 → 跳过返回 1", rc == 1, rc)
+check("b 版未导出 → stage 未变", read_job(jd)["stage"] == "video_ready", read_job(jd)["stage"])
+check("b 版未导出 → 目录原地", os.path.isdir(os.path.join(series, "cover_job")))
+rc = aj.archive(jd, ARCH, MF, force=True, roots=ROOTS)
+check("--force 可绕过未完成检查", rc == 0, rc)
+check("--force 后已移动", os.path.isdir(os.path.join(ARCH, "multiver", "cover_job")))
+
+series2, jd2 = make_job("multiver2", publish_status="published")
+jm.update_job(jd2, {"workflow": {"preset_profile": "a,b"},
+                    "video": {"outputs": {"a": {"state": "exported"},
+                                          "b": {"state": "exported"}}}},
+              event="test_seed", detail="seed 多版本已完成")
+rc = run(jd2)
+check("声明版本全部完成 → 正常归档", rc == 0, rc)
+check("全部完成 → 已移动", os.path.isdir(os.path.join(ARCH, "multiver2", "cover_job")))
+
 print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
 sys.exit(0 if not fails else 1)

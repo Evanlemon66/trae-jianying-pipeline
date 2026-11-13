@@ -15,6 +15,10 @@
     "watch.new_job_grace_min: 新剧宽限期分钟数（默认 10，设 0 关闭）。仅对「首次被发现、history 里还没有任何执行记录」的新剧生效：距 job.json 创建时间不足该分钟数则本轮跳过；期间 job.json 被改过（mtime 变新，说明有人在配裁剪）视为放行，直接走原有静默防抖逻辑。已在队列中的剧不受影响。",
     "watch.stall_heartbeat_s: watcher 心跳停滞判定卡死的秒数（默认 900）。watcher 每 30s 原子写 pipeline/_work/watcher_heartbeat.json；supervisor 发现进程在跑但心跳超过该秒数未更新，判定卡死并杀进程树后重新拉起。心跳缺失、不可解析、pid 不一致或进程刚启动（180s 内）都不判卡死，避免误杀。",
     "presets: 剪映「我的预设」里的组合预设名，必须与预设库完全一致（可用 pipeline.py --list-presets 查看）。",
+    "多账号预设组: 加 presets_<组名>（如 presets_a / presets_b）每个账号一组，生成草稿时用 --profile a / --profile b 选用；presets 作为未指定组时的默认组。--presets 显式列表优先级最高。",
+    "default_preset_profile: 未传 --profile 时默认使用哪一组，写完整键名，如 \"presets_a\"（也兼容 \"a\"）。watch.preset_profile: watcher 自动剪辑时默认用哪一组，可写 \"presets_a\" 或多组 \"presets_a,presets_b\"（可选，剧级可用 cover_job/job.json 的 workflow.preset_profile 覆盖）。",
+    "多预设组: --profile 支持逗号分隔多组，如 --profile a,b；第一个组用于正常构建，其余组自动复制草稿、只换预设层，生成独立草稿并分别导出。watcher 的 watch.preset_profile / job.json workflow.preset_profile 同样支持 \"a,b\" 或 [\"a\",\"b\"]。",
+    "同一条剧换账号发布: 先正常跑出 A 的草稿，再执行 python pipeline\\rebase_presets.py \"<A草稿名>\" --profile b（可选 --export），只替换预设层，视频/字幕/翻译/人声分离原样复用，生成独立新草稿并各自导出。",
     "alpha 为可选的滤镜透明度（0~1），仅对滤镜类预设生效，普通贴纸/logo 预设不用填。",
     "不配 presets 字段时，预设库中 pipeline_ 开头的预设会被自动启用。",
     "临时换预设可用命令行: python pipeline\\pipeline.py <草稿名> --presets \"名1,名2:0.03\"",
@@ -38,13 +42,24 @@
     "retry_pause_after": 5,
     "edit_stall_timeout_s": 900,
     "new_job_grace_min": 10,
-    "stall_heartbeat_s": 900
+    "stall_heartbeat_s": 900,
+    "preset_profile": ""
   },
   "presets": [
     { "name": "我的logo" },
     { "name": "我的角标贴纸" },
     { "name": "我的滤镜", "alpha": 0.03 }
   ],
+  "presets_a": [
+    { "name": "我的logo" },
+    { "name": "我的角标贴纸" },
+    { "name": "我的滤镜", "alpha": 0.03 }
+  ],
+  "presets_b": [
+    { "name": "B账号logo" },
+    { "name": "B账号滤镜", "alpha": 0.05 }
+  ],
+  "default_preset_profile": "presets_a",
   "translate": {
     "providers": [
       {

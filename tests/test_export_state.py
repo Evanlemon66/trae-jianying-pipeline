@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(_ROOT, "lib"))
 sys.path.insert(0, os.path.join(_ROOT, "pipeline"))
 import job_manifest as jm  # noqa: E402
 import stream_manifest as sm  # noqa: E402
+import export_state as es  # noqa: E402
 
 fails = []
 
@@ -154,6 +155,110 @@ check("返回 0", rc == 0, rc)
 check("成品已删", not os.path.exists(p["bundle"]))
 check("输出含跳过原因", "无 job.json" in out, out)
 check("无回写行", "[回写]" not in out, out)
+
+print("\n== ⑦ record_video 版本台账 + 顶层聚合 ==")
+p = make_series("esG")
+bt = os.path.join(TMP, "L", "esG_b")
+os.makedirs(bt, exist_ok=True)
+mp4b = os.path.join(bt, "esG_b.mp4")
+with open(mp4b, "wb") as f:
+    f.write(b"n" * 2048)
+jm.record_video(p["jd"], export_dir=p["bundle"],
+                export_file=os.path.join(p["bundle"], "esG.mp4"),
+                draft_name="esG", profile="a")
+job = jm.record_video(p["jd"], export_dir=bt, export_file=mp4b,
+                      draft_name="esG_b", profile="b")
+outs = job["video"]["outputs"]
+check("outputs 有两版", set(outs) == {"a", "b"}, outs)
+check("a 版 draft/state", outs["a"]["draft"] == "esG" and outs["a"]["state"] == "exported", outs)
+check("b 版记录 size", outs["b"]["size_bytes"] == 2048, outs["b"])
+check("b 版 history 有记录", len(outs["b"]["history"]) == 1, outs["b"]["history"])
+check("顶层 export_file 仍是基础版", job["video"]["export_file"].endswith("esG.mp4"),
+      job["video"]["export_file"])
+check("顶层 draft_name 仍是基础版", job["video"]["draft_name"] == "esG", job["video"]["draft_name"])
+ext = job["cleanup"]["external"]
+check("cleanup 命令带 --profile b",
+      any(e.get("profile") == "b" and "--profile b" in (e.get("command") or "") for e in ext), ext)
+check("基础版 cleanup 仍是整剧命令（无 --profile）",
+      any(e.get("draft_name") == "esG" and "--profile" not in (e.get("command") or "") for e in ext), ext)
+
+print("\n== ⑧ 版本级退避独立 + 导出全局串行 + 聚合 ==")
+p = make_series("esH")
+jd = p["jd"]
+es.register_profiles(jd, ["a", "b"])
+es.begin(jd, profile="a")
+check("导出中全局 status=exporting", es.load(jd)["status"] == "exporting", es.load(jd))
+check("active_profile=a", es.load(jd)["active_profile"] == "a", es.load(jd))
+why = es.gate(jd, profile="b")
+check("b 被全局串行挡住", why and "全局串行" in why, why)
+es.succeed(jd, profile="a")
+st = es.load(jd)
+check("a done 后全局不是 done（b 未导）", st["status"] != "done", st)
+check("b 未被 a 的完成影响，可导", es.gate(jd, profile="b") is None)
+es.fail(jd, "boom", profile="b", now=es._now())
+st = es.load(jd)
+p_b = st["profiles"]["b"]
+check("b 进入 retrying", p_b["status"] == "retrying", p_b)
+check("b 有独立 next_retry_at", float(p_b["next_retry_at"] or 0) > 0, p_b)
+check("b 退避中 gate 被挡", (es.gate(jd, profile="b") or "").find("退避") >= 0,
+      es.gate(jd, profile="b"))
+check("a 已 done 不受 b 失败影响", es.gate(jd, profile="a") is None)
+es.begin(jd, profile="b")
+es.succeed(jd, profile="b")
+st = es.load(jd)
+check("两版都 done → 全局 done", st["status"] == "done", st)
+check("done 后 gate 放行", es.gate(jd, profile="b") is None)
+
+print("\n== ⑨ 同版本重跑 .v<n> 三件套改名（含失败回滚） ==")
+import importlib.util
+from unittest import mock
+_spec = importlib.util.spec_from_file_location(
+    "pl_pipeline", os.path.join(_ROOT, "pipeline", "pipeline.py"))
+pl = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(pl)
+
+d = os.path.join(TMP, "stale_out")
+os.makedirs(d, exist_ok=True)
+mp4 = os.path.join(d, "剧A.mp4")
+cover = os.path.join(d, "剧A-封面.jpg")
+prog = mp4 + ".progress.json"
+for f in (mp4, cover, prog):
+    with open(f, "wb") as fh:
+        fh.write(b"x")
+moved = pl.archive_stale_outputs(mp4)
+check("返回三件套", len(moved) == 3, moved)
+check("v1 mp4 存在", os.path.isfile(os.path.join(d, "剧A.v1.mp4")))
+check("v1 封面存在", os.path.isfile(os.path.join(d, "剧A.v1-封面.jpg")))
+check("v1 progress 存在", os.path.isfile(os.path.join(d, "剧A.v1.mp4.progress.json")))
+check("原三件套已移走", not any(os.path.exists(f) for f in (mp4, cover, prog)))
+for f in (mp4, cover, prog):
+    with open(f, "wb") as fh:
+        fh.write(b"y")
+moved = pl.archive_stale_outputs(mp4)
+check("第二次用 v2", len(moved) == 3 and os.path.isfile(os.path.join(d, "剧A.v2.mp4")), moved)
+for f in (mp4, cover, prog):
+    with open(f, "wb") as fh:
+        fh.write(b"z")
+_real_replace = os.replace
+_calls = {"n": 0}
+
+
+def _fail_second(src, dst):
+    _calls["n"] += 1
+    if _calls["n"] == 2:
+        raise OSError("模拟封面改名失败")
+    return _real_replace(src, dst)
+
+
+try:
+    with mock.patch.object(pl.os, "replace", side_effect=_fail_second):
+        pl.archive_stale_outputs(mp4)
+    check("改名失败应抛错", False, "未抛 RuntimeError")
+except RuntimeError as e:
+    check("改名失败抛 RuntimeError", "回滚" in str(e), e)
+check("失败后原 mp4 已回滚", os.path.isfile(mp4))
+check("失败后封面仍在原位", os.path.isfile(cover))
+check("失败后未留下 v3 半套", not os.path.exists(os.path.join(d, "剧A.v3.mp4")))
 
 print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
 sys.exit(1 if fails else 0)

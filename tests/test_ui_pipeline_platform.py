@@ -185,7 +185,8 @@ def test_empty_cut_track_is_blocked_before_save_or_publish(monkeypatch):
     pipeline = types.ModuleType('pipeline')
     for name in ('create_empty_draft', 'inject_videos_into_draft',
                  'merge_preset_into_draft', 'publish_staged_draft',
-                 'find_preset_by_name', 'save_draft'):
+                 'find_preset_by_name', 'save_draft',
+                 'resolve_presets', 'write_preset_manifest'):
         setattr(pipeline, name, lambda *args, **kwargs: None)
     pipeline.DRAFT_ROOT = 'unused'
     monkeypatch.setitem(sys.modules, 'pipeline', pipeline)

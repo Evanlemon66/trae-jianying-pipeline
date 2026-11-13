@@ -1,7 +1,8 @@
 """cover_watch.py — cover_job 落盘监听 → 两阶段调度（剪辑 / 导出）。
 
 触发条件（全部满足，契约见 references/handoff-contract.md）：
-  1. 04_covers/ 有 4 张图（文件名可任意，ingest 自动识别改名）
+  1. 04_covers/ 有 4 张图（文件名可任意，ingest 自动识别改名；多账号可再加
+     `<契约名>_<账号>` 或 `<账号>/<契约名>` 组，每个账号同样 4 张）
   2. 03_prompts/prompts.json 存在
   3. job.json 可解析
   4. titles.gate == "done"
@@ -98,6 +99,7 @@ sys.path.insert(0, os.path.join(_REPO, "pipeline"))
 import export_config as pc  # noqa: E402  # 本机配置（presets.json）唯一读取入口
 from no_window import NO_WINDOW, install_default_hidden  # noqa: E402  # pythonw 托管下子进程一律不弹控制台
 import series_runner as sr  # noqa: E402  # 复用 _run_export（preclean+导出+归拢）
+import pipeline as jp  # noqa: E402  # 草稿目录/导出失效标记等公共能力
 install_default_hidden()  # 无控制台托管时兜底隐藏所有子进程窗口（有控制台不生效）
 sys.path.insert(0, os.path.join(_REPO, "scripts", "utils"))
 try:
@@ -127,6 +129,7 @@ CODE_FINGERPRINT_FILES = (
     "lib/failure_class.py",
     "pipeline/batch_runner.py",
     "pipeline/pipeline.py",
+    "pipeline/preset_ops.py",
 )
 
 
@@ -146,6 +149,9 @@ def check_trigger(job_dir: str) -> tuple[bool, list[str]]:
     for slot in (1, 2, 3, "vertical"):
         if slot not in found:
             reasons.append(f"缺图 slot={slot}")
+    # 多账号：基础 4 张之外允许任意多张账号图（8/12 张都行），但每个出现过的
+    # 账号必须 4 张齐全，避免只换一半封面就发出去。
+    reasons.extend(jm.account_cover_errors(job_dir))
     if not os.path.isfile(os.path.join(job_dir, "03_prompts", "prompts.json")):
         reasons.append("缺 03_prompts/prompts.json")
     try:
@@ -166,7 +172,10 @@ def check_trigger(job_dir: str) -> tuple[bool, list[str]]:
     if stage not in TRIGGER_STAGES:
         reasons.append(f"stage={job.get('stage')} 不在可触发集合")
     if (job.get("video") or {}).get("status") == "done":
-        reasons.append("video 已导出（status=done）")
+        # 多账号：基础账号导完就把整部剧钉成 done 会挡住后来新增的账号草稿/成品。
+        # 只在 job 自己声明了多预设组时放行（全局默认组不追认老任务，避免批量误重跑）。
+        if not _pending_account_outputs(job, job_dir):
+            reasons.append("video 已导出（status=done）")
     return (not reasons), reasons
 
 
@@ -490,10 +499,16 @@ def read_retry(job_dir: str) -> dict[str, Any]:
 
 def retry_gate(job_dir: str, phase_override: Optional[str] = None,
                progress_mtime: float = 0.0,
-               migrate_ctx: Optional[dict[str, Any]] = None) -> Optional[str]:
-    """导出闸门（读真源）：返回等待/暂停原因；None 表示可导。--phase export 人工放行。"""
+               migrate_ctx: Optional[dict[str, Any]] = None,
+               profile: Optional[str] = None) -> Optional[str]:
+    """导出闸门（读真源）：返回等待/暂停原因；None 表示可导。
+
+    profile 非空时按版本独立判断退避/暂停；exporting 仍是全局串行。
+    --phase export 人工放行。
+    """
     return es.gate(job_dir, phase_override=phase_override,
-                   progress_mtime=progress_mtime, migrate_ctx=migrate_ctx)
+                   progress_mtime=progress_mtime, migrate_ctx=migrate_ctx,
+                   profile=profile)
 
 
 def note_export_result(job_dir: str, name: str, ok: bool, *,
@@ -501,18 +516,21 @@ def note_export_result(job_dir: str, name: str, ok: bool, *,
                        error: Optional[str] = None,
                        failure_class: str = "unknown",
                        retryable: bool = True,
-                       phase: Optional[str] = None) -> None:
+                       phase: Optional[str] = None,
+                       profile: Optional[str] = None) -> None:
     """记录导出结果（写真源）：成功置 done 并清零；失败按分类走退避/暂停或终态。
 
     第 3 项：不可重试类（asset_missing/disk_full，retryable=False）直接置终态
     failed、不计数并 toast，避免空转；可重试类按 1/2/4/8/16/30 分钟退避/暂停。
     """
     if ok:
-        es.succeed(job_dir)
-        _log(job_dir, "export ok（真源置 done，计数清零）")
+        es.succeed(job_dir, profile=profile)
+        _log(job_dir, "export ok（真源置 done，计数清零）" if not profile
+             else f"export ok（版本 {profile} 置 done）")
         return
     st = es.fail(job_dir, error, pause_after=pause_after,
-                 failure_class=failure_class, retryable=retryable, phase=phase)
+                 failure_class=failure_class, retryable=retryable, phase=phase,
+                 profile=profile)
     if st.get("status") == "failed":
         _log(job_dir, f"export 硬失败[{failure_class}]，置终态不重试：{error}")
         try:
@@ -554,6 +572,86 @@ def find_stream_draft(series_name: str) -> Optional[str]:
     if not cands:
         return None
     return max(cands, key=os.path.getmtime)
+
+
+def _draft_exported(draft_name: str) -> bool:
+    """该草稿是否已有完成导出的成品（mp4 存在 + progress 标记 done）。
+
+    草稿目录带 _export_stale.json（重新构建/克隆发布后写入）时一律视为未导出：
+    否则改完预设重建同名草稿，旧 mp4 会被当成新成品跳过，静默发布旧视频。
+    """
+    if jp.export_is_stale(os.path.join(_draft_root(), draft_name)):
+        return False
+    out = pc.export_mp4_path(draft_name)
+    if not os.path.isfile(out):
+        return False
+    pj = out + ".progress.json"
+    try:
+        with open(pj, encoding="utf-8") as f:
+            return bool(json.load(f).get("done"))
+    except Exception:
+        return True  # 旧版无 progress：有成品即视为已完成
+
+
+def _account_draft_name(base_draft: str, prof: str) -> str:
+    """附加账号草稿命名约定（与 preset_ops.clone_draft_with_presets 保持一致）。"""
+    return f"{base_draft}_{prof}"
+
+
+def _profile_of_draft(base_draft: str, draft_name: str) -> str:
+    """草稿名 → 版本名：基础草稿是 a，克隆草稿取 `_<版本>` 后缀。"""
+    if not draft_name or draft_name == base_draft:
+        return "a"
+    prefix = base_draft + "_"
+    return draft_name[len(prefix):] if draft_name.startswith(prefix) else "a"
+
+
+def _missing_account_drafts(base_draft: str, profiles: list[str]) -> list[str]:
+    """多账号预设里尚未生成的克隆草稿（基础草稿不在此列）。"""
+    return [d for d in (_account_draft_name(base_draft, p) for p in profiles[1:])
+            if not os.path.isdir(os.path.join(_draft_root(), d))]
+
+
+def _export_targets(base_draft: str, profiles: list[str]) -> list[str]:
+    """多账号预设：基础草稿 + 已生成的附加账号克隆草稿。"""
+    missing = set(_missing_account_drafts(base_draft, profiles))
+    return [base_draft] + [_account_draft_name(base_draft, p) for p in profiles[1:]
+                           if _account_draft_name(base_draft, p) not in missing]
+
+
+def _job_profiles(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str]:
+    """只取 job 自己声明的预设组（不含全局默认组）。
+
+    用途：判断「已 done 的任务是否还有账号成品没导」。若把全局 watch.preset_profile
+    也算进来，改一次全局配置就会让所有历史 done 任务补克隆+重导，属于批量误操作。
+    未显式声明时按 job 自己的 prompts/covers 账号组反推（仍不读全局配置）。
+    """
+    wf = job.get("workflow") or {}
+    profiles = pc.parse_preset_profiles(
+        wf.get("preset_profile") or job.get("preset_profile"))
+    if len(profiles) < 2 and job_dir:
+        inferred = _profiles_from_job_outputs(job_dir)
+        if inferred:
+            profiles = inferred
+    return profiles
+
+
+def _pending_account_outputs(job: dict[str, Any], job_dir: str) -> list[str]:
+    """job 声明的多账号里，仍缺草稿或缺成品的附加账号草稿名。"""
+    profiles = _job_profiles(job, job_dir)
+    if len(profiles) < 2:
+        return []
+    name = os.path.basename(os.path.dirname(job_dir.rstrip("\\/")))
+    draft = find_stream_draft(name)
+    if not draft:
+        return []
+    base = os.path.basename(draft.rstrip("\\/"))
+    pending = list(_missing_account_drafts(base, profiles))
+    for p in profiles[1:]:
+        dn = _account_draft_name(base, p)
+        if dn not in pending and not _draft_exported(dn):
+            pending.append(dn)
+    return pending
 
 
 def _intent_of(job: dict[str, Any]) -> dict[str, Any]:
@@ -754,6 +852,65 @@ def _effective_derive(wf: dict[str, Any], cfg: dict[str, Any],
     return list(g) if g else []
 
 
+def _available_preset_profiles() -> set[str]:
+    """presets.json 里真实存在的预设组（a/b/…），用于过滤推导结果。"""
+    try:
+        with open(pc.CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k)[len("presets_"):].lower() for k in data
+                if str(k).startswith("presets_")}
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def _profiles_from_job_outputs(job_dir: str) -> list[str]:
+    """job 未显式写 preset_profile 时，从 prompts / covers 的账号组反推预设组。
+
+    - 组名来源：`03_prompts/prompts.json` 的 `items[].group`（A/B/C…），
+      以及 `04_covers/` 下的 `b_group` / `b-group` / `b组` 目录；
+    - 少于 2 组不推导（单账号仍只剪默认一份，保持旧行为）；
+    - A/B/C → presets_a/presets_b/presets_c，只保留 presets.json 里存在的组。
+    """
+    groups: set[str] = set()
+    pp = os.path.join(job_dir, "03_prompts", "prompts.json")
+    if os.path.isfile(pp):
+        try:
+            with open(pp, encoding="utf-8") as f:
+                for it in (json.load(f).get("items") or []):
+                    g = str((it or {}).get("group") or "").strip()
+                    if g and g[0].isalpha():
+                        groups.add(g[0].upper())
+        except (OSError, ValueError):
+            pass
+    covers = os.path.join(job_dir, "04_covers")
+    cover_ready: set[str] = set()
+    if os.path.isdir(covers):
+        for fn in os.listdir(covers):
+            cdir = os.path.join(covers, fn)
+            if not os.path.isdir(cdir):
+                continue
+            m = re.fullmatch(r"([A-Za-z])[-_]?group|([A-Za-z])组", fn, re.IGNORECASE)
+            if not m:
+                continue
+            g = (m.group(1) or m.group(2)).upper()
+            groups.add(g)
+            try:
+                imgs = [x for x in os.listdir(cdir)
+                        if x.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
+            except OSError:
+                imgs = []
+            if len(imgs) >= 4:  # 该组 4 张封面齐备
+                cover_ready.add(g)
+    # 三条件齐备才反推：① prompts 有该组 ② 04_covers/<组> 4 张齐 ③ presets_<组> 存在
+    available = _available_preset_profiles()
+    if not available:
+        return []
+    out = [g.lower() for g in sorted(groups & cover_ready) if g.lower() in available]
+    # 默认上限 2 组（A/B）：反推只用于兼容旧任务，不自动扩到 C/D…
+    out = out[:2]
+    return out if len(out) >= 2 else []
+
+
 def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
                pending_edit: int, phase_override: Optional[str] = None,
                notify: bool = True, write_log: bool = True) -> dict[str, Any]:
@@ -766,11 +923,18 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
     name = os.path.basename(series_dir.rstrip("\\/"))
     wf = _intent_of(job)
     draft = find_stream_draft(name)
+    # 预设组（多账号）：job.json workflow.preset_profile / 顶层 preset_profile > 全局 watch.preset_profile
+    # 支持单组 "presets_a" 或多组 "presets_a,presets_b" / ["a","b"]；
+    # 三处都没写时，从 prompts/covers 的账号组（A/B…）反推（少于 2 组不推导）。
+    profiles = pc.parse_preset_profiles(
+        wf.get("preset_profile") or job.get("preset_profile") or cfg.get("preset_profile"))
+    if not profiles:
+        profiles = _profiles_from_job_outputs(job_dir)
     policy = str(cfg.get("export_policy", "immediate")).strip().lower()
     if policy not in EXPORT_POLICIES:
         policy = "immediate"
     plan: dict[str, Any] = {"job_dir": job_dir, "name": name, "draft": draft,
-                            "intent": wf, "policy": policy,
+                            "intent": wf, "policy": policy, "profiles": profiles,
                             "action": "blocked", "reason": "", "cmd": ""}
     cut = _effective_cut(wf, job, job_dir, notify=notify, write_log=write_log)
 
@@ -780,6 +944,8 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
         # _wait_edit_with_watchdog 只按该日志体积变化刷新 edit 心跳，缓冲期间会被
         # 误判成 edit_stalled 而杀掉正在跑的剪辑。
         cmd = [sys.executable, "-u", _BATCH_RUNNER, series_dir, "--force", "--no-export"]
+        if profiles:
+            cmd += ["--profile", ",".join(profiles)]
         start_ep = _read_start_ep(job_dir)
         if start_ep > 1:
             cmd += ["--only", f"{start_ep}.."]
@@ -803,6 +969,9 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
         if not draft:
             plan.update(reason="--phase export 强制但无草稿，先跑 edit")
             return plan
+        dn = os.path.basename(draft.rstrip("\\/"))
+        # 人工放行同样导全多账号草稿（强制语义：已有成品也重导）
+        plan["export_targets"] = _export_targets(dn, profiles)
         plan.update(action="export", reason="--phase export 强制", cmd=_export_cmd())
         return plan
 
@@ -813,8 +982,12 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
         plan.update(reason="video.export_state=cleaned：成品已清理，视为完成（不再调度）")
         return plan
     if export_state == "exported":
-        plan.update(reason="video.export_state=exported：已导出，等待清理（不重复导出）")
-        return plan
+        # 多账号：已经 exported 但 job 声明的附加账号还有缺草稿/缺成品的，继续往下走
+        # （下一步会命中 clone / export 分支）。cleaned 仍视为终态。
+        pending_accounts = _pending_account_outputs(job, job_dir)
+        if not pending_accounts:
+            plan.update(reason="video.export_state=exported：已导出，等待清理（不重复导出）")
+            return plan
 
     if draft is None:
         g = eds.gate(job_dir, phase_override=phase_override)
@@ -837,12 +1010,58 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
     pm, p_status, p_pct = _progress_info(pc.export_mp4_path(dn))
     ctx = _migrate_ctx(job)
     ctx.update({"progress_status": p_status, "progress_pct": p_pct})
-    gate = retry_gate(job_dir, phase_override, progress_mtime=pm, migrate_ctx=ctx)
-    if gate:
-        plan.update(reason=gate)
+    if len(profiles) <= 1:
+        gate = retry_gate(job_dir, phase_override, progress_mtime=pm, migrate_ctx=ctx)
+        if gate:
+            plan.update(reason=gate)
+            return plan
+    missing = _missing_account_drafts(dn, profiles)
+    if missing:
+        # 少一份账号草稿就导出会漏发一个账号：先自动补克隆（只复制草稿换预设，
+        # 几秒完成，不重跑 ASR/翻译/人声分离），失败才退回人工处理。
+        clone_profiles = [p for p in profiles[1:]
+                          if _account_draft_name(dn, p) in set(missing)]
+        plan["draft_name"] = dn
+        plan["clone_profiles"] = clone_profiles
+        clone_cmd: list[str] = []
+        for p in clone_profiles:
+            if clone_cmd:
+                clone_cmd.append("&&")
+            clone_cmd += [sys.executable, os.path.join(_REPO, "pipeline", "rebase_presets.py"),
+                          dn, "--profile", p, "--overwrite"]
+        plan.update(action="clone",
+                    reason=f"缺少账号预设草稿 {', '.join(missing)} → 自动复制基础草稿换预设",
+                    cmd=clone_cmd)
         return plan
-    plan.update(action="export", reason=f"草稿就绪 + mode=full + policy={policy}",
-                cmd=_export_cmd())
+    targets = _export_targets(dn, profiles)
+    pending = [d for d in targets if not _draft_exported(d)]
+    # 版本级退避：某版本暂停/退避只卡它自己（next_retry_at 按版本独立），
+    # 其余版本照常导出；导出本身仍全局串行。
+    blocked: list[str] = []
+    if len(profiles) > 1:
+        ready = []
+        for d in pending:
+            prof = _profile_of_draft(dn, d)
+            _pm, _, _ = _progress_info(pc.export_mp4_path(d))
+            why = retry_gate(job_dir, phase_override, progress_mtime=_pm,
+                             migrate_ctx=ctx, profile=prof)
+            if why:
+                blocked.append(f"{prof}: {why}")
+                _log(job_dir, f"版本 {prof} 暂缓导出：{why}")
+            else:
+                ready.append(d)
+        pending = ready
+    plan["export_targets"] = pending
+    if blocked and not pending:
+        plan.update(reason="待导版本均在退避/暂停 → 暂不导出；" + "；".join(blocked))
+        return plan
+    if len(targets) > 1:
+        reason = f"草稿就绪 + mode=full + policy={policy}，待导出 {len(pending)}/{len(targets)} 份（多版本预设）"
+        if blocked:
+            reason += "；暂缓: " + "；".join(blocked)
+    else:
+        reason = f"草稿就绪 + mode=full + policy={policy}"
+    plan.update(action="export", reason=reason, cmd=_export_cmd())
     return plan
 
 
@@ -1423,6 +1642,41 @@ def run_edit(job_dir: str, plan: dict[str, Any], *, dry_run: bool) -> bool:
     return True
 
 
+def run_clone(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
+              *, dry_run: bool) -> bool:
+    """多账号补克隆：只复制基础草稿换预设层，不重跑 ASR/翻译/人声分离。
+
+    场景：基础草稿已存在（单账号时代建的），后来配置里加了第二个账号预设组，
+    watcher 不会重跑整条 edit，这里几秒补齐缺失的账号草稿，下一轮正常导出。
+    """
+    name = plan["name"]
+    if dry_run:
+        print(_plan_line(plan))
+        return True
+    _write_lock(job_dir, "clone")
+    toast("👥 账号预设克隆开始", name, icon="info")
+    _log(job_dir, f"clone start: {plan.get('clone_profiles')}")
+    try:
+        from preset_ops import clone_draft_with_presets
+        for prof in plan.get("clone_profiles") or []:
+            rep = clone_draft_with_presets(
+                plan["draft_name"], preset_profile=prof, overwrite=True)
+            _log(job_dir, f"clone ok {rep['target']}（{prof}）")
+        toast("✅ 账号预设草稿就绪", f"{name}（下一轮导出）", icon="success")
+        return True
+    except Exception as e:
+        brief = _exception_brief(e, where="run_clone")
+        _log(job_dir, f"clone 失败: {brief}")
+        p_class, _act = fc.classify(brief, phase="export")
+        strat = fc.strategy_of(p_class)
+        note_export_result(job_dir, name, False,
+                           pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
+                           error=brief, failure_class=p_class,
+                           retryable=bool(strat.get("retryable")), phase="clone")
+        toast("❌ 账号预设克隆失败", f"{name}: {brief}", icon="error")
+        return False
+
+
 def _run_verify(script: str, draft_name: str, mp4_path: str, job_dir: str) -> tuple[int, str]:
     """调用导出后质检脚本，返回 (rc, 明细日志路径)。
 
@@ -1507,55 +1761,116 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
                       f"owner={holder.get('owner')}），稍后重试")
         return False
     _write_lock(job_dir, "export")
-    es.begin(job_dir, phase="export")  # 真源进入 exporting（唯一写者经 export_state）
+    # 多版本：导出仍全局串行；每次只把一个版本置 exporting，版本自己的退避/暂停
+    # 记在 profiles[<版本>]，互不拖累。已完成的版本下一轮由 _draft_exported 跳过。
+    profiles = pc.parse_preset_profiles(
+        wf.get("preset_profile") or job.get("preset_profile") or cfg.get("preset_profile")) \
+        or list(plan.get("profiles") or []) or ["a"]
+    es.register_profiles(job_dir, profiles)
+    if "export_targets" in plan:
+        targets = list(plan.get("export_targets") or [])
+    else:
+        targets = [d for d in _export_targets(draft_name, profiles)
+                   if not _draft_exported(d)]
+    if not targets:
+        export_lock.release()
+        remaining = [d for d in _export_targets(draft_name, profiles)
+                     if not _draft_exported(d)]
+        _log(job_dir, "export 跳过：本轮无待导版本"
+             + (f"（仍有未完成: {', '.join(remaining)}）" if remaining else "（全部已有成品）"))
+        if not remaining:
+            note_export_result(job_dir, name, True)
+            _derive_video_status(job_dir)
+        return True
+    verify_script = os.path.join(_REPO, "pipeline", "verify_export.py")
+    exported: list[tuple[str, str]] = []
     try:
-        ok = sr._run_export(draft_name,
-                            timeout=float(cfg.get("export_stall_timeout", 1800)),
-                            cold_start=bool(cfg.get("cold_start", True)),
-                            job_dir=job_dir)
+        for idx, dn in enumerate(targets, 1):
+            one_out = pc.export_mp4_path(dn)
+            prof = _profile_of_draft(draft_name, dn)
+            if _draft_exported(dn):
+                _log(job_dir, f"export 跳过（已有成品）{idx}/{len(targets)}: {dn}")
+                exported.append((dn, one_out))
+                continue
+            # 同版本重跑：旧成品三件套（mp4/封面/progress）改名 .v<n> 保留，
+            # 不覆盖、也不与新成品混为一谈。任一改名失败整组回滚并硬失败。
+            if os.path.isfile(one_out) and jp.export_is_stale(os.path.join(_draft_root(), dn)):
+                try:
+                    moved = jp.archive_stale_outputs(one_out)
+                except Exception as e:
+                    brief = _exception_brief(e, where="archive_stale")
+                    _log(job_dir, f"旧成品归档失败 {dn}: {brief}")
+                    note_export_result(job_dir, name, False,
+                                       pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
+                                       error=brief, failure_class="archive_failed",
+                                       retryable=False, phase="export", profile=prof)
+                    toast("❌ 旧成品归档失败", f"{name} {dn}: {brief}", icon="error")
+                    return False
+                for s, d in moved:
+                    _log(job_dir, f"旧成品归档: {os.path.basename(s)} → {os.path.basename(d)}")
+            _log(job_dir, f"export 开始 {idx}/{len(targets)}: {dn}（版本 {prof}）")
+            es.begin(job_dir, phase="export", profile=prof)
+            es.heartbeat(job_dir, phase="export", profile=prof)
+            ok = sr._run_export(dn,
+                                timeout=float(cfg.get("export_stall_timeout", 1800)),
+                                cold_start=bool(cfg.get("cold_start", True)),
+                                job_dir=job_dir)
+            _log(job_dir, f"export {'ok' if ok else '失败'} {idx}/{len(targets)}: {dn}")
+            if not ok:
+                # 第 3 项：读回子进程落盘的 failure_class（权威），缺失则对 last_error 重新分类
+                p_class, p_phase, last_err = _read_progress_failure(one_out)
+                if not p_class:
+                    p_class, _act = fc.classify(last_err, p_phase)
+                strat = fc.strategy_of(p_class)
+                note_export_result(job_dir, name, False,
+                                   pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
+                                   error=last_err or "robust_auto_export 返回非 0",
+                                   failure_class=p_class,
+                                   retryable=bool(strat.get("retryable")),
+                                   phase=p_phase, profile=prof)
+                # 从 sidecar 读回实际自愈动作写入真源（唯一写者仍是 export_state；无值不写）
+                es.record_recovery(job_dir, _read_progress_recovery(one_out))
+                toast("❌ 导出失败", f"{name} {dn}（{p_class}）", icon="error")
+                return False
+            # 逐份质检（与 batch_runner 默认行为一致；--no-verify 关闭）
+            es.heartbeat(job_dir, phase="verify", profile=prof)
+            if verify and os.path.isfile(verify_script):
+                _log(job_dir, f"verify start {idx}/{len(targets)}: {dn}")
+                rc, vlog = _run_verify(verify_script, dn, one_out, job_dir)
+                _log(job_dir, f"verify rc={rc} {idx}/{len(targets)}: {dn}（明细 {vlog}）")
+                if rc != 0:
+                    toast("⚠️ 导出完成但质检未通过", f"{name} {dn}", icon="warning")
+            exported.append((dn, one_out))
     finally:
         export_lock.release()
-    _log(job_dir, f"export {'ok' if ok else '失败'}")
-    if not ok:
-        # 第 3 项：读回子进程落盘的 failure_class（权威），缺失则对 last_error 重新分类
-        p_class, p_phase, last_err = _read_progress_failure(out_mp4)
-        if not p_class:
-            p_class, _act = fc.classify(last_err, p_phase)
-        strat = fc.strategy_of(p_class)
-        note_export_result(job_dir, name, False,
-                           pause_after=int(cfg.get("retry_pause_after", RETRY_PAUSE_AFTER)),
-                           error=last_err or "robust_auto_export 返回非 0",
-                           failure_class=p_class,
-                           retryable=bool(strat.get("retryable")),
-                           phase=p_phase)
-        # 从 sidecar 读回实际自愈动作写入真源（唯一写者仍是 export_state；无值不写）
-        es.record_recovery(job_dir, _read_progress_recovery(out_mp4))
-        toast("❌ 导出失败", f"{name}（{p_class}）", icon="error")
-        return False
-    # 质检（与 batch_runner 默认行为一致；--no-verify 关闭）
-    es.heartbeat(job_dir, phase="verify")
-    verify_script = os.path.join(_REPO, "pipeline", "verify_export.py")
-    if verify and os.path.isfile(verify_script):
-        _log(job_dir, "verify start")
-        rc, vlog = _run_verify(verify_script, draft_name, out_mp4, job_dir)
-        _log(job_dir, f"verify rc={rc}（明细 {vlog}）")
-        if rc != 0:
-            toast("⚠️ 导出完成但质检未通过", name, icon="warning")
-    try:
-        # 本轮导出目标路径是确定的（与 _run_export 同一个 out_mp4），显式传下去：
-        # 不再依赖 stream manifest 自动探测，避免 manifest 缺 paths.export_file 时
-        # 登记失败、video.export_state 留 null、build_plan 判定需要再导一遍。
-        rep = jm.record_video(job_dir,
-                              export_dir=os.path.dirname(out_mp4) or None,
-                              export_file=out_mp4 if os.path.isfile(out_mp4) else None,
-                              draft_name=draft_name)
-        _log(job_dir, f"record-video ok export_dir={rep['video']['export_dir']}")
-    except Exception as e:
-        _log(job_dir, f"record-video 失败: {e}")
-        toast("⚠️ 导出完成但登记失败", f"{name} record-video: {e}", icon="warning")
-    # 真源终态 done（计数清零），随后把 video.status 由真源派生落 job.json
-    note_export_result(job_dir, name, True)
-    _derive_video_status(job_dir)
+    if len(exported) > 1:
+        for dn, p in exported[1:]:
+            _log(job_dir, f"附加版本成品: {dn} → {p}")
+    # 按版本登记成品：video.outputs[<版本>]，顶层字段取基础版聚合。
+    # 本轮导出目标路径是确定的（与 _run_export 同一个路径），显式传下去，避免
+    # manifest 缺 paths.export_file 时登记失败、video.export_state 留 null。
+    for dn, p in exported:
+        prof = _profile_of_draft(draft_name, dn)
+        try:
+            rep = jm.record_video(job_dir,
+                                  export_dir=os.path.dirname(p) or None,
+                                  export_file=p if os.path.isfile(p) else None,
+                                  draft_name=dn, profile=prof)
+            _log(job_dir, f"record-video ok 版本={prof} draft={dn} "
+                          f"export_dir={rep['video']['export_dir']}")
+        except Exception as e:
+            _log(job_dir, f"record-video 失败（{dn}）: {e}")
+            toast("⚠️ 导出完成但登记失败", f"{name} record-video({dn}): {e}", icon="warning")
+        es.succeed(job_dir, profile=prof)
+        # 导出成功：清除该草稿的失效标记，下次轮询才认这份成品
+        jp.clear_export_stale(os.path.join(_draft_root(), dn))
+    # 所有声明版本都导出后才把顶层置 done；否则保持聚合态，下一轮补未完成版本
+    remaining = [d for d in _export_targets(draft_name, profiles) if not _draft_exported(d)]
+    if remaining:
+        _log(job_dir, "仍有版本未导出（等待下一轮）: " + ", ".join(remaining))
+    else:
+        note_export_result(job_dir, name, True)
+        _derive_video_status(job_dir)
     # 从 sidecar 读回实际自愈动作写入真源（唯一写者仍是 export_state；无值不写）
     es.record_recovery(job_dir, _read_progress_recovery(out_mp4))
     if platforms:
@@ -1568,7 +1883,8 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
         _log(job_dir, "derive 跳过（意图/全局均为不派生）")
     job = jm.load_job(os.path.join(job_dir, "job.json"))
     export_dir = (job.get("video") or {}).get("export_dir") or "（见 pipeline.log）"
-    toast("✅ mp4 导出完成", f"{name}\n{export_dir}", icon="success")
+    extra = f"\n另 {len(exported) - 1} 份账号预设草稿" if len(exported) > 1 else ""
+    toast("✅ mp4 导出完成", f"{name}\n{export_dir}{extra}", icon="success")
     _log(job_dir, "chain done")
     return True
 
@@ -1979,11 +2295,12 @@ def _eval_round(args: argparse.Namespace, cfg: dict[str, Any],
 
 
 def _pick(candidates: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    """每轮只推进一部：edit 优先（不占剪映），再按优先级降序、路径升序。"""
-    actionable = [p for p in candidates if p["action"] in ("edit", "export")]
+    """每轮只推进一部：edit 优先（不占剪映），clone 次之（几秒），再按优先级/路径。"""
+    actionable = [p for p in candidates if p["action"] in ("edit", "clone", "export")]
     if not actionable:
         return None
-    actionable.sort(key=lambda p: (0 if p["action"] == "edit" else 1,
+    action_rank = {"edit": 0, "clone": 1, "export": 2}
+    actionable.sort(key=lambda p: (action_rank.get(p["action"], 9),
                                    -int(p["intent"].get("priority") or 0),
                                    p["job_dir"].lower()))
     return actionable[0]
@@ -2173,6 +2490,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         try:
             if pick["action"] == "edit":
                 success = run_edit(pick["job_dir"], pick, dry_run=False)
+            elif pick["action"] == "clone":
+                success = run_clone(pick["job_dir"], pick, cfg, dry_run=False)
             else:
                 success = run_export(pick["job_dir"], pick, cfg, dry_run=False,
                                      verify=not args.no_verify,

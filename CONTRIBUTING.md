@@ -57,6 +57,8 @@ powershell -File pipeline\install_deps.ps1 -DetectOnly
 
 审查 PR 时把「新增/修改的子进程调用是否隐藏窗口」列为必查项：漏一个就可能在无人值守时反复弹黑框。
 
+**CLI 入参命名**：改动或新增 CLI 参数必须沿用既有命名，不得自造同义新参数。多版本/账号相关一律用 `--profile`（`pipeline.py` / `batch_runner.py` / `rebase_presets.py` / `init_draft.py` / `ui_pipeline.py` 已统一）；`--only` 在 `batch_runner` 是「集段」含义，不得复用为版本选择。
+
 > 历史背景：曾因 `media_normalizer`（每集转码）、`local_materials`（建草稿时逐素材 ffprobe）、
 > `tasklist` 等调用未带 flag，执行期间每 1–3 秒弹一次黑框，并把 watcher 拖到 900 秒心跳超时被杀。
 

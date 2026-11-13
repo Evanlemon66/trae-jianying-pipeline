@@ -84,6 +84,7 @@ WORKFLOW_DEFAULTS: dict[str, Any] = {
     "cut_s": None,           # 正数秒裁剪；None/0=不裁
     "derive": [],            # 派生平台列表；[]=不派生
     "priority": 0,           # 调度优先级（大者优先）
+    "preset_profile": None,  # 预设组名（presets.json 的 presets_<组名>），多账号各用各的预设
     "intent_revision": 0,    # 仅人工 +1，任何程序路径只读不写
     "intent_source": "default",  # default | dispatch | manual
     "merged_at": None,
@@ -299,7 +300,7 @@ def build_job(series: str, *, host: str = "trae") -> dict[str, Any]:
             "gate": "pending",
             "prompt_file": None,
             "prompt_sha256": None,
-            "prompt_version": "title-spec-v4.1",
+            "prompt_version": "title-spec-v4.4",
             "selected": [],
             "selected_at": None,
         },
@@ -641,11 +642,77 @@ def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str
     if titles.get("gate") == "done" and len(selected) != 3:
         errors.append("gate=done 时 selected 必须有 3 项")
 
+    # 多组门禁结果：结构合法 + 编号必须存在 + 组内不重复（跨组允许重复）
+    raw_groups = titles.get("selected_groups")
+    if raw_groups is not None:
+        if not isinstance(raw_groups, list) or not raw_groups:
+            errors.append("titles.selected_groups 应为非空数组")
+        else:
+            names: set[str] = set()
+            first: list[str] = []
+            for gi, g in enumerate(raw_groups):
+                if not isinstance(g, dict):
+                    errors.append(f"selected_groups[{gi}] 应为对象 {{group,picks}}")
+                    continue
+                name = str(g.get("group") or "").strip().upper()
+                if not name:
+                    errors.append(f"selected_groups[{gi}] 缺少 group")
+                elif name in names:
+                    errors.append(f"selected_groups 组名重复: {name}")
+                else:
+                    names.add(name)
+                gpicks = g.get("picks") or []
+                if not isinstance(gpicks, list) or len(gpicks) != 3:
+                    errors.append(f"selected_groups[{gi}] 组 {name or gi} 需 3 项")
+                    continue
+                gids: set[str] = set()
+                for p in gpicks:
+                    if not isinstance(p, dict):
+                        errors.append(f"selected_groups[{gi}] picks 条目应为对象")
+                        continue
+                    tid = _norm_title_id(p.get("title_id"))
+                    if not tid:
+                        errors.append(f"selected_groups[{gi}] 条目缺少 title_id")
+                    elif tid in gids:
+                        errors.append(f"selected_groups[{gi}] 组内 title_id 重复: {tid}")
+                    else:
+                        gids.add(tid)
+                        errors.extend(_title_ref_errors(
+                            f"selected_groups[{gi}] 的 title_id", p.get("title_id"), cand_index))
+                if gi == 0:
+                    first = [str((p or {}).get("title_id")) for p in gpicks
+                             if isinstance(p, dict)]
+            sel_ids = [_norm_title_id(e.get("title_id")) for e in selected
+                       if isinstance(e, dict)]
+            if first and sel_ids and first != sel_ids:
+                errors.append("selected_groups 首组与 titles.selected 不一致（应同为首组）")
+
     prompts = job.get("prompts") or {}
-    if prompts.get("count") != 4:
-        errors.append("prompts.count 应为 4")
-    if not isinstance(prompts.get("items", []), list):
+    prompt_items = prompts.get("items", [])
+    if not isinstance(prompt_items, list):
         errors.append("prompts.items 应为数组")
+    else:
+        # 允许多账号多组（A/B…，count=4×组数），但每组必须四槽齐全；
+        # 单组时等价于旧契约「4 条」。
+        p_count = prompts.get("count")
+        if prompt_items and isinstance(p_count, int) and not isinstance(p_count, bool) \
+                and p_count != len(prompt_items):
+            errors.append(f"prompts.count({p_count}) 与 items 数量({len(prompt_items)}) 不一致")
+        groups: dict[str, set[Any]] = {}
+        for it in prompt_items:
+            if not isinstance(it, dict):
+                errors.append(f"prompts 条目应为对象，实际: {it!r}")
+                continue
+            g = str(it.get("group") or "A").strip().upper()
+            slot = it.get("slot")
+            if slot not in (1, 2, 3, "vertical"):
+                errors.append(f"prompts 组 {g} 的 slot 非法: {slot!r}")
+                continue
+            groups.setdefault(g, set()).add(slot)
+        for g, slots in sorted(groups.items()):
+            missing = [str(s) for s in (1, 2, 3, "vertical") if s not in slots]
+            if missing:
+                errors.append(f"prompts 组 {g} 缺槽位: {'、'.join(missing)}")
 
     video = job.get("video") or {}
     if video.get("path") and not str(video["path"]).endswith(".mp4"):
@@ -897,6 +964,14 @@ def _normalize_dispatch(raw: dict[str, Any]) -> dict[str, Any]:
             if key not in names:
                 names.append(key)
     out["derive"] = names
+    prof = raw.get("preset_profile")
+    if prof is not None:
+        # 多账号：允许 ["a","b"] 数组，统一收成 "a,b"（watcher 端 parse_preset_profiles 解析）
+        if isinstance(prof, (list, tuple)):
+            prof = ",".join(str(x).strip() for x in prof if str(x).strip())
+        else:
+            prof = str(prof).strip()
+        out["preset_profile"] = prof or None
     pri = raw.get("priority", 0)
     if isinstance(pri, bool) or not isinstance(pri, (int, float)):
         raise ValueError(f"dispatch.priority 应为整数: {pri!r}")
@@ -923,7 +998,7 @@ def merge_workflow_core(job: dict[str, Any], job_dir: str, *, notify=None) -> di
     if rev == 0:
         merged = _normalize_dispatch(raw) if raw else {}
         src = "dispatch" if raw else (wf.get("intent_source") or "default")
-        for k in ("mode", "cut_s", "derive", "priority"):
+        for k in ("mode", "cut_s", "derive", "priority", "preset_profile"):
             if k in merged and wf.get(k) != merged[k]:
                 wf[k] = merged[k]
                 changed = True
@@ -1302,11 +1377,13 @@ def _best_of_selected(job_dir: str, titles_file: Optional[str],
 
 
 def _annotate_titles_file(job_dir: str, job: dict[str, Any],
-                          picks: list[dict[str, Any]], by: str) -> None:
+                          picks: list[dict[str, Any]], by: str,
+                          groups: Optional[list[dict[str, Any]]] = None) -> None:
     """门禁后在 titles.json 原位标注：选中 3 条加 selected/slot，顶层记 gate。
 
     不复制标题文本，job.json 仍是唯一事实源；这里只是让 02_titles/titles.json
     自包含（豆包侧 Stage 2 只读这个文件也能看懂结果）。
+    多组时额外写 `selected_groups` 与条目级 `group_names`（同一条可在多组复用）。
     """
     titles_rel = (job.get("titles") or {}).get("file")
     if not titles_rel:
@@ -1320,17 +1397,30 @@ def _annotate_titles_file(job_dir: str, job: dict[str, Any],
     if not isinstance(items, list):
         return
     by_id = {p["title_id"]: p for p in picks}
+    group_names: dict[str, list[str]] = {}
+    for g in groups or []:
+        for p in g["picks"]:
+            names = group_names.setdefault(p["title_id"], [])
+            if g["group"] not in names:
+                names.append(g["group"])
     for item in items:
         item.pop("selected", None)
         item.pop("slot", None)
+        item.pop("group_names", None)
         tid = str(item.get("id"))
         if tid in by_id:
             item["selected"] = True
             item["slot"] = by_id[tid]["slot"]
+        if tid in group_names:
+            item["group_names"] = group_names[tid]
+        elif tid in by_id and groups:
+            item["group_names"] = []
     if isinstance(data, dict):
         data["gate"] = "done"
         data["selected_at"] = now_iso()
         data["selected_by"] = by
+        if groups:
+            data["selected_groups"] = groups
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1338,21 +1428,78 @@ def _annotate_titles_file(job_dir: str, job: dict[str, Any],
     os.replace(tmp, path)
 
 
+def parse_group_expression(expr: str) -> list[list[str]]:
+    """解析分组选择表达式：'t1 t2 n1，t5 t9 n12' → [[T1,T2,N1],[T5,T9,N12]]。
+
+    组内用空格或英文逗号，组间用中文逗号 `，` 或分号 `；`；空段忽略。
+    """
+    out: list[list[str]] = []
+    for part in re.split(r"[，；;]", str(expr or "")):
+        ids = [s.strip() for s in re.split(r"[,，\s]+", part) if s.strip()]
+        if ids:
+            out.append(ids)
+    return out
+
+
+def _canonical_groups(job_dir: str, titles_file: Optional[str],
+                      raw_groups: list[Any]) -> list[dict[str, Any]]:
+    """把 [{group, picks}] 归一为 [{group, picks:[{slot,title_id,title}]}]。
+
+    组内必须恰好 3 条且互不重复；跨组允许同一标题重复；编号必须存在于候选池。
+    """
+    texts = _title_texts(job_dir, titles_file)
+    out: list[dict[str, Any]] = []
+    for gi, g in enumerate(raw_groups):
+        if not isinstance(g, dict):
+            raise ValueError(f"groups[{gi}] 不是对象")
+        name = str(g.get("group") or chr(ord("A") + gi)).strip().upper() or chr(ord("A") + gi)
+        if any(x["group"] == name for x in out):
+            raise ValueError(f"组名重复: {name}")
+        entries: list[dict[str, Any]] = []
+        for idx, p in enumerate(list(g.get("picks") or [])[:3], start=1):
+            if isinstance(p, dict):
+                tid, title = (p.get("title_id") or p.get("id")), p.get("title")
+            else:
+                tid, title = p, None
+            key = _norm_title_id(tid)
+            if key not in texts:
+                raise ValueError(f"组 {name} 的编号不存在: {tid}")
+            entries.append({"slot": idx, "title_id": key,
+                            "title": title or texts.get(key) or ""})
+        if len(entries) != 3:
+            raise ValueError(f"组 {name} 需要恰好 3 个编号，实际 {len(entries)}")
+        if len({e["title_id"] for e in entries}) != 3:
+            raise ValueError(f"组 {name} 内编号重复")
+        out.append({"group": name, "picks": entries})
+    if not out:
+        raise ValueError("groups 为空")
+    return out
+
+
 def select_titles(job_dir: str, picks: list[dict[str, Any]],
-                  by: str = "user", auto_mode: Optional[str] = None) -> dict[str, Any]:
+                  by: str = "user", auto_mode: Optional[str] = None,
+                  groups: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
     """写入门禁结果：titles.selected + gate=done + cover_map 回填。
 
-    picks: [{"slot":1,"title_id":"T6","title":"..."},...] 共 3 项。
+    picks: [{"slot":1,"title_id":"T6","title":"..."},...] 共 3 项（第一组）。
+    groups: 多组门禁结果 [{group:"A",picks:[3 项]},...]；传了则以第一组同步
+            titles.selected / cover_map，全量写 titles.selected_groups。
     by: "user"（人工门禁）/ "auto"（兜底自动选分）。
     auto_mode: 兜底模式（"recommended"/"score"），仅 by="auto" 时记录，人工选置空。
     """
     if by not in ("user", "auto"):
         raise ValueError(f"by 非法: {by}")
-    if len(picks) != 3:
-        raise ValueError(f"selected 应为 3 项，实际 {len(picks)}")
 
     path = os.path.join(job_dir, "job.json")
     job = load_job(path)
+
+    canonical_groups: Optional[list[dict[str, Any]]] = None
+    if groups:
+        canonical_groups = _canonical_groups(
+            job_dir, (job.get("titles") or {}).get("file"), groups)
+        picks = canonical_groups[0]["picks"]
+    if len(picks) != 3:
+        raise ValueError(f"selected 应为 3 项，实际 {len(picks)}")
 
     # 回填 cover_map：按 slot 对齐 title_id / title
     cover_map = job.get("cover_map") or []
@@ -1379,6 +1526,8 @@ def select_titles(job_dir: str, picks: list[dict[str, Any]],
         },
         "cover_map": new_map,
     }
+    if canonical_groups:
+        patch["titles"]["selected_groups"] = canonical_groups
     # 只有当前阶段早于 titles_selected 时才推进 stage；已出封面后重选不能回退 stage。
     reselect_after_covers = _stage_index(current_stage) >= _stage_index("titles_selected")
     if not reselect_after_covers:
@@ -1390,6 +1539,9 @@ def select_titles(job_dir: str, picks: list[dict[str, Any]],
                   "score": "评分模式（全量取前 3）"}.get(auto_mode, "评分")
     detail = ("用户门禁选定 3 条标题" if by == "user"
               else f"兜底机制：用户未选，{mode_label}自动选定前 3 条")
+    if canonical_groups:
+        detail += "；共 " + str(len(canonical_groups)) + " 组（" + \
+                  "、".join(g["group"] for g in canonical_groups) + "）"
     explicit = (job.get("vertical_cover") or {}).get("title_id")
     if best and explicit in (None, ""):
         patch["vertical_cover"] = {"title_id": best["title_id"], "title": best["title"]}
@@ -1406,7 +1558,7 @@ def select_titles(job_dir: str, picks: list[dict[str, Any]],
         detail += (f"；重选（当前 {current_stage}）：stage 保持不变，"
                    "04_covers 需重新生成")
     job = update_job(job_dir, patch, event=event, detail=detail)
-    _annotate_titles_file(job_dir, job, picks, by)
+    _annotate_titles_file(job_dir, job, picks, by, groups=canonical_groups)
     return job
 
 
@@ -1607,12 +1759,17 @@ def _export_companions(export_file: str) -> list[str]:
 def record_video(job_dir: str, *, export_dir: Optional[str] = None,
                  export_file: Optional[str] = None,
                  draft_name: Optional[str] = None,
+                 profile: Optional[str] = None,
                  dry_run: bool = False) -> dict[str, Any]:
     """登记 pipeline 导出目录：只记录位置，不复制 mp4。
 
     自动按 source_dir=cover_job 父目录探测 stream manifest；同时把
     stream_manifest.py 的清理联动挂到 cleanup.external（记录不接管）。
     仅当当前 stage 已过 covers_ready 时才推进到 video_ready。
+
+    profile：本次成品属于哪个版本（基础版默认 "a"）。每个版本一条
+    video.outputs[<版本>] 台账；顶层 export_file/export_dir/draft_name 保留为
+    基础版聚合字段，export_state 仍是整剧聚合状态。
     """
     job = load_job(os.path.join(job_dir, "job.json"))
     series_dir = os.path.dirname(os.path.normpath(job_dir))
@@ -1644,20 +1801,55 @@ def record_video(job_dir: str, *, export_dir: Optional[str] = None,
     companions = [p for p in (_export_companions(export_file) if export_file else [])
                   if os.path.exists(p)]
 
+    prof = str(profile or "a").strip().lower()
+    outputs = dict((job.get("video") or {}).get("outputs") or {})
+    prev = dict(outputs.get(prof) or {})
+    history = list(prev.get("history") or [])
+    rel_file = (export_file or "").replace(os.sep, "/") or None
+    size = prev.get("size_bytes")
+    if export_file and os.path.isfile(export_file):
+        try:
+            size = os.path.getsize(export_file)
+        except OSError:
+            size = prev.get("size_bytes")
+    if rel_file and prev.get("export_file") != rel_file:
+        history.append({"file": rel_file, "at": now_iso(), "size_bytes": size})
+        history = history[-20:]
+    outputs[prof] = {
+        "draft": draft_name,
+        "export_dir": (export_dir or "").replace(os.sep, "/") or None,
+        "export_file": rel_file,
+        "size_bytes": size,
+        "state": "exported",
+        "exported_at": now_iso() if rel_file else prev.get("exported_at"),
+        "history": history,
+    }
+
     patch: dict[str, Any] = {"video": {
         "export_dir": (export_dir or "").replace(os.sep, "/") or None,
-        "export_file": (export_file or "").replace(os.sep, "/") or None,
+        "export_file": rel_file,
         "draft_name": draft_name,
         "export_state": "exported",
+        "outputs": outputs,
         "companions": [p.replace(os.sep, "/") for p in companions],
     }}
+    # 顶层聚合字段以基础版为准（A 版先导 / 后补 B 版时不被 B 覆盖）
+    base_entry = outputs.get("a") or {}
+    if base_entry.get("export_file"):
+        patch["video"]["export_file"] = base_entry["export_file"]
+        patch["video"]["export_dir"] = base_entry.get("export_dir")
+        patch["video"]["draft_name"] = base_entry.get("draft") or draft_name
 
     if draft_name:
+        scope_cmd = (f'python pipeline/stream_manifest.py clean "{draft_name}"'
+                     if prof == "a" else
+                     f'python pipeline/stream_manifest.py clean --job "{draft_name}" --profile {prof}')
         ext_entry = {
             "tool": "pipeline/stream_manifest.py",
             "draft_name": draft_name,
+            "profile": prof,
             "manifest": info["manifest"] if info else None,
-            "command": f'python pipeline/stream_manifest.py clean "{draft_name}"',
+            "command": scope_cmd,
             "scope": ["export_bundle(mp4+封面+progress)", "draft_dir",
                       "jycache_dir", "workdir"],
             "deletes_final_mp4": True,
@@ -1938,6 +2130,84 @@ CANONICAL_COVER_STEMS: dict[Any, str] = {
     1: "cover_01_hit", 2: "cover_02_contrast", 3: "cover_03_guard",
     "vertical": "cover_04_vertical",
 }
+_SLOT_OF_STEM = {v: k for k, v in CANONICAL_COVER_STEMS.items()}
+# 多账号封面：<契约名>_<账号>.<ext>（也接受 - 分隔）或 04_covers/<账号>/<契约名>.<ext>
+COVER_ACCOUNT_SEPARATORS = ("_", "-")
+# 备份/临时文件不当作账号组，避免 cover_01_hit_bak.png 被误报成「账号 bak 缺图」
+_COVER_IGNORE_SUFFIXES = {"bak", "backup", "old", "tmp", "temp", "copy", "副本", "备份"}
+
+
+def split_account_cover_stem(stem: str) -> tuple[str, Optional[str]]:
+    """cover_01_hit_b → ('cover_01_hit', 'b')；非账号变体返回归一化 stem 与 None。"""
+    s = str(stem or "").strip().lower()
+    for canon in CANONICAL_COVER_STEMS.values():
+        if s.startswith(canon) and len(s) > len(canon) \
+                and s[len(canon)] in COVER_ACCOUNT_SEPARATORS:
+            prof = s[len(canon) + 1:].strip("_-")
+            if prof and prof not in _COVER_IGNORE_SUFFIXES and len(prof) <= 16:
+                return canon, prof
+    return s, None
+
+
+def detect_account_cover_sets(job_dir: str) -> dict[str, dict[Any, str]]:
+    """识别按账号命名的封面组 → {账号: {slot: 绝对路径}}。
+
+    只认两种命名（大小写不敏感），保证账号图不会被当成基础契约图改名覆盖：
+      04_covers/cover_01_hit_<账号>.png   （后缀式，适合所有图放同一目录）
+      04_covers/<账号>/cover_01_hit.png   （目录式，适合每个账号一个子目录）
+    """
+    covers = os.path.join(job_dir, "04_covers")
+    sets: dict[str, dict[Any, str]] = {}
+    if not os.path.isdir(covers):
+        return sets
+    # 后缀式
+    for name in sorted(os.listdir(covers), key=natural_key):
+        p = os.path.join(covers, name)
+        if not os.path.isfile(p) or os.path.splitext(name)[1].lower() not in IMAGE_EXTS:
+            continue
+        canon, prof = split_account_cover_stem(os.path.splitext(name)[0])
+        if prof:
+            sets.setdefault(prof, {}).setdefault(_SLOT_OF_STEM[canon], p)
+    # 目录式（derived/ 等非账号目录跳过：只收契约名齐全的目录）
+    for name in sorted(os.listdir(covers), key=natural_key):
+        d = os.path.join(covers, name)
+        if not os.path.isdir(d) or name.lower() == "derived":
+            continue
+        # 目录名归一成账号键：b_group / B组 / b → b
+        key = name.strip().lower()
+        for suf in ("_group", "-group", "组"):
+            if key.endswith(suf):
+                key = key[:-len(suf)].strip("_-") or name.lower()
+                break
+        sub: dict[Any, str] = {}
+        for fn in sorted(os.listdir(d), key=natural_key):
+            p = os.path.join(d, fn)
+            if not os.path.isfile(p) or os.path.splitext(fn)[1].lower() not in IMAGE_EXTS:
+                continue
+            stem = os.path.splitext(fn)[0].lower()
+            # 目录内既支持 cover_01_hit，也支持 cover_01_hit_B（账号后缀冗余写法）
+            slot = _SLOT_OF_STEM.get(stem) or _SLOT_OF_STEM.get(
+                split_account_cover_stem(stem)[0])
+            if slot is not None:
+                sub.setdefault(slot, p)
+        if sub:
+            for slot, p in sub.items():
+                sets.setdefault(key, {}).setdefault(slot, p)
+    return sets
+
+
+def account_cover_errors(job_dir: str) -> list[str]:
+    """账号封面组完整性：只要某账号的封面出现过，就必须 4 张齐全。
+
+    防止「只换了两张」或新旧图混用导致某个账号发出半套封面；完全没做的账号
+    不报错（复用基础封面即可）。
+    """
+    errors: list[str] = []
+    for prof, slots in sorted(detect_account_cover_sets(job_dir).items()):
+        missing = [str(s) for s in CANONICAL_COVER_STEMS if s not in slots]
+        if missing:
+            errors.append(f"账号 {prof} 封面组不完整（缺 {'、'.join(missing)}）")
+    return errors
 
 
 def detect_cover_files(job_dir: str, *, apply: bool = True) -> tuple[dict[Any, str], list[str]]:
@@ -1956,6 +2226,10 @@ def detect_cover_files(job_dir: str, *, apply: bool = True) -> tuple[dict[Any, s
     files = [os.path.join(covers, n) for n in sorted(os.listdir(covers), key=natural_key)
              if os.path.isfile(os.path.join(covers, n))
              and os.path.splitext(n)[1].lower() in IMAGE_EXTS]
+    # 多账号图（cover_01_hit_b / a/cover_01_hit）只按账号组处理，绝不参与基础契约
+    # 识别与改名：否则 8/12 张图会被误映射成 slot 1/2/3 并 os.replace 覆盖掉别的账号。
+    files = [p for p in files
+             if not split_account_cover_stem(os.path.splitext(os.path.basename(p))[0])[1]]
     by_stem = {os.path.splitext(os.path.basename(p))[0].lower(): p for p in files}
     for slot, stem in CANONICAL_COVER_STEMS.items():
         if stem in by_stem:
@@ -2205,15 +2479,28 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
 
     # ── 标题门禁：优先读 selection.json（agent 只需交编号清单，不写 job.json）
     sel_file = os.path.join(job_dir, "02_titles", "selection.json")
-    if os.path.isfile(sel_file) and len(titles.get("selected") or []) != 3:
+    if os.path.isfile(sel_file) and (len(titles.get("selected") or []) != 3
+                                     or not titles.get("selected_groups")):
         with open(sel_file, encoding="utf-8-sig") as f:
             sdata = json.load(f)
-        picks = sdata.get("picks") or sdata.get("selected") or []
-        titles["selected"] = picks
-        titles["selected_by"] = sdata.get("selected_by") or "user"
-        titles["selected_at"] = titles.get("selected_at") or now_iso()
-        titles["gate"] = "done"
-        report["normalized"].append(f"读取 selection.json（{len(picks)} 条）")
+        groups_raw = sdata.get("groups") or []
+        if groups_raw:
+            norm_groups = _canonical_groups(job_dir, titles.get("file"), groups_raw)
+            titles["selected_groups"] = norm_groups
+            titles["selected"] = list(norm_groups[0]["picks"])
+            titles["selected_by"] = sdata.get("selected_by") or "user"
+            titles["selected_at"] = titles.get("selected_at") or now_iso()
+            titles["gate"] = "done"
+            report["normalized"].append(
+                f"读取 selection.json（{len(norm_groups)} 组，"
+                f"首组 {','.join(p['title_id'] for p in norm_groups[0]['picks'])}）")
+        elif len(titles.get("selected") or []) != 3:
+            picks = sdata.get("picks") or sdata.get("selected") or []
+            titles["selected"] = picks
+            titles["selected_by"] = sdata.get("selected_by") or "user"
+            titles["selected_at"] = titles.get("selected_at") or now_iso()
+            titles["gate"] = "done"
+            report["normalized"].append(f"读取 selection.json（{len(picks)} 条）")
 
     # ── 规范化 selected：对象 / "T9" / 9 / 纯文本 → canonical 对象
     if titles.get("selected"):
@@ -2598,10 +2885,13 @@ def _main(argv: Optional[list[str]] = None) -> int:
     p_tit.add_argument("--prompt", default=None)
     p_tit.add_argument("--prompt-version", default=None)
 
-    p_sel = sub.add_parser("select", help="人工门禁：按 slot 顺序给 3 个编号")
+    p_sel = sub.add_parser("select", help="人工门禁：按 slot 顺序给 3 个编号，或按组表达式")
     p_sel.add_argument("--job", required=True)
-    p_sel.add_argument("--picks", required=True,
-                       help="逗号分隔 3 个编号，依次为封面1/2/3，如 T6,T11,T1")
+    p_sel.add_argument("--picks", default=None,
+                       help="单组：逗号分隔 3 个编号，依次为封面1/2/3，如 T6,T11,T1")
+    p_sel.add_argument("--groups", default=None,
+                       help="多组：一段=一个发布账号组，组内空格/英文逗号，组间中文逗号或分号，"
+                            "如 \"t1 t2 n1，t5 t9 n12\"")
 
     p_res = sub.add_parser("resolve", help="Stage 2 取上下文（含兜底链）")
     p_res.add_argument("--job", required=True)
@@ -2693,26 +2983,51 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "select":
-        ids = [s.strip() for s in args.picks.split(",") if s.strip()]
-        if len(ids) != 3:
-            print("[FAIL] --picks 需要恰好 3 个编号，如 T6,T11,T1")
+        if not args.picks and not args.groups:
+            print("[FAIL] 需要 --picks（单组 3 个编号）或 --groups（分组表达式）")
             return 1
         titles_file = os.path.join(
             job_dir, (load_job(os.path.join(job_dir, "job.json"))
                       .get("titles") or {}).get("file") or "02_titles/titles.json")
-        items = {_norm_title_id(t.get("id") or t.get("title_id")): t
-                 for t in _load_titles_items(titles_file) if isinstance(t, dict)}
-        picks = []
-        for slot, tid in enumerate(ids, start=1):
-            key = _norm_title_id(tid)
-            if key not in items:
-                print(f"[FAIL] 编号不存在: {tid}")
+
+        def _to_picks(ids: list[str]) -> Optional[list[dict[str, Any]]]:
+            items = {_norm_title_id(t.get("id") or t.get("title_id")): t
+                     for t in _load_titles_items(titles_file) if isinstance(t, dict)}
+            out = []
+            for slot, tid in enumerate(ids, start=1):
+                key = _norm_title_id(tid)
+                if key not in items:
+                    print(f"[FAIL] 编号不存在: {tid}")
+                    return None
+                out.append({"slot": slot, "title_id": key,
+                            "title": _item_title_text(items[key]) or ""})
+            return out
+
+        groups = None
+        if args.groups:
+            raw = []
+            for gi, ids in enumerate(parse_group_expression(args.groups)):
+                if len(ids) != 3:
+                    print(f"[FAIL] 第 {gi + 1} 组需要恰好 3 个编号，实际 {len(ids)}: {ids}")
+                    return 1
+                raw.append({"group": chr(ord("A") + gi), "picks": ids})
+            if not raw:
+                print("[FAIL] --groups 为空")
                 return 1
-            picks.append({"slot": slot, "title_id": key,
-                          "title": _item_title_text(items[key]) or ""})
-        job = select_titles(job_dir, picks, by="user")
+            groups = raw
+            ids = raw[0]["picks"]
+        else:
+            ids = [s.strip() for s in args.picks.split(",") if s.strip()]
+            if len(ids) != 3:
+                print("[FAIL] --picks 需要恰好 3 个编号，如 T6,T11,T1")
+                return 1
+        picks = _to_picks(ids)
+        if picks is None:
+            return 1
+        job = select_titles(job_dir, picks, by="user", groups=groups)
+        extra = (f" groups={len(groups)}" if groups else "")
         print(f"[OK] revision={job['revision']} stage={job['stage']} gate=done "
-              f"selected={','.join(ids)}")
+              f"selected={','.join(ids)}{extra}")
         return 0
 
     if args.command == "resolve":

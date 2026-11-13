@@ -9,7 +9,7 @@ sys.path.insert(0, _HERE)
 
 from jy_cover import set_draft_cover, set_cover_composition
 
-from export_config import get_deps_root, get_font_path
+from export_config import get_deps_root, get_font_path, preset_profile_name
 import job_manifest as jm
 from no_window import NO_WINDOW, install_default_hidden, hidden_child_env
 install_default_hidden()  # 无控制台托管时兜底隐藏所有子进程窗口（有控制台不生效）
@@ -251,6 +251,8 @@ def publish_staged_draft(stage_dir, draft_name, duration_us=0):
     print(f"🚀 草稿已发布到剪映目录: {target}")
     if _jianying_running():
         print("⚠️  剪映正在运行：若该草稿此刻处于打开状态，请先关闭该草稿再刷新草稿列表")
+    # 草稿内容已更新：旧成品不再代表当前草稿，打失效标记（导出成功后清除）
+    mark_export_stale(target, "publish")
     if trash:
         shutil.rmtree(trash, ignore_errors=True)
     # 发布成功后清理暂存区空壳（move 已搬走本体，残留的是封面/配置等小文件壳目录）
@@ -636,7 +638,12 @@ def _collect_inner_materials(inner_draft, new_materials, id_map):
 
 
 def merge_preset_into_draft(draft, preset_path, offset_us=0, stretch_to_duration_us=None,
-                            clip_alpha=None):
+                            clip_alpha=None, out_manifest=None):
+    """把组合预设合并进草稿。
+
+    out_manifest 传入 dict 时，会把本次新增的轨道 ID / 素材 ID 追加进去，
+    供「克隆草稿换预设」时精确剥离旧预设层（见 preset_ops.strip_preset_layers）。
+    """
     with open(preset_path, "r", encoding="utf-8") as f:
         preset = json.load(f)
 
@@ -778,6 +785,19 @@ def merge_preset_into_draft(draft, preset_path, offset_us=0, stretch_to_duration
         draft["materials"].setdefault("drafts", []).extend(new_nested_drafts)
 
     draft.setdefault("tracks", []).extend(new_flat_tracks)
+
+    if out_manifest is not None:
+        out_manifest.setdefault("tracks", []).extend(
+            t.get("id") for t in new_flat_tracks if t.get("id"))
+        mats = out_manifest.setdefault("materials", {})
+        for mk, mv in new_materials.items():
+            ids = [m.get("id") for m in mv if isinstance(m, dict) and m.get("id")]
+            if ids:
+                mats.setdefault(mk, []).extend(ids)
+        draft_ids = [d.get("id") for d in new_nested_drafts
+                     if isinstance(d, dict) and d.get("id")]
+        if draft_ids:
+            mats.setdefault("drafts", []).extend(draft_ids)
 
     return len(new_flat_tracks), sum(len(v) for v in new_materials.values()) + len(new_nested_drafts)
 
@@ -1221,7 +1241,8 @@ def add_text_segments(draft, sub_segments, offset_us=0, font="HarmonyOS Sans SC"
 
     原生约定（参考 10月22日 草稿）：
       中文字幕: track.attribute=2, seg.track_attribute=2, render_index=14000, transform.y=-0.56
-      英文字幕: track.attribute=0, seg.track_attribute=0, render_index=14052, transform.y=-0.64
+      英文字幕: track.attribute=0, seg.track_attribute=0, render_index=14052,
+               transform.y=-0.7523595505617979（对齐「被踹下悬崖，我化身海东青赶山宠妻_第01-80集串流」）
       两条 track 均 flag=1 / is_default_name=true，segment.visible 控制显隐。
     """
     text_mats = []
@@ -1231,7 +1252,7 @@ def add_text_segments(draft, sub_segments, offset_us=0, font="HarmonyOS Sans SC"
     is_cn = (sub_type == 0)
     track_attribute = 2 if is_cn else 0
     render_index = 14000 if is_cn else 14052
-    transform_y = -0.56 if is_cn else -0.64
+    transform_y = -0.56 if is_cn else -0.7523595505617979
 
     MIN_DUR_US = 1_500_000
 
@@ -2357,17 +2378,64 @@ def parse_presets_arg(s):
     return out
 
 
-def resolve_presets():
-    """返回 (presets, 来源描述)。presets 为 [(name, alpha), ...]，可能为空列表。"""
+def _preset_items(items):
+    """把预设组配置规范化为 [(name, alpha), ...]，忽略无名项。"""
+    if not isinstance(items, list):
+        return []
+    return [(it["name"], it.get("alpha")) for it in items
+            if isinstance(it, dict) and it.get("name")]
+
+
+def _find_profile_presets(cfg, profile):
+    """按预设组名查找配置：presets_<name>（大小写不敏感）。
+
+    profile 可传 'a' 或 'presets_a'，会先归一化。找不到返回 None。
+    """
+    name = preset_profile_name(profile)
+    key = f"presets_{name}"
+    for k in cfg:
+        if isinstance(k, str) and k.lower() == key.lower():
+            return cfg.get(k)
+    return None
+
+
+def resolve_presets(profile=None):
+    """返回 (presets, 来源描述)。presets 为 [(name, alpha), ...]，可能为空列表。
+
+    多账号预设组：
+      presets_<组名>           每个账号/渠道一组，如 presets_a / presets_b
+      default_preset_profile   未显式指定组时用哪一组，写成完整键名如 "presets_a"（也兼容 "a"）
+      presets                  兼容旧配置：默认预设组（未配置分组时使用）
+    profile 显式指定但配置里没有该组时抛 RuntimeError（避免静默用错品牌物料）。
+    """
     if os.path.isfile(PRESETS_JSON):
         try:
             with open(PRESETS_JSON, encoding="utf-8") as f:
-                items = json.load(f).get("presets", [])
-            out = [(it["name"], it.get("alpha")) for it in items if it.get("name")]
+                cfg = json.load(f)
+        except Exception as e:
+            cfg = None
+            print(f"  ⚠️ presets.json 解析失败({e})，回退自动发现")
+        if isinstance(cfg, dict):
+            if profile:
+                name = preset_profile_name(profile)
+                items = _find_profile_presets(cfg, name)
+                if items is None:
+                    raise RuntimeError(
+                        f"presets.json 中未找到预设组 'presets_{name}'；"
+                        f"可用: {sorted(k for k in cfg if str(k).lower().startswith('presets'))}")
+                return _preset_items(items), f"配置文件 {os.path.basename(PRESETS_JSON)} / 预设组 {name}"
+            default_profile = preset_profile_name(cfg.get("default_preset_profile"))
+            if default_profile:
+                items = _find_profile_presets(cfg, default_profile)
+                if items is None:
+                    raise RuntimeError(
+                        f"default_preset_profile='{cfg.get('default_preset_profile')}' 未在 presets.json 中定义；"
+                        f"应写 presets_<组名>，如 presets_{default_profile}")
+                return (_preset_items(items),
+                        f"配置文件 {os.path.basename(PRESETS_JSON)} / 默认预设组 {default_profile}")
+            out = _preset_items(cfg.get("presets"))
             if out:
                 return out, f"配置文件 {os.path.basename(PRESETS_JSON)}"
-        except Exception as e:
-            print(f"  ⚠️ presets.json 解析失败({e})，回退自动发现")
     prefixed = [(n, None) for n in list_available_presets() if n.startswith(PRESET_PREFIX)]
     if prefixed:
         return prefixed, f"预设库前缀 {PRESET_PREFIX}* 自动发现"
@@ -2385,6 +2453,114 @@ def warn_missing_presets(presets):
 
 
 DEFAULT_PRESETS = []  # 兼容旧引用；实际解析走 resolve_presets()
+
+# 预设层清单：记录某次构建加了哪些预设轨/素材，供克隆草稿换预设时精确剥离
+PRESET_MANIFEST_NAME = "_pipeline_presets.json"
+
+# 导出失效标记：草稿被重新构建/克隆发布后写入，watcher 见到它就不再认为旧 mp4 是
+# 当前草稿的成品（避免「改了预设重建草稿，但旧成品被当成新成品跳过导出」）。
+# 导出成功后由 clear_export_stale() 清除。
+EXPORT_STALE_NAME = "_export_stale.json"
+
+
+def mark_export_stale(path, reason=""):
+    """标记草稿内容已变，旧导出成品视为过期（只写标记，不动用户成品文件）。"""
+    try:
+        d = _draft_dir_of(path)
+        if not os.path.isdir(d):
+            return
+        payload = {"draft": os.path.basename(d), "reason": reason,
+                   "marked_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        with open(os.path.join(d, EXPORT_STALE_NAME), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  [warn] 写导出失效标记失败: {e}")
+
+
+def export_is_stale(path):
+    """草稿是否带导出失效标记（带标记 = 旧成品不能算当前草稿的导出）。"""
+    try:
+        return os.path.isfile(os.path.join(_draft_dir_of(path), EXPORT_STALE_NAME))
+    except Exception:
+        return False
+
+
+def clear_export_stale(path):
+    """导出成功后清除失效标记（失败只告警，不影响主流程）。"""
+    try:
+        p = os.path.join(_draft_dir_of(path), EXPORT_STALE_NAME)
+        if os.path.isfile(p):
+            os.remove(p)
+    except Exception as e:
+        print(f"  [warn] 清除导出失效标记失败: {e}")
+
+
+def archive_stale_outputs(export_file, *, max_versions=99):
+    """同版本重跑前，把旧成品三件套改名 .v<n> 保留（不覆盖、不删除）。
+
+    三件套：`<stem>.mp4`、`<stem>-封面.jpg`、`<stem>.mp4.progress.json`。
+    返回 [(旧路径, 新路径)]；没有旧 mp4 时返回 []。
+    只要有一个文件改名失败，就把已改的整组回滚并抛 RuntimeError——
+    绝不允许出现"mp4 已改名、封面还是旧的"这种半套状态。
+    """
+    p = os.path.abspath(export_file)
+    if not os.path.isfile(p):
+        return []
+    stem, ext = os.path.splitext(p)
+    n = 1
+    while n <= max_versions:
+        cand = f"{stem}.v{n}{ext}"
+        if not any(os.path.exists(x) for x in
+                   (cand, f"{stem}.v{n}-封面.jpg", f"{cand}.progress.json")):
+            break
+        n += 1
+    if n > max_versions:
+        raise RuntimeError(f"旧成品版本号已用尽（>{max_versions}）: {p}")
+    plan = [(p, f"{stem}.v{n}{ext}"),
+            (stem + "-封面.jpg", f"{stem}.v{n}-封面.jpg"),
+            (p + ".progress.json", f"{stem}.v{n}{ext}.progress.json")]
+    plan = [(s, d) for s, d in plan if os.path.exists(s)]
+    done = []
+    try:
+        for s, d in plan:
+            os.replace(s, d)
+            done.append((s, d))
+    except OSError as e:
+        for s, d in reversed(done):
+            try:
+                os.replace(d, s)
+            except OSError:
+                pass
+        raise RuntimeError(f"旧成品归档失败（已回滚已改名文件）: {e}") from e
+    return done
+
+
+def _draft_dir_of(path):
+    p = str(path)
+    if os.path.isfile(p) or p.lower().endswith(".json"):
+        return os.path.dirname(os.path.abspath(p))
+    return os.path.abspath(p)
+
+
+def write_preset_manifest(path, manifest):
+    """写草稿目录下的预设层清单（失败只告警，不阻塞主流程）。"""
+    try:
+        d = _draft_dir_of(path)
+        with open(os.path.join(d, PRESET_MANIFEST_NAME), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  [warn] 写预设清单失败: {e}")
+
+
+def read_preset_manifest(path):
+    """读预设层清单；不存在/损坏返回 None。"""
+    p = os.path.join(_draft_dir_of(path), PRESET_MANIFEST_NAME)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def default_workdir_for_draft(draft_name_or_path):
@@ -2433,7 +2609,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                  do_whisper=True, do_translate=True, do_hide_cn=True,
                  do_subtitle_check=True,
                  do_vad_gate=True, vad_min_speech_ratio=None,
-                 presets=None,
+                 presets=None, preset_profile=None,
                  cover_image=None, cover_extract_from_video=None, cover_extract_time_s=3.0,
                  vocal_mode="audio_track", job_dir=None):
     if workdir is None:
@@ -2442,7 +2618,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
     _TIMINGS.clear()  # 每次运行重新计时
 
     if presets is None:
-        presets, _preset_src = resolve_presets()
+        presets, _preset_src = resolve_presets(preset_profile)
         if _preset_src:
             print(f"  🧩 预设来源: {_preset_src}")
         if do_presets and not presets:
@@ -2450,6 +2626,14 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         elif do_presets:
             warn_missing_presets(presets)
     PRESETS = presets
+    # 预设层清单：记录本次合并出的轨道/素材，克隆换预设时据此精确剥离
+    preset_manifest = {
+        "profile": preset_profile,
+        "presets": [],
+        "tracks": [],
+        "materials": {},
+        "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
     print(f"\n{'='*60}")
     print(f"  🎬 JianYing Full-Local Pipeline")
@@ -2638,12 +2822,18 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                 print(f"  ✗ 找不到预设目录! (目录 '{preset_name}' 不存在)")
                 continue
             try:
+                one = {}
                 nt, nm = merge_preset_into_draft(
                     draft, pp,
                     offset_us=0,
                     stretch_to_duration_us=main_dur,
                     clip_alpha=alpha_override,
+                    out_manifest=one,
                 )
+                preset_manifest["presets"].append({"name": preset_name, "alpha": alpha_override})
+                preset_manifest["tracks"].extend(one.get("tracks") or [])
+                for _mk, _ids in (one.get("materials") or {}).items():
+                    preset_manifest["materials"].setdefault(_mk, []).extend(_ids)
                 alpha_note = f", clip.alpha={alpha_override}" if alpha_override else ""
                 print(f"  ✅ 合并: +{nt} tracks, +{nm} materials{alpha_note}")
 
@@ -2956,6 +3146,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             dp_root, draft_path = publish_staged_draft(
                 dp_root, draft_name_or_path, draft.get("duration", 0))
         _write_pipeline_backup(draft_path, draft)
+        write_preset_manifest(draft_path, preset_manifest)
         # 记录串流产物清单（供 stream_manifest.py 一键清理）
         try:
             import stream_manifest as _sm
@@ -3195,7 +3386,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-demucs", action="store_true", help="跳过人声分离")
     parser.add_argument("--no-presets", action="store_true", help="跳过所有预设")
     parser.add_argument("--presets", default=None, metavar="'名1,名2:0.03'",
-                        help="显式指定预设(逗号分隔, 名字后可带:滤镜透明度); 优先级高于 presets.json 与前缀自动发现")
+                        help="显式指定预设(逗号分隔, 名字后可带:滤镜透明度); 优先级高于 --profile 与 presets.json")
+    parser.add_argument("--profile", default=None, metavar="a",
+                        help="预设组名（配置里写 presets_a；这里写 a 或 presets_a 均可），多账号各用各的预设")
     parser.add_argument("--list-presets", action="store_true",
                         help="列出本机剪映预设库及当前生效来源后退出")
     parser.add_argument("--no-asr", action="store_true", help="跳过字幕识别")
@@ -3209,7 +3402,11 @@ if __name__ == "__main__":
 
     if args.list_presets:
         avail = list_available_presets()
-        resolved, src = resolve_presets()
+        try:
+            resolved, src = resolve_presets(args.profile)
+        except RuntimeError as e:
+            print(f"❌ {e}")
+            sys.exit(2)
         resolved_names = {n for n, _ in resolved}
         print("本机剪映组合预设库:")
         for n in avail:
@@ -3221,9 +3418,20 @@ if __name__ == "__main__":
             print(f"  {'✅' if marks else '  '} {n}" + (f"  ({', '.join(marks)})" if marks else ""))
         if not avail:
             print("  (空) — 在剪映中框选元素 → 保存为我的预设 后此处可见")
+        if os.path.isfile(PRESETS_JSON):
+            try:
+                with open(PRESETS_JSON, encoding="utf-8") as f:
+                    _cfg = json.load(f)
+                _groups = sorted(k for k in _cfg if str(k).lower().startswith("presets_"))
+                if _groups:
+                    print(f"\n已配置预设组: {_groups}")
+                    print(f"默认预设组: {_cfg.get('default_preset_profile') or '(未设置)'}")
+            except Exception:
+                pass
         print(f"\n当前解析来源: {src or '无（本次将不使用预设）'}")
         print(f"生效预设: {[n for n, _ in resolved] or '无'}")
-        print("提示: --presets '名1,名2:0.03' 可临时覆盖; 个人固定配置写 pipeline/presets.json")
+        print("提示: --profile a 选预设组（配置里写 presets_a）；--presets '名1,名2:0.03' 可临时覆盖; "
+              "多组批量见 batch_runner.py --profile a,b; 个人固定配置写 pipeline/presets.json")
         sys.exit(0)
 
     if not args.draft:
@@ -3251,6 +3459,7 @@ if __name__ == "__main__":
             do_vad_gate=not args.no_vad_gate,
             do_presets=not args.no_presets,
             presets=parse_presets_arg(args.presets) if args.presets else None,
+            preset_profile=None if args.presets else args.profile,
             do_ffmpeg=True,
             do_whisper=not args.no_asr,
             do_translate=not args.no_translate,

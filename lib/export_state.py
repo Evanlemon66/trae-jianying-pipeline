@@ -83,12 +83,12 @@ def _iso(ts: Optional[float] = None) -> str:
 
 def _default() -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "status": "pending",
         "attempts": 0,
         "consecutive_failures": 0,
         "last_error": None,
-        "next_retry_at": 0,          # epoch；0 表示立即可重试
+        "next_retry_at": 0,          # epoch；0 表示立即可重试（顶层=各版本聚合）
         "progress": None,            # 0-100 整数或 None
         "heartbeat_ts": 0,           # epoch 心跳（与 .progress.json 取大者判活）
         "updated_at": None,          # 人类可读的最近写入时间
@@ -97,7 +97,69 @@ def _default() -> dict[str, Any]:
         "failure_class": "unknown",  # 预留：失败分类（第 3 项）
         "last_recovery_action": None,  # 最近一次自愈动作（soft_home/kill_restart/dismiss/dismiss_then_kill）
         "last_recovery_at": None,      # 最近一次自愈动作时间（ISO）
+        "active_profile": None,      # 当前正在导出的版本（导出全局串行）
+        "profiles": {},              # 版本维度：{版本: 与顶层同构的子状态}
     }
+
+
+def _profile_default() -> dict[str, Any]:
+    """单版本子状态（不含 profiles/active_profile，避免递归）。"""
+    return {
+        "status": "pending",
+        "attempts": 0,
+        "consecutive_failures": 0,
+        "last_error": None,
+        "next_retry_at": 0,
+        "progress": None,
+        "heartbeat_ts": 0,
+        "updated_at": None,
+        "phase": None,
+        "failure_class": "unknown",
+    }
+
+
+def _prof(st: dict[str, Any], name: str) -> dict[str, Any]:
+    """取（必要时创建）版本子状态；调用方需持有可写的整份状态副本。"""
+    profiles = st.setdefault("profiles", {})
+    p = dict(_profile_default())
+    p.update(profiles.get(name) or {})
+    profiles[name] = p
+    return p
+
+
+def _aggregate(st: dict[str, Any]) -> dict[str, Any]:
+    """把各版本子状态聚合回顶层（顶层 status 仍是全局闸门）。
+
+    - 所有版本 done → done；
+    - 任一出错 → 依次降级 paused / failed / retrying（next_retry_at 取最小）；
+    - 都没有问题时 → pending（可继续导下一版）。
+    """
+    profiles = st.get("profiles") or {}
+    if not profiles:
+        return st
+    statuses = [str((v or {}).get("status") or "pending") for v in profiles.values()]
+    if all(s == "done" for s in statuses):
+        st["status"] = "done"
+        st["progress"] = 100
+        st["consecutive_failures"] = 0
+        st["next_retry_at"] = 0
+    elif "paused" in statuses:
+        st["status"] = "paused"
+        st["next_retry_at"] = 0
+    elif "failed" in statuses:
+        st["status"] = "failed"
+        st["next_retry_at"] = 0
+    elif "exporting" in statuses:
+        st["status"] = "exporting"
+    elif "retrying" in statuses:
+        st["status"] = "retrying"
+        waits = [float((v or {}).get("next_retry_at") or 0)
+                 for v in profiles.values() if (v or {}).get("status") == "retrying"]
+        st["next_retry_at"] = min(waits) if waits else 0
+    else:
+        st["status"] = "pending"
+        st["next_retry_at"] = 0
+    return st
 
 
 def _atomic_write(job_dir: str, data: dict[str, Any]) -> None:
@@ -266,15 +328,44 @@ def reap_stale(job_dir: str, *, progress_mtime: float = 0.0,
     st["next_retry_at"] = 0
     st["last_error"] = (st.get("last_error") or "") and st.get("last_error") or \
         "心跳超时，判定上次导出崩溃（stale 回收）"
+    act = st.get("active_profile")
+    if act:
+        p = _prof(st, act)
+        p["status"] = "retrying"
+        p["next_retry_at"] = 0
+        p["last_error"] = st["last_error"]
+    st["active_profile"] = None
     _save_if_changed(job_dir, st)
     return True
 
 
 # ── 状态转移 ─────────────────────────────────────────────────────
 
+def register_profiles(job_dir: str, names: list[str]) -> dict[str, Any]:
+    """登记本剧声明的全部版本（缺失的补 pending），保证顶层聚合不会提前 done。"""
+    if not names:
+        return _read_raw(job_dir) or _default()
+    st = dict(_read_raw(job_dir) or _default())
+    changed = False
+    for n in names:
+        n = str(n).strip().lower()
+        if n and n not in (st.get("profiles") or {}):
+            _prof(st, n)
+            changed = True
+    if changed:
+        _aggregate(st)
+        return _save_if_changed(job_dir, st)
+    return st
+
+
 def begin(job_dir: str, *, phase: Optional[str] = None,
+          profile: Optional[str] = None,
           now: Optional[float] = None) -> dict[str, Any]:
-    """pending/retrying/paused → exporting。已在 exporting 时只刷心跳（幂等，不重复计次）。"""
+    """pending/retrying/paused → exporting。已在 exporting 时只刷心跳（幂等，不重复计次）。
+
+    profile：本次导出的版本。顶层 status 恒为 exporting（导出全局串行），
+    版本自己的 status/attempts/next_retry_at 单独记在 profiles[profile]。
+    """
     now = now if now is not None else _now()
     st = _read_raw(job_dir) or _default()
     if st.get("status") != "exporting":
@@ -284,11 +375,22 @@ def begin(job_dir: str, *, phase: Optional[str] = None,
     st["next_retry_at"] = 0
     if phase:
         st["phase"] = phase
+    if profile:
+        st["active_profile"] = profile
+        p = _prof(st, profile)
+        if p.get("status") != "exporting":
+            p["attempts"] = int(p.get("attempts") or 0) + 1
+        p["status"] = "exporting"
+        p["heartbeat_ts"] = now
+        p["next_retry_at"] = 0
+        if phase:
+            p["phase"] = phase
     return _save_if_changed(job_dir, st)
 
 
 def heartbeat(job_dir: str, *, progress: Optional[int] = None,
-              phase: Optional[str] = None, now: Optional[float] = None) -> None:
+              phase: Optional[str] = None, profile: Optional[str] = None,
+              now: Optional[float] = None) -> None:
     """导出进行中刷新心跳（幂等）。仅处于 exporting 时生效。"""
     now = now if now is not None else _now()
     st = _read_raw(job_dir)
@@ -300,6 +402,14 @@ def heartbeat(job_dir: str, *, progress: Optional[int] = None,
         st["progress"] = max(0, min(100, int(progress)))
     if phase:
         st["phase"] = phase
+    if profile:
+        st["active_profile"] = profile
+        p = _prof(st, profile)
+        p["heartbeat_ts"] = now
+        if progress is not None:
+            p["progress"] = max(0, min(100, int(progress)))
+        if phase:
+            p["phase"] = phase
     _save_if_changed(job_dir, st)
 
 
@@ -325,13 +435,32 @@ def record_recovery(job_dir: str, action: Optional[str], *,
     return _save_if_changed(job_dir, st)
 
 
-def succeed(job_dir: str, *, now: Optional[float] = None) -> dict[str, Any]:
-    """→ done：计数清零。幂等（已 done 时原样返回，不重写、不产生副作用）。"""
+def succeed(job_dir: str, *, profile: Optional[str] = None,
+           now: Optional[float] = None) -> dict[str, Any]:
+    """→ done：计数清零。幂等（已 done 时原样返回，不重写、不产生副作用）。
+
+    profile：只把该版本置 done；顶层在所有版本都 done 时才变 done，
+    否则回到 pending/has-error 聚合态，让下一版还能继续导。
+    """
     st = _read_raw(job_dir) or _default()
-    if st.get("status") == "done":
+    if not profile and st.get("status") == "done":
         return st
     now = now if now is not None else _now()
     st = dict(st)
+    st["active_profile"] = None
+    if profile:
+        p = _prof(st, profile)
+        p["status"] = "done"
+        p["attempts"] = 0
+        p["consecutive_failures"] = 0
+        p["next_retry_at"] = 0
+        p["last_error"] = None
+        p["progress"] = 100
+        p["heartbeat_ts"] = now
+        st["last_error"] = None
+        st["heartbeat_ts"] = now
+        _aggregate(st)
+        return _save_if_changed(job_dir, st)
     st["status"] = "done"
     st["attempts"] = 0
     st["consecutive_failures"] = 0
@@ -339,6 +468,11 @@ def succeed(job_dir: str, *, now: Optional[float] = None) -> dict[str, Any]:
     st["last_error"] = None
     st["progress"] = 100
     st["heartbeat_ts"] = now
+    if st.get("profiles"):
+        for _k, _v in st["profiles"].items():
+            if isinstance(_v, dict):
+                _v["status"] = "done"
+                _v["next_retry_at"] = 0
     return _save_if_changed(job_dir, st)
 
 
@@ -347,6 +481,7 @@ def fail(job_dir: str, error: Optional[str] = None, *,
          failure_class: str = "unknown",
          retryable: bool = True,
          phase: Optional[str] = None,
+         profile: Optional[str] = None,
          now: Optional[float] = None) -> dict[str, Any]:
     """记录一次失败。
 
@@ -355,6 +490,7 @@ def fail(job_dir: str, error: Optional[str] = None, *,
     - retryable=False（asset_missing / disk_full 等硬错误）：→ 终态 failed，
       **不递增** consecutive_failures（不计数），next_retry_at=0，等人工处理。
     phase/failure_class 写入对应字段，供第 2/3 项追溯。
+    profile：只更新该版本子状态，顶层按所有版本重新聚合（退避按版本独立）。
     """
     now = now if now is not None else _now()
     st = _read_raw(job_dir) or _default()
@@ -364,6 +500,28 @@ def fail(job_dir: str, error: Optional[str] = None, *,
     st["heartbeat_ts"] = now
     if phase:
         st["phase"] = phase
+    if profile:
+        st["active_profile"] = None
+        p = _prof(st, profile)
+        p["last_error"] = error
+        p["failure_class"] = failure_class
+        p["heartbeat_ts"] = now
+        if phase:
+            p["phase"] = phase
+        if not retryable:
+            p["status"] = "failed"
+            p["next_retry_at"] = 0
+        else:
+            fails = int(p.get("consecutive_failures") or 0) + 1
+            p["consecutive_failures"] = fails
+            if fails >= max(1, pause_after):
+                p["status"] = "paused"
+                p["next_retry_at"] = 0
+            else:
+                p["status"] = "retrying"
+                p["next_retry_at"] = now + BACKOFF_S[min(fails - 1, len(BACKOFF_S) - 1)]
+        _aggregate(st)
+        return _save_if_changed(job_dir, st)
     if not retryable:
         st["status"] = "failed"
         st["next_retry_at"] = 0
@@ -423,7 +581,8 @@ def _infer_from_ctx(job_dir: str, *, progress_mtime: float = 0.0,
 
 def gate(job_dir: str, *, phase_override: Optional[str] = None,
          progress_mtime: float = 0.0,
-         migrate_ctx: Optional[dict[str, Any]] = None) -> Optional[str]:
+         migrate_ctx: Optional[dict[str, Any]] = None,
+         profile: Optional[str] = None) -> Optional[str]:
     """导出闸门：返回等待/暂停原因；None 表示可导。--phase export 为人工强制放行。
 
     纯内存推导：文件缺失时按 migrate_ctx 推断，但**不 migrate、不备份、不写盘**；
@@ -440,6 +599,28 @@ def gate(job_dir: str, *, phase_override: Optional[str] = None,
         st = _infer_from_ctx(job_dir, progress_mtime=progress_mtime,
                              migrate_ctx=migrate_ctx)
     st = _effective(st, progress_mtime)
+    if profile:
+        if st.get("status") == "exporting" and st.get("active_profile") not in (None, profile):
+            return "导出进行中（其他版本，导出为全局串行）"
+        p = dict(_profile_default())
+        p.update((st.get("profiles") or {}).get(profile) or {})
+        if _is_stale_exporting(p, progress_mtime, _now(), STALE_AFTER_S):
+            p = dict(p)
+            p["status"] = "retrying"
+            p["next_retry_at"] = 0
+        ps = p.get("status")
+        if ps == "paused":
+            return (f"版本 {profile} 连续 {p.get('consecutive_failures')} 次导出失败已暂停"
+                    f"（人工排查后删除 {STATE_NAME} 或 --phase export 强制放行）")
+        if ps == "failed":
+            return f"版本 {profile} 导出硬失败（failure_class={p.get('failure_class')}），需人工处理"
+        if ps == "exporting":
+            return "导出进行中（心跳仍新鲜）"
+        nxt = float(p.get("next_retry_at") or 0)
+        if ps == "retrying" and nxt > _now():
+            return (f"版本 {profile} 导出失败退避中（{int(nxt - _now())}s 后重试，"
+                    f"已失败 {p.get('consecutive_failures')} 次）")
+        return None
     status = st.get("status")
     if status == "paused":
         return (f"连续 {st.get('consecutive_failures')} 次导出失败已暂停"

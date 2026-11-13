@@ -38,7 +38,8 @@ import pipeline as pl  # noqa: E402
 from no_window import NO_WINDOW, install_default_hidden, hidden_child_env  # noqa: E402
 install_default_hidden()  # 无控制台托管时兜底隐藏所有子进程窗口（有控制台不生效）
 from utils.notifier import toast as _toast  # noqa: E402
-from export_config import export_mp4_path  # noqa: E402
+from export_config import export_mp4_path, parse_preset_profiles  # noqa: E402
+import preset_ops as _po  # noqa: E402
 import job_manifest as jm  # noqa: E402
 import subtitle_guard  # noqa: E402
 try:
@@ -190,6 +191,56 @@ def save_state(workdir, state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def _export_drafts_sequential(drafts, export_root, timeout_min=60.0, verify=True):
+    """多账号草稿串行导出：剪映同一时刻只能导一份，必须逐份同步导出 + 质检。
+
+    返回 {草稿名: 是否成功}。单份失败不阻塞后续份（各自独立成品）。
+    """
+    import subprocess as _sp
+
+    exporter = os.path.join(
+        _PROJECT_ROOT, ".trae", "skills", "jianying-editor",
+        "examples", "robust_auto_export.py")
+    verify_script = os.path.join(_HERE, "verify_export.py")
+    results = {}
+    for i, dn in enumerate(drafts, 1):
+        out_mp4 = export_mp4_path(dn, export_root)
+        fallback = os.path.dirname(os.path.dirname(out_mp4))
+        os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
+        print(f"\n📤 串行导出 {i}/{len(drafts)}: {dn} → {out_mp4}")
+        _toast("📤 导出中", f"{dn}（{i}/{len(drafts)}）")
+        ok = False
+        proc = None
+        try:
+            proc = _sp.Popen(
+                [sys.executable, "-u", exporter, dn, out_mp4, "--move",
+                 "--fallback-dir", fallback],
+                cwd=_PROJECT_ROOT, env=hidden_child_env(),
+                creationflags=NO_WINDOW)
+            proc.wait(timeout=timeout_min * 60)
+            ok = proc.returncode == 0
+        except _sp.TimeoutExpired:
+            print(f"  ⚠️ 导出超时（>{timeout_min}min），终止: {dn}")
+            proc.kill()
+            proc.wait()
+        except Exception as e:
+            print(f"  ❌ 导出异常: {dn}: {e}")
+        results[dn] = ok
+        if ok:
+            pl.clear_export_stale(dn)  # 成品已对应当前草稿内容
+        _toast("✅ 导出完成" if ok else "❌ 导出失败", dn,
+               icon="success" if ok else "error")
+        if ok and verify:
+            if os.path.exists(verify_script):
+                rc = _sp.call([sys.executable, verify_script, dn, out_mp4],
+                              cwd=_HERE, env=hidden_child_env(),
+                              creationflags=NO_WINDOW)
+                _toast("✅ 验证全部通过" if rc == 0 else "❌ 验证未通过", dn)
+            else:
+                print("    verify_export.py 不存在，跳过质检")
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser(description="整季批量流水线")
     ap.add_argument("series_dir", help="剧集目录")
@@ -231,6 +282,11 @@ def main():
                     help="导出等待上限分钟数（默认 60；超时视为异常，不阻塞继续）")
     ap.add_argument("--presets", default=None, metavar="'名1,名2:0.03'",
                     help="显式指定组合预设（透传 pipeline；不指定则走 presets.json/前缀自动发现）")
+    ap.add_argument("--profile", default=None, metavar="presets_a[,presets_b]",
+                    help="预设组名（presets.json 里的 presets_<组名>），多账号各用各的预设；"
+                         "支持多组逗号分隔（如 a,b 或 presets_a,presets_b）：第一组正常构建，"
+                         "其余组复制草稿只换预设层，生成多份草稿并分别串行导出；"
+                         "与 --presets 同时给时 --presets 优先")
     ap.add_argument("--watch", dest="watch", action="store_true", default=True,
                     help="(默认) 启动 watcher 守护进程（后台监控状态变化，桌面通知，脚本崩溃也能告知）")
     ap.add_argument("--no-watch", dest="watch", action="store_false",
@@ -244,6 +300,14 @@ def main():
     args = ap.parse_args()
 
     series_dir = os.path.abspath(args.series_dir)
+    # 多账号预设组：--profile a / a,b / presets_a,presets_b（--presets 显式列表优先）
+    profiles = [] if args.presets else parse_preset_profiles(args.profile)
+    if len(profiles) > 1 and not args.stream:
+        print("✗ --profile 多组仅支持默认串流模式（逐集模式一次只生成一个草稿）")
+        sys.exit(1)
+    if profiles:
+        print(f"👥 预设组: {', '.join(profiles)}"
+              + ("（第一组正常构建，其余复制草稿换预设）" if len(profiles) > 1 else ""))
     job_dir = os.path.join(series_dir, "cover_job")  # 缺字幕清单所在任务目录
     if not os.path.isdir(series_dir):
         print(f"✗ 目录不存在: {series_dir}")
@@ -384,6 +448,7 @@ def main():
             skip_local_ai=False,
             workdir=args.workdir,
             presets=pl.parse_presets_arg(args.presets) if args.presets else None,
+            preset_profile=profiles[0] if profiles else None,
             job_dir=job_dir,
             **cover_kw,
         )
@@ -429,6 +494,20 @@ def main():
         # 整轮结束：缺字幕清单非空只收尾通知一条（不按集弹）
         subtitle_guard.notify(job_dir)
 
+        # ---- 多账号预设：复制首组草稿 → 只替换预设层，生成独立草稿 ----
+        # 必须在 framefix 之后克隆：复制的是已帧对齐的成品草稿，不再重跑 ASR/翻译/人声分离。
+        export_drafts = [draft_name]
+        for prof in profiles[1:]:
+            try:
+                rep = _po.clone_draft_with_presets(
+                    draft_name, preset_profile=prof, overwrite=True)
+                export_drafts.append(rep["target"])
+                print(f"  👥 账号预设草稿就绪: {rep['target']}（{prof}）")
+            except Exception as e:
+                print(f"  ❌ 克隆账号预设草稿失败（{prof}）: {e}")
+                _toast("❌ 账号预设草稿失败", f"{draft_name} → {prof}: {e}", icon="error")
+                raise SystemExit(1)
+
         # ---- 导出（后台 WMI + pythonw + CREATE_NO_WINDOW，零弹窗、不阻塞）----
         export_blocked = False
         try:
@@ -439,7 +518,16 @@ def main():
             export_blocked = True
         if args.auto_export and export_blocked:
             print("   ⏭️ 已跳过后台导出（缺字幕未修复）")
-        if args.auto_export and not export_blocked:
+        elif args.auto_export and len(export_drafts) > 1:
+            # 多账号：剪映同一时刻只能导一份，必须串行同步导出
+            print(f"\n👥 多账号串行导出 {len(export_drafts)} 份: {'、'.join(export_drafts)}")
+            results = _export_drafts_sequential(
+                export_drafts, args.export_dir,
+                timeout_min=args.export_timeout, verify=args.verify)
+            failed = [d for d, ok in results.items() if not ok]
+            if failed:
+                print(f"  ⚠️ 以下账号草稿导出失败: {'、'.join(failed)}")
+        elif args.auto_export:
             import subprocess as _sp
             import tempfile as _tf
             exporter = os.path.join(
@@ -524,6 +612,8 @@ subprocess.Popen(
                             if rec.get("done"):
                                 print(f"    ✅ 导出完成（耗时 {rec.get('elapsed_s',0)/60:.1f}min，"
                                       f"最终 {rec.get('final_mb',0):.0f}MB）")
+                                # 导出成功：清掉草稿的导出失效标记
+                                pl.clear_export_stale(draft_name)
                                 break
                         except Exception:
                             pass
@@ -602,6 +692,7 @@ subprocess.Popen(
                     cover_extract_from_video=None if args.cover_image else video,
                     workdir=wd_ep,
                     presets=pl.parse_presets_arg(args.presets) if args.presets else None,
+                    preset_profile=profiles[0] if profiles else None,
                     job_dir=job_dir,
                 )
                 done = True
