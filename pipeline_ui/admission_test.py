@@ -532,7 +532,7 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         main, presets = hide_preset_tracks(win)
         _mark('tracks.hide_presets')
         if main is None:
-            raise RuntimeError('主轨识别失败（无 video 行）')
+            raise RuntimeError('主轨识别失败（无 video 行或 M2 封面校验未过）')
         rows_chk, *_ = scan_tracks(win)
         if len(rows_chk) != _expected_tracks:
             raise RuntimeError(

@@ -7,7 +7,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'pipeline_ui'))
 
+import numpy as np
+
 import ui_calibration
+import ui_core
 import ui_extract_audio
 import ui_recognize_translate
 import ui_track_ops
@@ -58,6 +61,36 @@ def test_restore_last_light_failure_forces_full_scan_and_fails(monkeypatch):
     assert result['ok'] is False
 
 
+def _draft_sig_before():
+    """分离前的草稿指纹：主轨 5 段 / videos=7 / 没有 audio 轨。"""
+    return {
+        'mtime': 0.0, 'n_tracks': 5, 'main_id': 'main1', 'main_segments': 5,
+        'track_index': {'main1': {'type': 'video', 'n_segments': 5}},
+        'n_videos': 7, 'video_paths': set(), 'video_ids': set(),
+        'audio_tracks': [], 'audios_by_id': {},
+    }
+
+
+def _draft_sig_after_ok():
+    """分离成功：主轨 5 段不变、videos 不变、新增 audio 轨且素材带原声标记。"""
+    sig = _draft_sig_before()
+    sig.update({
+        'mtime': 1.0, 'n_tracks': 6,
+        'track_index': {'main1': {'type': 'video', 'n_segments': 5}},
+        'audio_tracks': [{'id': 'aud1', 'segments': [{'material_id': 'am1'}]}],
+        'audios_by_id': {'am1': {'id': 'am1', 'video_original_sound': True}},
+    })
+    return sig
+
+
+def _patch_extract_draft(monkeypatch, after_sig=None):
+    """把分离前后的 draft 对账换成固定指纹（单测不读真实草稿）。"""
+    monkeypatch.setattr(ui_extract_audio, '_draft_path', lambda: 'draft.json')
+    monkeypatch.setattr(ui_extract_audio, '_draft_sig', lambda _p: _draft_sig_before())
+    monkeypatch.setattr(ui_extract_audio, '_wait_separation_applied',
+                        lambda *_a, **_k: after_sig or _draft_sig_after_ok())
+
+
 def test_extract_audio_propagates_restore_failure(monkeypatch, tmp_path):
     win = object()
     main = {'type': 'video', 'ymid': 100, 'hidden': False}
@@ -78,6 +111,7 @@ def test_extract_audio_propagates_restore_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda: None)
     monkeypatch.setattr(ui_extract_audio.pyautogui, 'hotkey', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio.time, 'sleep', lambda _seconds: None)
+    _patch_extract_draft(monkeypatch)
     monkeypatch.setattr(ui_extract_audio, 'restore_all_tracks',
                         lambda *args, **kwargs: {'ok': False})
     monkeypatch.setattr(ui_extract_audio, '_subs_from_hint',
@@ -325,6 +359,7 @@ def test_extract_audio_reports_scroll_unavailable_distinctly(monkeypatch, tmp_pa
     monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda: None)
     monkeypatch.setattr(ui_extract_audio.pyautogui, 'hotkey', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio.time, 'sleep', lambda _seconds: None)
+    _patch_extract_draft(monkeypatch)
     monkeypatch.setattr(ui_extract_audio, 'restore_all_tracks',
                         lambda *args, **kwargs: {'ok': False, 'reason': 'scroll_unavailable',
                                                  'still_locked': [], 'still_hidden': []})
@@ -334,6 +369,118 @@ def test_extract_audio_reports_scroll_unavailable_distinctly(monkeypatch, tmp_pa
     assert result['ok'] is False
     assert '可视区外' in result['error']          # 与"仍锁定或隐藏"区分
     assert result['restore']['reason'] == 'scroll_unavailable'
+
+
+# ============ 分离音频：draft 前后对账硬校验 ============
+def test_check_separation_rejects_main_track_converted_to_audio():
+    """上一轮事故复现：主轨 5 段被转成音频（segments=0、videos 7→2）必须判失败。"""
+    before = _draft_sig_before()
+    after = _draft_sig_before()
+    after.update({
+        'n_tracks': 8, 'main_segments': 0,
+        'track_index': {'main1': {'type': 'video', 'n_segments': 0}},
+        'n_videos': 2,
+        'audio_tracks': [{'id': 'aud1',
+                          'segments': [{'material_id': f'am{i}'} for i in range(5)]}],
+        'audios_by_id': {f'am{i}': {'id': f'am{i}'} for i in range(5)},
+    })
+
+    ok, detail = ui_extract_audio._check_separation(before, after)
+
+    assert ok is False
+    assert '主轨 segments 减少' in detail
+
+
+def test_check_separation_rejects_video_material_loss():
+    before = _draft_sig_before()
+    after = _draft_sig_after_ok()
+    after['n_videos'] = 6
+
+    ok, detail = ui_extract_audio._check_separation(before, after)
+
+    assert ok is False
+    assert 'materials.videos 减少' in detail
+
+
+def test_check_separation_requires_new_audio_from_video_original_sound():
+    before = _draft_sig_before()
+    after = _draft_sig_after_ok()
+    after['audios_by_id'] = {'am1': {'id': 'am1'}}       # 没有任何原声标记
+
+    ok, detail = ui_extract_audio._check_separation(before, after)
+
+    assert ok is False
+    assert 'video_original_sound' in detail
+
+    after['audios_by_id'] = {'am1': {'id': 'am1', 'type': 'extract'}}
+    ok, detail = ui_extract_audio._check_separation(before, after)
+    assert ok is True
+
+
+def test_extract_audio_fails_when_separation_check_rejects(monkeypatch, tmp_path):
+    """分离被判失败时必须立刻返回失败，不能继续 restore / 落盘（避免二次破坏）。"""
+    win = object()
+    main = {'type': 'video', 'ymid': 100, 'hidden': False}
+    scans = iter([([main], None, 0, 0, 200, 75, win)])
+    forbidden = []
+    damaged = _draft_sig_before()
+    damaged.update({'n_tracks': 8, 'main_segments': 0, 'n_videos': 2})
+
+    monkeypatch.setattr(ui_extract_audio, 'op_stage', lambda *args: None)
+    monkeypatch.setattr(ui_extract_audio, 'dprint', lambda *args: None)
+    monkeypatch.setattr(ui_extract_audio, '_ensure_edit_page', lambda _win: (win, True))
+    monkeypatch.setattr(ui_extract_audio, 'ensure_maximized', lambda value: value)
+    monkeypatch.setattr(ui_extract_audio, '_top_text_cluster', lambda _win: ([], 75, win))
+    monkeypatch.setattr(ui_extract_audio, '_safe_scan', lambda _win: next(scans))
+    monkeypatch.setattr(ui_extract_audio, 'find_main_track', lambda *args: (main, True))
+    monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda: None)
+    monkeypatch.setattr(ui_extract_audio.pyautogui, 'hotkey', lambda *args: None)
+    monkeypatch.setattr(ui_extract_audio.time, 'sleep', lambda _seconds: None)
+    _patch_extract_draft(monkeypatch, after_sig=damaged)
+    monkeypatch.setattr(ui_core, 'save_screenshot', lambda *args: None)
+    monkeypatch.setattr(ui_extract_audio, 'restore_all_tracks',
+                        lambda *args, **kwargs: forbidden.append('restore'))
+    monkeypatch.setattr(ui_extract_audio, '_write_final_layout',
+                        lambda *args: forbidden.append('layout'))
+
+    result = ui_extract_audio.run_extract_audio(workdir=str(tmp_path))
+
+    assert result['ok'] is False
+    assert '分离音频失败' in result['error']
+    assert forbidden == []
+
+
+# ============ 主轨识别：不允许用预设轨顶替 ============
+def _patch_main_track_probe(monkeypatch):
+    monkeypatch.setattr(ui_track_ops, 'get_window_rect', lambda _w: (0, 0, 300, 200))
+    monkeypatch.setattr(ui_track_ops, '_ensure_geom', lambda *args: (0, 1.0))
+    monkeypatch.setattr(ui_track_ops, '_hdr_x', lambda off: int(off))
+    monkeypatch.setattr(ui_track_ops, 'dprint', lambda *args: None)
+    monkeypatch.setattr(ui_track_ops, 'get_param',
+                        lambda _section, _name, default=None: default)
+
+
+def test_find_main_track_rejects_row_without_cover_button(monkeypatch):
+    """M2 封面按钮校验不过 → 返回 None（不再按 M1 采用下方预设轨）。"""
+    _patch_main_track_probe(monkeypatch)
+    rows = [{'type': 'video', 'ymid': 100}]
+
+    main, ok = ui_track_ops.find_main_track(object(), rows, np.zeros((200, 300, 3), np.uint8))
+
+    assert main is None
+    assert ok is False
+
+
+def test_find_main_track_accepts_cell_with_cover_button(monkeypatch):
+    _patch_main_track_probe(monkeypatch)
+    rows = [{'type': 'video', 'ymid': 100}]
+    img = np.zeros((200, 300, 3), np.uint8)
+    img[75:95, 120:160] = 255          # 封面按钮列有亮度对比
+
+    main, ok = ui_track_ops.find_main_track(object(), rows, img)
+
+    assert ok is True
+    assert main['ymid'] == 100
 
 
 @pytest.mark.parametrize('expected_overrides,actual_overrides', [

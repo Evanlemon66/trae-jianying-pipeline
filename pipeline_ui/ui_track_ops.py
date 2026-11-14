@@ -497,15 +497,17 @@ def hide_tracks_except_main(win) -> List[int]:
     """
     只保留主视频轨（双重校验版：M1 最底 video + M2 封面按钮），其余行全部隐藏。
     剪映主轨恒在最底部。返回被隐藏的行的索引列表。
+
+    主轨识别失败直接抛异常：绝不拿最底行/下方预设轨顶替——那样"只隐藏预设轨"
+    会变成"隐藏主轨"，上一轮事故就是这么发生的。
     """
     rows, img, _, _, _, eye_x = scan_tracks(win)
     if not rows:
-        dprint("hide_tracks_except_main: 没找到轨道行")
-        return []
+        raise RuntimeError('hide_tracks_except_main: 没找到任何轨道行')
     main, _m2 = find_main_track(win, rows, img)
     if main is None:
-        main = rows[-1]
-        dprint("  ⚠️ 无 video 行，按最底行当主轨")
+        raise RuntimeError('hide_tracks_except_main: 主轨识别失败（M2 封面校验未过），'
+                           '拒绝用最底行顶替')
     keep_idx = next(i for i, r in enumerate(rows) if r is main)
     dprint(f"轨道行 ({len(rows)}): {[(r['type'], r['hidden']) for r in rows]}  保留主轨: 行{keep_idx}")
 
@@ -1005,11 +1007,14 @@ def hide_text_tracks_only(win) -> List[int]:
 
 def find_main_track(win, rows, img=None):
     """
-    主轨识别（双重校验机制）：
+    主轨识别（双重校验，两项都过才算主轨）：
       M1: type=='video' 且 ymid 最大（剪映主轨恒在时间线最底部）
       M2: 该行 cover_x_range 区间对比度列数 >= min_cols（主轨专属 📌封面按钮）
-    返回 (main_row, m2_ok)；无 video 行返回 (None, False)。
-    M2 未通过时仍按 M1 返回（打警告），由调用方决定是否中止/肉眼复核。
+    返回 (main_row, m2_ok)；无 video 行或 M2 未过 → (None, False)。
+
+    ⚠️ 不再"M2 未过也按 M1 采用"：上一轮主轨片段被转成音频后主轨变空行，
+    最底 video 行实际是下方预设轨，M1 把它当主轨 → 后面的判据全部跟着错。
+    宁可返回 None 让调用方报错/人工复核，也不拿预设轨顶替主轨。
     """
     WL, WT, WW, WH = get_window_rect(win)
     _ensure_geom(win, WL, WT, WW, WH)   # S3-B1：封面列同样锚定时间线左缘
@@ -1031,11 +1036,12 @@ def find_main_track(win, rows, img=None):
     if y1 > y0 and cx1 > cx0:
         strip = img[y0:y1, cx0:cx1, :3].astype(int)
         m2_ok = int(((strip.max(axis=(0, 2)) - strip.min(axis=(0, 2))) > ct).sum()) >= mc
-    if m2_ok:
-        dprint(f"  ✅ 主轨双重校验通过: ymid={main['ymid']} (M1最底video + M2封面按钮)")
-    else:
-        dprint(f"  ⚠️ M2 封面校验未过 (ymid={main['ymid']})，按 M1 采用——建议肉眼复核")
-    return main, m2_ok
+    if not m2_ok:
+        dprint(f"  ❌ 主轨校验失败: 最底 video 行 ymid={main['ymid']} 未通过 M2 封面按钮校验，"
+               f"判为下方预设轨而非主轨（拒绝顶替）")
+        return None, False
+    dprint(f"  ✅ 主轨双重校验通过: ymid={main['ymid']} (M1最底video + M2封面按钮)")
+    return main, True
 
 
 def _strip_mean(img, WT, ymid, strip, half_h=12):
