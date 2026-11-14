@@ -286,7 +286,8 @@ def _open_admission_draft(cfg, after_build=False):
         cfg['draft_name'], timeout=op['edit_timeout'],
         hot_wait=op['hot_wait_after_build'] if after_build else 30,
         cold_wait=op['cold_wait'], max_launch=op['max_launch'],
-        allow_cold_restart=op['allow_cold_restart'])
+        allow_cold_restart=op['allow_cold_restart'],
+        ready_timeout=op.get('ready_timeout', 120.0))
 
 
 def _ensure_draft(cfg, presets):

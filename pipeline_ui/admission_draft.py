@@ -23,6 +23,7 @@ DEFAULT_OPEN = {
     'cold_wait': 150.0,            # 冷启动后每轮找卡片秒数（比现状 90 宽）
     'max_launch': 2,               # 冷启动重拉次数（与现状一致）
     'edit_timeout': 90,            # 等进入编辑页秒数
+    'ready_timeout': 120.0,        # 冷启动就绪墙钟（透传 ensure_for_export）
     'allow_cold_restart': True,    # false 时禁止 taskkill/重开剪映
     'close_on_exit': True,         # 收尾正常关闭本轮拉起的剪映，并清理草稿临时文件
 }
@@ -118,6 +119,8 @@ def normalize_config(raw):
             'cold_wait': _as_float(open_raw.get('cold_wait'), DEFAULT_OPEN['cold_wait']),
             'max_launch': _as_int(open_raw.get('max_launch'), DEFAULT_OPEN['max_launch'], minimum=1),
             'edit_timeout': _as_int(open_raw.get('edit_timeout'), DEFAULT_OPEN['edit_timeout'], minimum=1),
+            'ready_timeout': _as_float(
+                open_raw.get('ready_timeout'), DEFAULT_OPEN['ready_timeout']),
             'allow_cold_restart': _as_bool(
                 open_raw.get('allow_cold_restart'), DEFAULT_OPEN['allow_cold_restart']),
             'close_on_exit': _as_bool(
