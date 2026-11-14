@@ -51,6 +51,13 @@ try:
 except Exception:  # 分类器不可用时退回旧逻辑
     fc = None
 
+# ========== 1c. 草稿写盘原语（串流恢复的唯一写回入口）==========
+# 恢复必须走 pipeline/draft_io.write_draft_content：原子写 + 不变量校验 + 写时留痕。
+_PIPE_DIR = os.path.join(_REPO_ROOT, "pipeline")
+if _PIPE_DIR not in sys.path:
+    sys.path.insert(0, _PIPE_DIR)
+import draft_io  # noqa: E402
+
 # ========== 1c. 实例生命周期管理器（第 2 项，同目录 jy_instance.py）==========
 # 四套拉起/回首页逻辑收敛到该管理器；只有它的 kill() 允许 taskkill。
 import jy_instance  # noqa: E402
@@ -1638,6 +1645,18 @@ def _find_draft_dir(draft_name):
     return None
 
 
+def _draft_material_ids(d):
+    """draft_content.materials 下所有素材 id 集合（串流恢复的前置条件之一）。"""
+    ids = set()
+    for lst in (d.get("materials") or {}).values():
+        if not isinstance(lst, list):
+            continue
+        for m in lst:
+            if isinstance(m, dict) and m.get("id"):
+                ids.add(str(m["id"]))
+    return ids
+
+
 def _restore_streams_from_backup(draft_name):
     """导出前检查草稿是否被剪映合并了串流 segments，有的话用 pipeline 备份恢复。
 
@@ -1645,6 +1664,12 @@ def _restore_streams_from_backup(draft_name):
     （"串流视频"优化），合并时丢失 crop 后的 source_timerange.duration，
     导致音画不同步。pipeline 发布时会在草稿目录写一份 _pipeline_backup.json，
     本函数在打开草稿前比对，如果发现 video/audio 轨段数骤降则恢复。
+
+    恢复门槛：duration 与素材 id 集合必须同时相等才允许覆盖 live。段数骤降只说明
+    「像被合并」，若 duration 或素材集合已变，备份对应的不是当前这份时间线，
+    覆盖会把别的内容写回去，所以宁可跳过并说明原因。
+    写回统一走 draft_io.write_draft_content（writer=stream_restore），
+    让 E1 认这次写入、不被误判成 externally_modified；不变量失败必须上抛。
     """
     import json
     draft_dir = _find_draft_dir(draft_name)
@@ -1662,6 +1687,20 @@ def _restore_streams_from_backup(draft_name):
             bak = json.load(f)
     except Exception as e:
         dprint(f"⚠️ 读取草稿/备份失败: {e}")
+        return False
+
+    # 恢复门槛：duration 与素材 id 集合必须同时相等，任一不满足就跳过并说明原因
+    cur_duration = int(cur.get("duration") or 0)
+    bak_duration = int(bak.get("duration") or 0)
+    cur_ids = _draft_material_ids(cur)
+    bak_ids = _draft_material_ids(bak)
+    if cur_duration != bak_duration or cur_ids != bak_ids:
+        ids_desc = "相等" if cur_ids == bak_ids else (
+            f"不等（仅当前 {len(cur_ids - bak_ids)} 个、仅备份 {len(bak_ids - cur_ids)} 个）")
+        dprint(
+            f"⚠️ 跳过串流恢复：duration 当前={cur_duration} 备份={bak_duration}"
+            f"（{'相等' if cur_duration == bak_duration else '不等'}），"
+            f"素材 id 集合 {ids_desc}；需 duration 与素材 id 集合同时相等才允许备份覆盖 live")
         return False
 
     def _seg_counts(d):
@@ -1715,18 +1754,26 @@ def _restore_streams_from_backup(draft_name):
             new_tracks.append(t)
     cur["tracks"] = new_tracks
 
-    # 写前备份当前草稿（保留一份 .before_restore.bak），备份失败则不恢复，避免改坏草稿
-    try:
-        shutil.copy2(content_path, content_path + ".before_restore.bak")
-    except OSError as e:
-        dprint(f"⚠️ 恢复前备份失败，保守起见跳过恢复: {e}")
-        return False
-
-    with open(content_path, "w", encoding="utf-8") as f:
-        json.dump(cur, f, ensure_ascii=False)
+    # 写回统一走 draft_io：不变量断言 → .before_restore.bak 备份 → 原子替换 → E1 留痕。
+    # DraftInvariantError 不在这里捕获，必须上抛（调用方也不得降级成继续导出）。
+    draft_io.write_draft_content(
+        cur, content_path, writer="stream_restore",
+        backup_suffix=".before_restore.bak")
     dprint(f"🛡️ 草稿轨道已恢复: {restored} 条轨 从备份还原，"
            f"当前 video/audio segments: {_seg_counts(cur)}")
     return True
+
+
+def _restore_streams_before_export(draft_name):
+    """导出前恢复检查的包装：草稿不变量失败必须上抛，其它异常只告警继续导出。"""
+    try:
+        return _restore_streams_from_backup(draft_name)
+    except draft_io.DraftInvariantError:
+        raise
+    except Exception as e:
+        dprint(f"⚠️ 恢复检查失败（继续导出）: {e}")
+        _flow(f"导出前轨道检查失败（继续导出）: {e}")
+        return False
 
 
 def run(draft_name, output_path, move_output=False, expected_duration=None,
@@ -1788,12 +1835,8 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
 
     # 3. 导出前修复：剪映可能在 pipeline 发布后打开过草稿，
     # 自动合并串流 video segments 导致 crop 元数据丢失 → 音画不同步
-    try:
-        restored = _restore_streams_from_backup(draft_name)
-        _flow("导出前轨道检查：已从备份恢复串流片段" if restored else "导出前轨道检查：轨道正常，无需恢复")
-    except Exception as e:
-        dprint(f"⚠️ 恢复检查失败（继续导出）: {e}")
-        _flow(f"导出前轨道检查失败（继续导出）: {e}")
+    restored = _restore_streams_before_export(draft_name)
+    _flow("导出前轨道检查：已从备份恢复串流片段" if restored else "导出前轨道检查：轨道正常，无需恢复")
 
     # 2. 打开草稿
     _TASK["stage"] = "打开草稿"
