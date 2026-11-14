@@ -44,15 +44,20 @@ import os
 import sys
 import time
 
-_PYLIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pylibs')
-if _PYLIB_DIR not in sys.path:
-    sys.path.insert(0, _PYLIB_DIR)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_UI_DIR = os.path.dirname(os.path.abspath(__file__))
+if _UI_DIR not in sys.path:
+    sys.path.insert(0, _UI_DIR)
 # presets.json / export_config / init_draft 在 ..\pipeline
-_PIPELINE_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'pipeline'))
+_PIPELINE_DIR = os.path.normpath(os.path.join(_UI_DIR, '..', 'pipeline'))
 if _PIPELINE_DIR not in sys.path:
     sys.path.insert(0, _PIPELINE_DIR)
+
+from export_config import get_ui_pylibs_dir
+
+# UI OCR 依赖目录由统一配置解析；目录不存在时插入不报错，缺包在首次 OCR 时给出可读错误
+_UI_PYLIBS = get_ui_pylibs_dir()
+if _UI_PYLIBS not in sys.path:
+    sys.path.insert(0, _UI_PYLIBS)
 
 from admission_draft import (active_draft_name, baseline_mismatch, decide_action,
                              decide_window_action, draft_fs_state, expected_track_count,
@@ -102,11 +107,41 @@ MAIN_TRACK_LOGICAL = {
 }
 
 
-def _dump_report(ui_params, results, calib, marks, final=False):
+_RUN_STATE = {'ui_params': {}, 'results': {}, 'calib': {}, 'marks': [], 'error': None}
+
+
+def _infer_failed_stage(marks, results):
+    """失败阶段 = 已成功打点之后的下一阶段；无打点时为首阶段。"""
+    done = [n.split('.')[0] for n, _ in marks if n.split('.')[0] in STAGES]
+    idx = max(STAGES.index(s) for s in done) if done else -1
+    nxt = idx + 1
+    if nxt >= len(STAGES):
+        for s in STAGES:
+            if s not in results:
+                return s
+        return None
+    return STAGES[nxt]
+
+
+def _classify_failure(error, stage):
+    """把准入异常映射到 lib/failure_class 的类别（导不出时返回 None，不影响落盘）。"""
+    if not error:
+        return None
+    try:
+        from failure_class import classify
+        cat, *_ = classify(error, stage or 'open_draft')
+        return cat
+    except Exception:
+        return None
+
+
+def _dump_report(ui_params, results, calib, marks, final=False,
+                 error=None, failed_stage=None):
     """准入输出：每阶段读到的 UI 入参 + 结果/耗时/关键数值 + 打点时间线。
 
     generated_by=admission_test；ui_pipeline 只是调用方，不负责记录。
-    final=False 只写 partial（失败/中断不影响正式报告）；final=True 才覆盖正式报告。
+    正式报告（final=True）在跑完即写：失败也落正式报告并带 ok/failed_stage/
+    failure_class，partial 只表示「仍在进行中」。
     """
     try:
         stages = {}
@@ -119,10 +154,17 @@ def _dump_report(ui_params, results, calib, marks, final=False):
                 'error': r.get('error'),
                 'metrics': r.get('metrics', {}),
             }
+        if error and not failed_stage:
+            failed_stage = _infer_failed_stage(marks, results)
         t_base = marks[0][1] if marks else time.time()
         rec = {
             'generated_by': 'admission_test',
             'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'ok': bool(stages) and all(s.get('ok') is True for s in stages.values())
+                  and not error,
+            'failed_stage': failed_stage if error else None,
+            'failure_class': _classify_failure(error, failed_stage),
+            'error': error,
             'env': calib.get('env', {}),
             'stages': stages,
             'timeline': [{'step': n, 't_s': round(t - t_base, 1)} for n, t in marks],
@@ -314,9 +356,11 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
     from ui_core import enable_timing
     enable_timing()          # 每行 dprint 带 [+耗时s] 前缀
     _marks = []              # [(阶段名, 时间点)]
-    export_ran = False       # 整轮是否真正跑到 export 且成功（决定写正式报告还是只写 partial）
     ui_param_log = {}        # 阶段 → 该阶段读取的 UI 入参
     stage_results = {}       # 阶段 → {ok, duration_s, error, metrics}
+    # 供 __main__ 在异常路径写正式报告（失败也要留痕）
+    _RUN_STATE.update(ui_params=ui_param_log, results=stage_results, calib=calib,
+                      marks=_marks, error=None)
 
     def _mark(name):
         stage = name.split('.')[0]
@@ -721,10 +765,9 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         stage_results['export'] = {
             'ok': r.get('ok'), 'duration_s': r.get('duration_s'), 'error': r.get('error'),
             'metrics': {'cmd': (r.get('inputs') or {}).get('cmd')}}
-        export_ran = True          # 以「实际执行到 export 且返回 ok」为准，不看命令行参数
 
     _save_merged(calib)
-    _dump_report(ui_param_log, stage_results, calib, _marks, final=export_ran)
+    _dump_report(ui_param_log, stage_results, calib, _marks, final=True)
     dprint('\n' + '=' * 60)
     dprint(f'[准入测试] ✅ 完成  耗时 {int(time.time() - t0)}s')
     _print_timing(_marks)
@@ -854,7 +897,8 @@ if __name__ == '__main__':
         calibrate(stop_after=args.stop_after, vocal_mode=args.vocal_mode,
                   target_screen=args.target_screen)
         completed = True
-    except Exception:
+    except Exception as e:
+        _RUN_STATE['error'] = str(e)
         # 失败兜底：尽量退出编辑页回首页（草稿留在编辑页会阻塞下次热复用，也不便人工检查）
         try:
             from ui_core import dprint
@@ -866,5 +910,10 @@ if __name__ == '__main__':
             print(f"[warn] 回首页失败（忽略）: {e}")
         raise
     finally:
+        if not completed:
+            # 失败/中断也落正式报告（带 failed_stage / failure_class），partial 不再是唯一记录
+            _dump_report(_RUN_STATE['ui_params'], _RUN_STATE['results'],
+                         _RUN_STATE['calib'], _RUN_STATE['marks'],
+                         final=True, error=_RUN_STATE.get('error') or '准入未跑完')
         _finalize_jianying(stop_after=args.stop_after, completed=completed,
                            keep_window=args.keep_window, close_window=args.close_window)
