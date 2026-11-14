@@ -41,6 +41,7 @@ _LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 from export_bundle import audit_bundle, log_forced_use  # noqa: E402  # 成品三件套校验（与导出侧同口径）
+import export_lock  # noqa: E402  # 与导出侧同一把 .export.lock，防并发互踩
 
 
 def _manifest_path(draft_name):
@@ -618,55 +619,66 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
         print("  （dry-run：未执行任何删除，记录未改动）")
     else:
         print("  （非 dry-run：即将实际删除，可先用 --dry-run 复核）")
-        # 删成品前先写墓碑（不判定、不阻断）：成品 hash / 草稿 hash / 删除原因一并留档，
-        # 之后 sidecar 会随成品目录一起被删，墓碑是唯一能追溯「删掉的是哪一版」的证据。
-        tombs = []
-        if not intermediates_only and source_dir:
-            try:
-                import freshness
-                _jd = os.path.join(source_dir, "cover_job")
-                _done = set()
-                for tprof, p in profile_marks:
-                    v = tprof or "a"
-                    if v in _done:
-                        continue
-                    _done.add(v)
-                    tp = freshness.write_tombstone(_jd, v)
-                    if tp:
-                        tombs.append((tp, v, p))
-            except Exception as e:
-                print(f"  [warn] 墓碑写入失败（不影响清理）: {e}")
-        cleaned = []
-        for n, label, kind, p, size in ready:
-            if os.path.isdir(p):
-                shutil.rmtree(p, ignore_errors=True)
-            else:
+        # 与导出侧同一把 .export.lock：真正动文件前先取锁，避免和 watcher /
+        # series_runner 的导出并发互踩；拿不到按导出侧策略直接退出并说明原因。
+        if not export_lock.acquire(owner=f"stream_manifest clean {draft_name}"):
+            holder = export_lock.read_lock() or {}
+            print(f"  ⛔ 全局导出锁被占用（pid={holder.get('pid')} "
+                  f"owner={holder.get('owner')}），本次不清理；"
+                  "等导出结束或确认无人在跑后重试")
+            return 1
+        try:
+            # 删成品前先写墓碑（不判定、不阻断）：成品 hash / 草稿 hash / 删除原因一并留档，
+            # 之后 sidecar 会随成品目录一起被删，墓碑是唯一能追溯「删掉的是哪一版」的证据。
+            tombs = []
+            if not intermediates_only and source_dir:
                 try:
-                    os.remove(p)
-                except OSError as e:
-                    print(f"  [fail] {label}: {e}")
-                    continue
-            if not os.path.exists(p):
-                print(f"  [已删] {label}: {p} ({_fmt(size)})")
-                if kind == "export_bundle" or (kind == "export_file" and label == "export_file"):
-                    cleaned.append((p, size))
-            else:
-                print(f"  [失败] {label}: {p}")
-        if cleaned:
-            if profile:
-                _mark_export_cleaned(source_dir, cleaned, profile=profile)
-            else:
-                # 只回写"确实被删掉成品"的版本，逐版本各写各的
-                marks = {prof for prof, p in profile_marks if not os.path.exists(p)}
-                _mark_export_cleaned(source_dir, cleaned, profiles=marks)
-        if tombs:
-            try:
-                import freshness
-                for tp, _v, p in tombs:
-                    freshness.update_tombstone(
-                        tp, "deleted" if not os.path.exists(p) else "failed")
-            except Exception as e:
-                print(f"  [warn] 墓碑状态回写失败: {e}")
+                    import freshness
+                    _jd = os.path.join(source_dir, "cover_job")
+                    _done = set()
+                    for tprof, p in profile_marks:
+                        v = tprof or "a"
+                        if v in _done:
+                            continue
+                        _done.add(v)
+                        tp = freshness.write_tombstone(_jd, v)
+                        if tp:
+                            tombs.append((tp, v, p))
+                except Exception as e:
+                    print(f"  [warn] 墓碑写入失败（不影响清理）: {e}")
+            cleaned = []
+            for n, label, kind, p, size in ready:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    try:
+                        os.remove(p)
+                    except OSError as e:
+                        print(f"  [fail] {label}: {e}")
+                        continue
+                if not os.path.exists(p):
+                    print(f"  [已删] {label}: {p} ({_fmt(size)})")
+                    if kind == "export_bundle" or (kind == "export_file" and label == "export_file"):
+                        cleaned.append((p, size))
+                else:
+                    print(f"  [失败] {label}: {p}")
+            if cleaned:
+                if profile:
+                    _mark_export_cleaned(source_dir, cleaned, profile=profile)
+                else:
+                    # 只回写"确实被删掉成品"的版本，逐版本各写各的
+                    marks = {prof for prof, p in profile_marks if not os.path.exists(p)}
+                    _mark_export_cleaned(source_dir, cleaned, profiles=marks)
+            if tombs:
+                try:
+                    import freshness
+                    for tp, _v, p in tombs:
+                        freshness.update_tombstone(
+                            tp, "deleted" if not os.path.exists(p) else "failed")
+                except Exception as e:
+                    print(f"  [warn] 墓碑状态回写失败: {e}")
+        finally:
+            export_lock.release()
     # source_dir 只提示，永不清理；manifest 记录本身也永不删除
     if source_dir:
         print(f"  （源视频目录保留不动: {source_dir}）")

@@ -49,6 +49,7 @@ sys.path.insert(0, os.path.join(_REPO, "pipeline"))
 import job_manifest as jm  # noqa: E402
 import export_config as pc  # noqa: E402
 from export_bundle import audit_bundle, log_forced_use  # noqa: E402
+import export_lock  # noqa: E402  # 与导出侧同一把 .export.lock，防并发互踩
 from no_window import NO_WINDOW  # noqa: E402
 
 LOCK_NAME = ".watcher.lock"
@@ -437,37 +438,48 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
         print("  （dry-run：未写 job.json、未移动目录）")
         return 0
 
-    if not archived:
+    # 与导出侧同一把 .export.lock：真正动文件（写 job.json / 搬目录 / 改 manifest）
+    # 前先取锁，避免和 watcher / series_runner 的导出并发互踩；拿不到按导出侧策略退出。
+    if not export_lock.acquire(owner=f"archive_job {name}"):
+        holder = export_lock.read_lock() or {}
+        print(f"  ⛔ 全局导出锁被占用（pid={holder.get('pid')} "
+              f"owner={holder.get('owner')}），本次不归档；"
+              "等导出结束或确认无人在跑后重试")
+        return 1
+    try:
+        if not archived:
+            try:
+                jm.update_job(job_dir, {"stage": "archived"}, event="archived",
+                              detail=f"归档到 {target}")
+            except (ValueError, OSError) as e:
+                print(f"  [FAIL] 置 stage=archived 失败: {e}")
+                return 2
+        os.makedirs(archive_root, exist_ok=True)
+        # 归档 = 产物连同出身一起搬走：搬之前把各版本的新鲜度判定固化成快照，
+        # 供归档后追溯（stale/evidence_missing 已在上面做过默认阻断与人工放行）。
         try:
-            jm.update_job(job_dir, {"stage": "archived"}, event="archived",
-                          detail=f"归档到 {target}")
-        except (ValueError, OSError) as e:
-            print(f"  [FAIL] 置 stage=archived 失败: {e}")
+            import freshness
+            snap = freshness.archive_snapshot(
+                job_dir, write=True, allow_stale_reason=allow_stale_reason)
+            if snap:
+                brief = ", ".join(f"{k}={v.get('state')}"
+                                  for k, v in (snap.get("versions") or {}).items())
+                print(f"  新鲜度快照: 06_publish/freshness_archive_snapshot.json ({brief})")
+                miss = snap.get("evidence_missing") or []
+                if miss:
+                    print(f"  [warn] evidence_missing（已登记导出但缺 sidecar）: {', '.join(miss)}")
+        except Exception as e:
+            print(f"  [warn] 新鲜度快照写入失败（不影响归档）: {e}")
+        try:
+            shutil.move(series_dir, target)
+        except OSError as e:
+            print(f"  [FAIL] 移动目录失败（stage 已置 archived，调度已阻断；修复后可重跑续做）: {e}")
             return 2
-    os.makedirs(archive_root, exist_ok=True)
-    # 归档 = 产物连同出身一起搬走：搬之前把各版本的新鲜度判定固化成快照，
-    # 供归档后追溯（stale/evidence_missing 已在上面做过默认阻断与人工放行）。
-    try:
-        import freshness
-        snap = freshness.archive_snapshot(
-            job_dir, write=True, allow_stale_reason=allow_stale_reason)
-        if snap:
-            brief = ", ".join(f"{k}={v.get('state')}"
-                              for k, v in (snap.get("versions") or {}).items())
-            print(f"  新鲜度快照: 06_publish/freshness_archive_snapshot.json ({brief})")
-            miss = snap.get("evidence_missing") or []
-            if miss:
-                print(f"  [warn] evidence_missing（已登记导出但缺 sidecar）: {', '.join(miss)}")
-    except Exception as e:
-        print(f"  [warn] 新鲜度快照写入失败（不影响归档）: {e}")
-    try:
-        shutil.move(series_dir, target)
-    except OSError as e:
-        print(f"  [FAIL] 移动目录失败（stage 已置 archived，调度已阻断；修复后可重跑续做）: {e}")
-        return 2
-    hits = _rewrite_manifests(manifest_dir, series_dir, target, dry_run=False)
-    print(f"  [ok] 已归档: {target}（manifest 更新 {hits} 条）")
-    return 0
+        hits = _rewrite_manifests(manifest_dir, series_dir, target, dry_run=False)
+        print(f"  [ok] 已归档: {target}（manifest 更新 {hits} 条）")
+        return 0
+    finally:
+        export_lock.release()
 
 
 def main(argv=None) -> int:
