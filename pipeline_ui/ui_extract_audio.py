@@ -235,10 +235,20 @@ def run_extract_audio(workdir: str = ".", timeout_sec: int = 30) -> dict:
     # --- Step 5: 解除所有锁定和隐藏（阶段 6 边界：分离已完成，进入最终形态布局）---
     op_stage('6 草稿最终形态(只隐藏中文轨,其余解除隐藏)')
     dprint("\n[5/6] 解除所有轨道的锁定和隐藏")
-    restore_result = restore_all_tracks(win, scan_hint=hint)
+    restore_result = restore_all_tracks(win, scan_hint=hint,
+                                        expected_tracks=len(rows0) + 1)
     if not restore_result.get('ok'):
+        reason = restore_result.get('reason')
+        if reason == 'scroll_unavailable':
+            err = ('恢复轨道失败：仍有轨道在时间线可视区外，滚轮/滚动条/键盘均无法滚动，'
+                   '无法判定是锁定还是不可见（请人工滚动时间线后复跑）')
+        else:
+            err = '恢复轨道失败：仍有轨道锁定或隐藏'
+            if restore_result.get('still_locked') or restore_result.get('still_hidden'):
+                err += (f"（仍锁定={restore_result.get('still_locked')} "
+                        f"仍隐藏={restore_result.get('still_hidden')}）")
         return {'ok': False, 'duration_s': round(time.time() - t0, 1),
-                'error': '恢复轨道失败：仍有轨道锁定或隐藏'}
+                'error': err, 'restore': restore_result}
 
     # --- Step 6: 只隐藏中文字幕轨（从上到下第二条字幕轨）---
     dprint("\n[6/6] 隐藏中文字幕轨（从上到下第二条）")

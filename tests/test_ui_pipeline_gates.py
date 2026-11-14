@@ -203,10 +203,130 @@ def test_verify_video_audio_channel_conflict_stays_warn(monkeypatch, tmp_path):
 def test_verify_definite_hidden_or_uia_type_mismatch_fails(
         monkeypatch, tmp_path, actual_overrides):
     result, report = _verify_with_row(monkeypatch, tmp_path, {}, actual_overrides)
-
     assert result['ok'] is False
     assert result['state'] == 'FAIL'
     assert report['recon'][0]['verdict'] == 'fail'
+
+
+# ============ 轨道可视区 / 多态滚动（T5 ymid=855 卡点）============
+
+def test_row_in_view_excludes_rows_outside_timeline():
+    tr = (0, 80, 500, 300)
+    assert ui_track_ops._row_in_view(150, tr) is True
+    assert ui_track_ops._row_in_view(70, tr) is False
+    assert ui_track_ops._row_in_view(310, tr) is False
+    # 拿不到 timeline rect 时不误判（交给后续真实扫描）
+    assert ui_track_ops._row_in_view(855, None) is True
+
+
+def test_scroll_all_modes_fail_is_reported(monkeypatch):
+    win = object()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('模态不可用')
+
+    monkeypatch.setattr(ui_track_ops, '_light_scan',
+                        lambda _w: ([{'ymid': 100}], (0, 0, 500, 300), object(), 0, 0))
+    monkeypatch.setattr(ui_track_ops, '_scroll_once', boom)
+    monkeypatch.setattr(ui_track_ops.time, 'sleep', lambda _s: None)
+    monkeypatch.setattr(ui_track_ops, 'dprint', lambda *a: None)
+
+    r = ui_track_ops.scroll_timeline_vertical(win)
+
+    assert r['ok'] is False
+    assert r['reason'] == 'all_modes_failed'
+    assert [t['mode'] for t in r['tried']] == ['wheel', 'scrollbar', 'keyboard']
+    assert all(t['ok'] is False for t in r['tried'])
+
+
+def test_restore_marks_scroll_unavailable_instead_of_still_locked(monkeypatch):
+    win = object()
+    row = {'type': 'video', 'ymid': 100, 'hidden': False}
+    img = object()
+
+    monkeypatch.setattr(ui_track_ops, 'get_window_rect', lambda _w: (0, 0, 200, 300))
+    monkeypatch.setattr(ui_track_ops, '_ensure_geom', lambda *a: None)
+    monkeypatch.setattr(ui_track_ops, '_hdr_x', lambda v: v)
+    monkeypatch.setattr(ui_track_ops, 'is_row_locked', lambda *a: False)
+    monkeypatch.setattr(ui_track_ops, 'scan_tracks', lambda _w: ([row], img, 0, 0, 200, 300))
+    monkeypatch.setattr(ui_track_ops, '_light_scan',
+                        lambda _w: ([dict(row)], (0, 0, 200, 300), img, 0, 0))
+    monkeypatch.setattr(ui_track_ops, 'scroll_timeline_vertical',
+                        lambda *a, **k: {'ok': False, 'mode': None,
+                                         'tried': [], 'reason': 'all_modes_failed'})
+    monkeypatch.setattr(ui_track_ops.pyautogui, 'click', lambda *a: None)
+    monkeypatch.setattr(ui_track_ops.time, 'sleep', lambda _s: None)
+    monkeypatch.setattr(ui_track_ops, 'dprint', lambda *a: None)
+    monkeypatch.setattr(ui_calibration, 'get_param',
+                        lambda _s, key, default=None: 50 if key == 'lock_x' else default)
+
+    r = ui_track_ops.restore_all_tracks(win, max_rounds=1, expected_tracks=2)
+
+    assert r['ok'] is False
+    assert r['reason'] == 'scroll_unavailable'
+    assert r['scroll_unavailable'] is True
+    assert r['still_locked'] == []          # 不能报成"仍锁定"
+
+
+def test_restore_reflows_stale_hint_before_unlock(monkeypatch):
+    win = object()
+    stale = {'type': 'video', 'ymid': 855, 'hidden': False}   # 插入新轨前的旧坐标
+    fresh = {'type': 'unknown', 'y_top': 590, 'y_bot': 616, 'ymid': 603, 'hidden': False}
+    img = object()
+    clicks = []
+
+    monkeypatch.setattr(ui_track_ops, 'get_window_rect', lambda _w: (0, 0, 200, 900))
+    monkeypatch.setattr(ui_track_ops, '_ensure_geom', lambda *a: None)
+    monkeypatch.setattr(ui_track_ops, '_hdr_x', lambda v: v)
+    monkeypatch.setattr(ui_track_ops, '_light_scan',
+                        lambda _w: ([dict(fresh)], (0, 0, 200, 900), img, 0, 0))
+    monkeypatch.setattr(ui_track_ops, 'scan_tracks',
+                        lambda _w: ([dict(fresh)], img, 0, 0, 200, 900))
+    monkeypatch.setattr(ui_track_ops, 'is_row_locked',
+                        lambda _img, _wt, ymid: int(ymid) == 603 and not clicks)
+    monkeypatch.setattr(ui_track_ops.pyautogui, 'click',
+                        lambda x, y: clicks.append((x, y)))
+    monkeypatch.setattr(ui_track_ops.time, 'sleep', lambda _s: None)
+    monkeypatch.setattr(ui_track_ops, 'dprint', lambda *a: None)
+    monkeypatch.setattr(ui_calibration, 'get_param',
+                        lambda _s, key, default=None: 50 if key == 'lock_x' else default)
+
+    r = ui_track_ops.restore_all_tracks(win, max_rounds=1,
+                                        scan_hint=([stale], img, 0, 0, 200, 900))
+
+    assert clicks == [(50, 603)]        # 点在重排后的新 y，而不是失效的 855
+    assert r['drift_rounds'] >= 1
+    assert r['ok'] is True
+
+
+def test_extract_audio_reports_scroll_unavailable_distinctly(monkeypatch, tmp_path):
+    win = object()
+    main = {'type': 'video', 'ymid': 100, 'hidden': False}
+    audio = {'type': 'audio', 'ymid': 150, 'hidden': False}
+    scans = iter([
+        ([main], None, 0, 0, 200, 75, win),
+        ([main, audio], object(), 0, 0, 200, 75, win),
+    ])
+
+    monkeypatch.setattr(ui_extract_audio, 'op_stage', lambda *args: None)
+    monkeypatch.setattr(ui_extract_audio, 'dprint', lambda *args: None)
+    monkeypatch.setattr(ui_extract_audio, '_ensure_edit_page', lambda _win: (win, True))
+    monkeypatch.setattr(ui_extract_audio, 'ensure_maximized', lambda value: value)
+    monkeypatch.setattr(ui_extract_audio, '_top_text_cluster', lambda _win: ([], 75, win))
+    monkeypatch.setattr(ui_extract_audio, '_safe_scan', lambda _win: next(scans))
+    monkeypatch.setattr(ui_extract_audio, 'find_main_track', lambda *args: (main, True))
+    monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda: None)
+    monkeypatch.setattr(ui_extract_audio.pyautogui, 'hotkey', lambda *args: None)
+    monkeypatch.setattr(ui_extract_audio.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(ui_extract_audio, 'restore_all_tracks',
+                        lambda *args, **kwargs: {'ok': False, 'reason': 'scroll_unavailable',
+                                                 'still_locked': [], 'still_hidden': []})
+
+    result = ui_extract_audio.run_extract_audio(workdir=str(tmp_path))
+
+    assert result['ok'] is False
+    assert '可视区外' in result['error']          # 与"仍锁定或隐藏"区分
+    assert result['restore']['reason'] == 'scroll_unavailable'
 
 
 @pytest.mark.parametrize('expected_overrides,actual_overrides', [
