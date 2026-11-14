@@ -270,6 +270,47 @@ def _close_jianying_after_batch(reason: str = "队列导出结束") -> None:
         print("  ⚠️ 剪映未在时限内正常退出（不影响已完成成品）")
 
 
+def _drafts_root():
+    try:
+        from utils.formatters import get_default_drafts_root
+        return get_default_drafts_root()
+    except Exception:
+        return JY_DRAFT_ROOT
+
+
+def _draft_duration_s(draft_name: str):
+    """草稿总时长（秒）。读不到返回 None：导出照常，只是进度没有估算。"""
+    if not draft_name:
+        return None
+    path = os.path.join(_drafts_root(), draft_name, "draft_content.json")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            draft = json.load(f)
+        us = 0
+        for track in draft.get("tracks") or []:
+            for seg in track.get("segments") or []:
+                tr = seg.get("target_timerange") or {}
+                us = max(us, int(tr.get("start", 0)) + int(tr.get("duration", 0)))
+        return round(us / 1e6, 3) if us > 0 else None
+    except Exception:
+        return None
+
+
+def _export_cmd(draft_name: str, out_mp4: str, cold_start: bool, keep_open: bool):
+    cmd = [sys.executable, "-u", AUTO_EXPORTER, draft_name, out_mp4, "--move",
+           "--fallback-dir", get_export_dir()]
+    # 首版没有旧成品时，进度百分比只能靠草稿时长估算；watcher 路径也要传，
+    # 否则和 pipeline_ui 路径的行为不一致（长时间显示"无估算"）。
+    expect_s = _draft_duration_s(draft_name)
+    if expect_s:
+        cmd += ["--expect-duration", ("%g" % expect_s)]
+    if cold_start:
+        cmd.append("--cold-start")
+    if keep_open:
+        cmd.append("--keep-open")
+    return cmd
+
+
 def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = False,
                 job_dir: str | None = None, keep_open: bool = False) -> bool:
     """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。
@@ -295,12 +336,7 @@ def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = Fa
     # 只建父目录：剧名目录留给剪映自己创建，否则剪映会把成品写进「剧名(1)」
     os.makedirs(os.path.dirname(out_dir), exist_ok=True)
     _preclean_bundles(draft_name, out_dir)
-    cmd = [sys.executable, "-u", AUTO_EXPORTER, draft_name, out_mp4, "--move",
-           "--fallback-dir", get_export_dir()]
-    if cold_start:
-        cmd.append("--cold-start")
-    if keep_open:
-        cmd.append("--keep-open")
+    cmd = _export_cmd(draft_name, out_mp4, cold_start, keep_open)
 
     # 子进程输出落盘：pythonw 链路下没有控制台，dprint 原本全部丢失（13:25、13:59
     # 两次冷启动失败零证据）。这里直接重定向 OS 句柄，并记录启动/pid/退出码。

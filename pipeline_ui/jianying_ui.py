@@ -15,11 +15,29 @@ def load_coords():
 
 def get_jianying_window():
     w = uia.WindowControl(searchDepth=1, ClassName="MainWindow_QMLTYPE_6263")
-    if not w.Exists(2):
-        w = uia.WindowControl(searchDepth=1, Name="剪映专业版")
-    if not w.Exists(0):
-        return None
-    return w
+    if w.Exists(2):
+        return w
+    w = uia.WindowControl(searchDepth=1, Name="剪映专业版")
+    if w.Exists(0):
+        return w
+    # 版本类名或界面语言变化时兜底：按进程名找顶层窗口，ClassName 含
+    # MainWindow/HomePage 即认为是剪映主窗口（不依赖中文标题）。
+    try:
+        import psutil
+        pids = {p.pid for p in psutil.process_iter(["name"])
+                if (p.info.get("name") or "").lower() == "jianyingpro.exe"}
+        if pids:
+            for c in uia.GetRootControl().GetChildren():
+                try:
+                    if c.ProcessId in pids and (
+                            "MainWindow" in (c.ClassName or "")
+                            or "HomePage" in (c.ClassName or "")):
+                        return c
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
 
 def window_rect():
     w = get_jianying_window()
@@ -45,9 +63,13 @@ def click_mark(name, offset_x=0, offset_y=0, delay_after=0.8):
 
 def ensure_foreground():
     import ctypes
-    hwnd = ctypes.windll.user32.FindWindowW("MainWindow_QMLTYPE_6263", "剪映专业版")
-    if not hwnd:
-        hwnd = ctypes.windll.user32.FindWindowW(None, "剪映专业版")
+    w = get_jianying_window()
+    if not w:
+        return
+    try:
+        hwnd = int(w.NativeWindowHandle or 0)
+    except Exception:
+        hwnd = 0
     if hwnd:
         ctypes.windll.user32.ShowWindow(hwnd, 9)
         ctypes.windll.user32.SetForegroundWindow(hwnd)

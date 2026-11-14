@@ -1390,12 +1390,10 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
 
     def _export_cmd() -> list[str]:
         dn = os.path.basename(draft.rstrip("\\/"))
-        cmd = [sys.executable, os.path.join(_REPO, ".trae", "skills", "jianying-editor",
-                                            "examples", "robust_auto_export.py"),
-               dn, pc.export_mp4_path(dn), "--move", "--fallback-dir", pc.get_export_dir()]
-        if cfg.get("cold_start", True):
-            cmd.append("--cold-start")
-        return cmd
+        # 与实际执行共用同一份命令拼装（含 --expect-duration），避免 plan 里
+        # 展示的命令和真正跑的命令不一致。
+        return sr._export_cmd(dn, pc.export_mp4_path(dn),
+                              bool(cfg.get("cold_start", True)), False)
 
     if phase_override == "edit":
         plan.update(action="edit", reason="--phase edit 强制", cmd=_edit_cmd())
@@ -2015,6 +2013,40 @@ def _reap_stalled_edit(job_dir: str, cfg: dict[str, Any], *, name: str) -> None:
     except OSError as e:
         # 巡检轮次不因为它自己写状态失败就把 daemon 打崩；下一轮会再次巡检。
         _log(job_dir, f"edit 卡死：写 .edit_state.json 失败（{e}），下一轮重试")
+
+
+def _reap_stale_export(job_dir: str) -> None:
+    """每轮巡检：上次导出崩溃留下的 exporting 死记录 → 落盘回收为 retrying。
+
+    导出链自己在开头会 reap 一次（run_export）；但被 gate 拦下、不会再进入
+    导出链的 job 永远走不到那里，死记录会一直显示"导出进行中"并阻塞调度。
+    这里补一个后台巡检：只在真实轮次调用（plan/dry-run 只读），心跳仍新鲜的
+    活导出不受影响（stale 判定取 max(heartbeat_ts, progress_mtime)）。
+    """
+    try:
+        job = jm.load_job(os.path.join(job_dir, "job.json"))
+    except Exception:
+        return
+    video = job.get("video") or {}
+    names = []
+    for ent in (video.get("outputs") or {}).values():
+        if isinstance(ent, dict) and ent.get("draft"):
+            names.append(ent["draft"])
+    if not names and video.get("draft_name"):
+        names.append(video["draft_name"])
+    pm = 0.0
+    for draft_name in names:
+        try:
+            m, _, _ = _progress_info(pc.export_mp4_path(draft_name))
+            pm = max(pm, m)
+        except Exception:
+            continue
+    try:
+        if es.reap_stale(job_dir, progress_mtime=pm):
+            _log(job_dir, "真源回收：巡检发现导出心跳超时（stale），转重试")
+    except OSError as e:
+        # 巡检不能因为写状态失败把 daemon 打崩；下一轮会再次巡检。
+        print(f"[WARN] 导出 stale 巡检写盘失败 {job_dir}: {e}")
 
 
 def _job_created_ts(job_dir: str, job: dict[str, Any]) -> Optional[float]:
@@ -3449,6 +3481,9 @@ def _eval_round(args: argparse.Namespace, cfg: dict[str, Any],
             if args.verbose:
                 print(f"[skip] {job_dir}: 活锁存在（链在跑）")
             continue
+        if write_log:
+            # 无活锁的 job 不会再走导出链，只能靠巡检回收 exporting 死记录
+            _reap_stale_export(job_dir)
         ok, reasons = check_trigger(job_dir)
         if not ok:
             if getattr(args, "once", False) or args.verbose:

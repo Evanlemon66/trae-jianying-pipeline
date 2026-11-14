@@ -275,10 +275,11 @@ def default_freshness():
                       "reason": None, "detail": None, "accepted_as_is": None},
             EDGE_E2: {"state": "unknown", "input_hash": None, "output": None,
                       "recorded_at": None, "reason": None,
-                      "provenance_file": None},
+                      "provenance_file": None, "version": None,
+                      "versions": {}},
             EDGE_E3: {"state": "unknown", "input_hash": None,
                       "output_hash": None, "recorded_at": None,
-                      "reason": None},
+                      "reason": None, "version": None, "versions": {}},
         },
         "manual_confirmed": {},
     }
@@ -650,6 +651,90 @@ def job_dir_for_draft(draft_path_or_name):
 
 # ━━━━━━━━━━━━━━━━ 记录写入 ━━━━━━━━━━━━━━━━
 
+def _e3_record_for_version(fr, version):
+    """按版本取 E3 证据槽（模式同 E2）。
+
+    封面的输入/输出本身按版本区分；单槽会让"给 B 补封面基线"把 A 误判成
+    cover_changed。旧 job.json 无 versions 时仍按平铺字段只读兼容。
+    """
+    e3 = fr["edges"][EDGE_E3]
+    versions = e3.get("versions") if isinstance(e3.get("versions"), dict) else {}
+    slot = versions.get(version)
+    flat_version = e3.get("version")
+    if isinstance(slot, dict) and slot.get("state") not in (None, "unknown"):
+        return slot
+    if flat_version in (None, "") or _norm_version(flat_version) == version:
+        return e3
+    return slot if isinstance(slot, dict) else {"state": "unknown"}
+
+
+def _mark_e3_stale(job, fr, reason):
+    """E3 置 stale。封面/意图变化对所有版本都成立，所以分槽与平铺一起标。"""
+    e3 = fr["edges"][EDGE_E3]
+    versions = e3.setdefault("versions", {})
+    targets = set(((job.get("video") or {}).get("outputs") or {})) | set(versions)
+    slot = {"state": "stale", "reason": reason, "recorded_at": _now_iso(),
+            "input_hash": None, "output_hash": None}
+    for v in targets:
+        versions.setdefault(v, {}).update(dict(slot, version=v))
+    flat_version = e3.get("version")
+    if not targets or flat_version in (None, "") or \
+            _norm_version(flat_version) in targets:
+        e3.update(slot)
+
+
+def _e2_record_for_version(fr, version):
+    """按版本取 E2 证据槽。
+
+    新版 job.json 在 `edges.e2.versions[<版本>]` 按版本分槽，避免 A/B 互相覆盖；
+    平铺字段保留为最近一次写的兼容副本。旧 job.json 没有分槽（也没有 version
+    字段）时仍按平铺字段判，保持原有行为。
+    """
+    e2 = fr["edges"][EDGE_E2]
+    versions = e2.get("versions") if isinstance(e2.get("versions"), dict) else {}
+    slot = versions.get(version)
+    flat_version = e2.get("version")
+    if isinstance(slot, dict) and slot.get("state") not in (None, "unknown"):
+        return slot
+    if flat_version in (None, "") or _norm_version(flat_version) == version:
+        return e2
+    return slot if isinstance(slot, dict) else {"state": "unknown"}
+
+
+def _versions_for_draft_path(job, draft_path):
+    """草稿路径 → 对应版本列表（按 job.video.outputs[*].draft 的目录名反查）。"""
+    try:
+        target = os.path.basename(os.path.normpath(
+            os.path.dirname(os.path.abspath(draft_path))))
+    except Exception:
+        return []
+    out = []
+    for ver, ent in (((job.get("video") or {}).get("outputs") or {}).items()):
+        name = (ent or {}).get("draft")
+        if not name:
+            continue
+        if os.path.basename(os.path.normpath(str(name))) == target:
+            out.append(_norm_version(ver))
+    return out
+
+
+def _mark_e2_stale(job, fr, version, reason, detail, draft_path=None):
+    """只把受影响版本的 E2 槽置 stale；版本无法判定时保守地全部置 stale。"""
+    e2 = fr["edges"][EDGE_E2]
+    versions = e2.setdefault("versions", {})
+    slot = {"state": "stale", "reason": reason, "detail": detail,
+            "recorded_at": _now_iso(), "output": None, "provenance_file": None}
+    targets = [version] if version else _versions_for_draft_path(job, draft_path)
+    if not targets:
+        targets = list(versions)  # 无法反查版本：全部分槽 + 平铺一起置 stale
+    for v in targets:
+        versions.setdefault(v, {}).update(dict(slot, version=v))
+    flat_version = e2.get("version")
+    if not targets or flat_version in (None, "") or \
+            _norm_version(flat_version) in targets:
+        e2.update(slot)
+
+
 def record_draft_write(job_dir, draft_path, writer, adopted_external=False):
     """每次写 draft_content.json 后调用：记 E1 指纹，并把 E2 置 stale。
 
@@ -678,10 +763,8 @@ def record_draft_write(job_dir, draft_path, writer, adopted_external=False):
                        "output_hash": out_hash, "weak_hash": weak,
                        "draft": dname, "recorded_at": _now_iso(),
                        "last_writer": writer, "reason": None, "detail": None})
-            e2 = fr["edges"][EDGE_E2]
-            e2.update({"state": "stale", "reason": "draft_changed",
-                       "detail": f"writer={writer}", "output": None,
-                       "provenance_file": None})
+            _mark_e2_stale(job, fr, None, "draft_changed", f"writer={writer}",
+                           draft_path=draft_path)
         _record(job_dir, mutate, event=None)
         return True
     except Exception as e:
@@ -744,10 +827,11 @@ def record_export(job_dir, version, draft_name, export_file, verify_rc=None,
             # 成品不存在：绝不写 valid 边（那会指向空文件），显式降级为
             # stale(output_missing)，让下游按"缺成品"处理。
             def mark_missing(job, fr):
-                fr["edges"][EDGE_E2].update({
-                    "state": "stale", "reason": "output_missing",
-                    "recorded_at": _now_iso(), "output": None,
-                })
+                slot = {"state": "stale", "reason": "output_missing",
+                        "recorded_at": _now_iso(), "output": None,
+                        "version": version}
+                fr["edges"][EDGE_E2].update(slot)
+                fr["edges"][EDGE_E2].setdefault("versions", {})[version] = deepcopy(slot)
             _record(job_dir, mark_missing)
             return False
         ddir = _draft_dir(draft_name)
@@ -781,14 +865,17 @@ def record_export(job_dir, version, draft_name, export_file, verify_rc=None,
                 print(f"  [warn] sidecar 写入失败（不影响导出）: {e}")
 
         def mutate(job, fr):
-            fr["edges"][EDGE_E2].update({
+            slot = {
                 "state": "valid", "input_hash": dhash, "output": {
                     k: evidence["video"].get(k) for k in
                     ("size_bytes", "sha256", "duration_us", "nb_frames",
                      "avg_frame_rate", "width", "height")},
                 "recorded_at": _now_iso(), "reason": None,
-                "provenance_file": sc,
-            })
+                "provenance_file": sc, "version": version,
+            }
+            e2 = fr["edges"][EDGE_E2]
+            e2.update(slot)
+            e2.setdefault("versions", {})[version] = deepcopy(slot)
         _record(job_dir, mutate, event=None)
         return True
     except Exception as e:
@@ -820,11 +907,14 @@ def record_cover(job_dir, version, draft_dir, cover_image=None):
         out_hash = _cover_output_hash(draft_dir, draft) if draft else None
 
         def mutate(job, fr):
-            fr["edges"][EDGE_E3].update({
+            slot = {
                 "state": "valid", "input_hash": in_hash,
                 "output_hash": out_hash, "recorded_at": _now_iso(),
-                "reason": None,
-            })
+                "reason": None, "version": version,
+            }
+            e3 = fr["edges"][EDGE_E3]
+            e3.update(slot)
+            e3.setdefault("versions", {})[version] = deepcopy(slot)
         _record(job_dir, mutate)
         return True
     except Exception as e:
@@ -881,9 +971,7 @@ def mark_intent_changed(job_dir):
         def mutate(job, fr):
             fr["edges"][EDGE_E1].update({
                 "state": "stale", "reason": "intent", "recorded_at": _now_iso()})
-            fr["edges"][EDGE_E3].update({
-                "state": "stale", "reason": "covers_pending_regeneration",
-                "recorded_at": _now_iso()})
+            _mark_e3_stale(job, fr, "covers_pending_regeneration")
         return _record(job_dir, mutate)
     except Exception as e:
         print(f"  [warn] 标记意图变更失败: {e}")
@@ -894,9 +982,7 @@ def mark_covers_pending(job_dir, reason="covers_changed"):
     """covers 重跑后：E3 等 cover_bind，E1/E2 不动。"""
     try:
         def mutate(job, fr):
-            fr["edges"][EDGE_E3].update({
-                "state": "stale", "reason": reason,
-                "recorded_at": _now_iso()})
+            _mark_e3_stale(job, fr, reason)
         return _record(job_dir, mutate)
     except Exception as e:
         print(f"  [warn] 标记封面待绑定失败: {e}")
@@ -1002,7 +1088,7 @@ def check(job_dir, edge, version=None):
 
     if edge == EDGE_E3:
         cur_in = _cover_input_hash(job_dir, version)
-        rec = fr["edges"][EDGE_E3]
+        rec = _e3_record_for_version(fr, version)
         if cur_in is None or not rec.get("input_hash"):
             return {"state": "unknown", "reason": "no_cover", "evidence": rec}
         if cur_in != rec.get("input_hash"):
@@ -1181,7 +1267,7 @@ def freshness_of(job_dir, version, consumer="scheduler"):
     marker_hit = bool(marker and os.path.isfile(marker))
 
     sc = read_sidecar(export_file) if export_file else None
-    rec = fr["edges"][EDGE_E2]
+    rec = _e2_record_for_version(fr, version)
 
     # 封面专用写入自愈：草稿 hash 变了，但变的是 timeline_unchanged=true 的
     # 封面绑定（且晚于本次导出）→ 时间线未变，E2 仍成立，不判 draft_changed。
@@ -1362,8 +1448,8 @@ def reuse_as_is(job_dir, edges="all", version=None, why=""):
 
 # ━━━━━━━━━━━━━━━━ 归档 / clean 支撑 ━━━━━━━━━━━━━━━━
 
-def archive_snapshot(job_dir, versions=None, write=True):
-    """归档搬运前的判定快照：不阻断，只记录。"""
+def archive_snapshot(job_dir, versions=None, write=True, allow_stale_reason=None):
+    """归档搬运前的判定快照：记录判定，不在这里阻断（阻断由 archive_job 做）。"""
     try:
         job = _read_json(_job_json(job_dir))
     except Exception:
@@ -1378,6 +1464,11 @@ def archive_snapshot(job_dir, versions=None, write=True):
     # 反向检测汇总：登记过导出却没有 sidecar 的版本单独列出，归档时一眼可见
     snap["evidence_missing"] = [v for v, d in snap["versions"].items()
                                 if d.get("state") == "evidence_missing"]
+    snap["stale"] = [v for v, d in snap["versions"].items()
+                     if d.get("state") == "stale"]
+    # 人工放行 stale/evidence_missing 时把理由一起固化，便于事后追溯
+    if allow_stale_reason:
+        snap["allow_stale_reason"] = allow_stale_reason
     # 命中上线基线的历史产物：只标注，不算问题
     snap["legacy_baseline"] = [v for v, d in snap["versions"].items()
                                if d.get("reason") == "baseline"]

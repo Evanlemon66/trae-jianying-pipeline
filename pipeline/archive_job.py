@@ -296,7 +296,8 @@ def _rewrite_manifests(manifest_dir: str, old_dir: str, new_dir: str,
 
 def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
             dry_run: bool = False, force: bool = False,
-            roots: list[str] | None = None) -> int:
+            roots: list[str] | None = None,
+            allow_stale_reason: str | None = None) -> int:
     """归档一部剧。返回 0=成功/计划完成；1=跳过；2=失败。"""
     job_dir = _norm_job_dir(job_dir)
     if not os.path.isfile(os.path.join(job_dir, "job.json")):
@@ -385,6 +386,30 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
                   "确需强推加 --force")
             return 1
 
+    # 新鲜度默认阻断：stale / evidence_missing 的成品不能静默搬进归档池。
+    # 人工确认后必须用 --allow-stale "<理由>" 放行，理由会写进归档快照。
+    allow_stale_reason = (allow_stale_reason or "").strip() or None
+    stale_hit: list[str] = []
+    if not archived:
+        try:
+            import freshness
+            probe = freshness.archive_snapshot(job_dir, write=False)
+            stale_hit = list(probe.get("stale") or [])
+            stale_hit += [v for v in (probe.get("evidence_missing") or [])
+                          if v not in stale_hit]
+        except Exception as e:
+            # 判定本身不可用时沿用原 best-effort 语义，但必须显式提示
+            print(f"  [warn] 归档前新鲜度判定失败，按原行为继续: {e}")
+        if stale_hit and not allow_stale_reason:
+            print("  [blocked] 新鲜度判定为 stale/evidence_missing: "
+                  + "、".join(stale_hit))
+            print('  归档默认阻断过期/无证据成品；确认要归档请加 '
+                  '--allow-stale "理由"（理由会写入快照）')
+            return 1
+        if stale_hit:
+            print(f"  [allow-stale] 版本 {'、'.join(stale_hit)} 已人工放行："
+                  f"{allow_stale_reason}")
+
     print(f"  剧集目录: {series_dir}")
     print(f"  归档目标: {target}")
     if not archived:
@@ -404,10 +429,11 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
             return 2
     os.makedirs(archive_root, exist_ok=True)
     # 归档 = 产物连同出身一起搬走：搬之前把各版本的新鲜度判定固化成快照，
-    # 不阻断、不判定（legacy/unknown/stale 都原样记录），供归档后追溯。
+    # 供归档后追溯（stale/evidence_missing 已在上面做过默认阻断与人工放行）。
     try:
         import freshness
-        snap = freshness.archive_snapshot(job_dir, write=True)
+        snap = freshness.archive_snapshot(
+            job_dir, write=True, allow_stale_reason=allow_stale_reason)
         if snap:
             brief = ", ".join(f"{k}={v.get('state')}"
                               for k, v in (snap.get("versions") or {}).items())
@@ -438,6 +464,8 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不写盘、不移动")
     ap.add_argument("--force", action="store_true",
                     help="跳过发布/清理准入与成品三件套校验（路径断言不可跳过）")
+    ap.add_argument("--allow-stale", default=None, metavar="理由",
+                    help="人工放行 stale/evidence_missing 成品归档；理由写入快照")
     args = ap.parse_args(argv)
 
     root = args.archive_root or (pc.get_watch_config() or {}).get("archive_root")
@@ -445,7 +473,8 @@ def main(argv=None) -> int:
         print("[FAIL] 未指定 --archive-root，且 presets.json watch 段无 archive_root")
         return 2
     return archive(args.job, root, args.manifest_dir,
-                   dry_run=args.dry_run, force=args.force)
+                   dry_run=args.dry_run, force=args.force,
+                   allow_stale_reason=args.allow_stale)
 
 
 if __name__ == "__main__":

@@ -128,9 +128,32 @@ def test_material_set_mismatch_skips_restore(tmp_path, monkeypatch, capsys):
 
 # ── 门槛通过：恢复 + 留痕 ────────────────────────────────────────
 
+def test_partial_merge_also_restores(tmp_path, monkeypatch):
+    """部分合并（>50% 剩余）也要恢复：117→70 这类路径旧阈值会漏。"""
+    live = _draft(DURATION, [_seg("m1", 1_500_000) for _ in range(4)])
+    bak = _draft(DURATION, [_seg("m1", 1_000_000) for _ in range(6)])
+    ddir, _ = _setup(tmp_path, monkeypatch, live, bak)
+
+    assert rae._restore_streams_from_backup(NAME) is True
+
+    after = _read(str(ddir / "draft_content.json"))
+    video = [t for t in after["tracks"] if t["type"] == "video"][0]
+    assert len(video["segments"]) == 6
+
+
+def test_equal_segment_count_does_not_restore(tmp_path, monkeypatch):
+    ddir, _ = _setup(tmp_path, monkeypatch, _merged(), _backup_ok())
+    live = _read(str(ddir / "draft_content.json"))
+    live["tracks"] = [{"type": "video", "segments": [_seg("m1", 2_000_000)
+                                                    for _ in range(3)]},
+                      {"type": "text", "segments": []}]
+    _write(str(ddir / "draft_content.json"), live)
+
+    assert rae._restore_streams_from_backup(NAME) is False
+
+
 def test_equal_duration_and_materials_restores_with_freshness(tmp_path, monkeypatch):
     ddir, job_dir = _setup(tmp_path, monkeypatch, _merged(), _backup_ok())
-
     assert rae._restore_streams_from_backup(NAME) is True
 
     after = _read(str(ddir / "draft_content.json"))

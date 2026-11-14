@@ -40,6 +40,44 @@ import jianying_proc as jp  # noqa: E402
 STATES = ("stopped", "launching", "home", "editing", "exporting")
 PROCESS_NAME = "jianyingpro.exe"
 
+
+def _pick_main_window(children, pids):
+    """从顶层窗口里挑剪映主窗口：进程名 + ClassName 双条件，不依赖中文标题。
+
+    界面语言/版本改名时中文 Name 匹配会落空；ClassName 里的 MainWindow/
+    HomePage 与进程名是稳定的，可作为兜底。保持纯函数便于单测。
+    """
+    for c in children:
+        try:
+            if pids and getattr(c, "ProcessId", None) not in pids:
+                continue
+            cls = getattr(c, "ClassName", "") or ""
+            if "MainWindow" in cls or "HomePage" in cls:
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def _jianying_pids():
+    try:
+        import psutil
+        return {p.pid for p in psutil.process_iter(["name"])
+                if (p.info.get("name") or "").lower() == PROCESS_NAME}
+    except Exception:
+        return set()
+
+
+def _window_by_process(uia):
+    """按进程名定位主窗口；进程不在或 UIA 读取失败都返回 None。"""
+    pids = _jianying_pids()
+    if not pids:
+        return None
+    try:
+        return _pick_main_window(uia.GetRootControl().GetChildren(), pids)
+    except Exception:
+        return None
+
 # ── 启动即死检测（口径统一在 jianying_launch，模块内保留同名别名供调用方引用）──
 EARLY_DEATH_WINDOW_S = jl.EARLY_DEATH_WINDOW_S
 EARLY_DEATH_RETRIES = jl.EARLY_DEATH_RETRIES
@@ -128,10 +166,7 @@ class UIABackend(Backend):
 
     def window_exists(self) -> bool:
         try:
-            uia = self._u()
-            if uia.WindowControl(searchDepth=1, Name="剪映专业版").Exists(0):
-                return True
-            return uia.WindowControl(searchDepth=1, Name="导出").Exists(0)
+            return bool(self._main_window())
         except Exception:
             return False
 
@@ -141,6 +176,7 @@ class UIABackend(Backend):
         教训：回退用的搜索条件不是窗口。Name='导出' 只是一个查询描述，
         未做 Exists 校验就把它当主窗口交出去，后续读 ClassName 会白等 10s
         搜索超时（看起来像剪映假死）。任何 rebind 路径都不能跳过存在性校验。
+        中文标题只作首选：界面语言/版本改名时兜底按进程名 + ClassName 找顶层窗口。
         """
         uia = self._u()
         w = uia.WindowControl(searchDepth=1, Name="剪映专业版")
@@ -149,7 +185,8 @@ class UIABackend(Backend):
         export_win = uia.WindowControl(searchDepth=1, Name="导出")
         if export_win.Exists(0):
             return export_win
-        return None
+        return _window_by_process(uia)
+
 
     def is_home(self) -> bool:
         try:

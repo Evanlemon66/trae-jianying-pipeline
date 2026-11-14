@@ -31,6 +31,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import draft_io  # noqa: E402  草稿写盘唯一原语
+from restore_backups import prune_restore_backups  # noqa: E402  恢复备份源唯一白名单
 _DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                            "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
 # 合并暂存区：放在剪映草稿目录之外（同盘），合并完再整体搬进去。
@@ -318,10 +319,7 @@ def merge(src_dirs, out_name, force=False, transition="none", transition_duratio
     # 用第一集为模板复制完整目录；基础集内容与 ID 完全保留
     shutil.copytree(src_dirs[0], out_dir)
     print(f"🏗️ 暂存区构建（剪映不可见）: {out_dir}")
-    for junk in os.listdir(out_dir):
-        if junk.startswith("draft_content.json.bak") or junk.startswith("draft_meta_info.json.bak") \
-                or junk.startswith("template") and junk.endswith(".tmp"):
-            os.remove(os.path.join(out_dir, junk))
+    prune_restore_backups(out_dir)
 
     base_path = os.path.join(out_dir, "draft_content.json")
     base = json.load(open(base_path, encoding="utf-8"))

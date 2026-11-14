@@ -181,10 +181,12 @@ def _mtime(path):
 
 
 def _preflight_media(draft_name):
-    """导出预检：把草稿引用的音视频源文件逐个 ffprobe 一遍，提前暴露损坏/缺失素材。
+    """导出预检：把草稿引用的音视频源文件逐个校验，提前暴露损坏/缺失素材。
 
     剪映遇到坏素材会弹「导出文件缺失/损坏 10011」并卡在 0%，肉眼难查；
     这里在动剪映之前就校验完，返回 (可解码数量, [(路径, 原因), ...])。
+    fail-closed：ffprobe 缺失只降级「解码检查」，文件存在性/大小检查恒执行，
+    缺失素材不会被带进剪映。
     """
     import json
     import concurrent.futures as futures
@@ -198,8 +200,7 @@ def _preflight_media(draft_name):
 
     ffprobe = _find_ffprobe()
     if not ffprobe:
-        dprint("⚠️ 未找到 ffprobe，跳过素材预检（损坏素材仍可能导致导出卡死）")
-        return 0, []
+        dprint("⚠️ 未找到 ffprobe：仅校验文件存在性/大小，跳过解码检查")
 
     with open(content, encoding="utf-8") as f:
         data = json.load(f)
@@ -219,6 +220,8 @@ def _preflight_media(draft_name):
             return (p, "文件不存在")
         if os.path.getsize(p) < 1024:
             return (p, "文件过小/空文件")
+        if not ffprobe:
+            return None
         try:
             r = subprocess.run(
                 [ffprobe, "-v", "error", "-show_entries", "format=duration",
@@ -281,11 +284,31 @@ def _flush_task(done=False, final_file=None, duration=None, cover=None):
                     done=done, final_file=final_file, duration=duration, cover=cover)
 
 
+def _archived_exports(output_path, limit=5):
+    """同目录历史归档成品 [(版号, 尺寸)]，v1 最新；供预期体积回退。"""
+    if not output_path:
+        return []
+    stem, ext = os.path.splitext(os.path.abspath(output_path))
+    out = []
+    for n in range(1, limit + 1):
+        p = f"{stem}.v{n}{ext}"
+        try:
+            if os.path.isfile(p):
+                size = os.path.getsize(p)
+                if size > 0:
+                    out.append((n, size))
+        except OSError:
+            continue
+    return out
+
+
 def _expected_export_bytes(output_path, expected_duration=None):
-    """预期成品体积（字节, 来源）：上一版成品 > 上次完成记录 > 时长×码率估算。
+    """预期成品体积（字节, 来源）：上一版成品 > 归档副本 > 上次完成记录 > 时长估算。
 
     上一版成品就是 job.json → video.outputs[].size_bytes 记的那个文件本身（同一个数），
-    直接量文件即可，不为导出链新增 job 目录依赖。都拿不到返回 (None, "无估算")。
+    直接量文件即可，不为导出链新增 job 目录依赖。同版本重跑前旧成品会被改名成
+    `<stem>.v1.mp4`（archive_stale_outputs），输出路径上就没有旧文件了；归档副本
+    就在同目录、体积同样可靠，所以排在第二优先。都拿不到返回 (None, "无估算")。
     """
     try:
         if output_path and os.path.isfile(output_path):
@@ -294,6 +317,8 @@ def _expected_export_bytes(output_path, expected_duration=None):
                 return size, "上一版成品"
     except OSError:
         pass
+    for n, size in _archived_exports(output_path):
+        return size, f"归档副本 .v{n}"
     # 上次完成时的进度记录（只认 done，避免把本次运行中的半成品 MB 当总量）
     try:
         final_path, side_path = _progress_paths(output_path)
@@ -1714,7 +1739,11 @@ def _restore_streams_from_backup(draft_name):
     bak_cnt = _seg_counts(bak)
     needs_restore = False
     for k in bak_cnt:
-        if cur_cnt.get(k, 0) < bak_cnt[k] / 2:  # 骤降 >50% 认为被合并
+        # 段数 + 总时长双指标：时长相等已在内容门槛校验过，这里只判段数。
+        # 剪映 5.9 的合并不一定是"腰斩"，部分合并（如 117→70）同样会丢
+        # source_timerange，所以只要段数变少就触发恢复；内容门槛保证备份
+        # 对得上当前时间线（duration 与素材 id 集合都相等）。
+        if cur_cnt.get(k, 0) < bak_cnt[k]:
             needs_restore = True
             break
 
@@ -1742,7 +1771,7 @@ def _restore_streams_from_backup(draft_name):
             if bi < len(bak_tracks_by_type[ttype]):
                 cur_n = len(t.get("segments") or [])
                 bak_n = len(bak_tracks_by_type[ttype][bi].get("segments") or [])
-                if cur_n < bak_n / 2:
+                if cur_n < bak_n:
                     new_tracks.append(bak_tracks_by_type[ttype][bi])
                     restored += 1
                 else:
@@ -1810,8 +1839,8 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
             _TASK["stage"] = "素材预检失败"
             _flow(f"素材预检不通过：{len(problems)} 个源文件损坏（{brief}{tail}）")
             raise Exception(f"素材预检不通过：{len(problems)} 个源文件损坏或缺失（{brief}{tail}）")
-        dprint(f"✅ 素材预检通过: {ok_n} 个源文件均可解码")
-        _flow(f"素材预检通过：{ok_n} 个源文件均可正常解码")
+        dprint(f"✅ 素材预检通过: {ok_n} 个源文件（缺失/损坏=0）")
+        _flow(f"素材预检通过：{ok_n} 个源文件通过校验")
 
     # 2. 确保在首页：--cold-start 时先判后拉（每部剧一次，避开"刚导完上一部"的
     #    窗口存在但未就绪状态）；否则按原逻辑连接/切回首页。

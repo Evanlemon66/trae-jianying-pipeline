@@ -234,13 +234,42 @@ def main(argv=None):
               f"台账 {item['ledger_size_bytes']} / 实际 {item['actual_size_bytes']}")
 
     existing = None
+    existing_broken = False
     if os.path.isfile(out):
         try:
             with open(out, encoding="utf-8-sig") as fp:
                 existing = json.load(fp)
         except Exception as e:
-            print(f"  [warn] 现有清单解析失败，将按 --force 语义处理: {e}")
+            print(f"  [warn] 现有清单解析失败: {e}")
             existing = None
+            existing_broken = True
+
+    def _existing_valid(data):
+        """与运行期 load_baseline 同口径：kind/schema/digest 任一不符即整份失效。"""
+        try:
+            ents = data.get("entries")
+            return (data.get("kind") == freshness.BASELINE_KIND
+                    and int(data.get("schema") or 0) == 1
+                    and isinstance(ents, list)
+                    and freshness.baseline_entries_digest(ents)
+                    == data.get("entries_digest"))
+        except Exception:
+            return False
+
+    if existing is not None and not _existing_valid(existing):
+        # 手改过清单 / 摘要不符：追加会把篡改后的条目重新签名成"合法"，
+        # 等于洗掉校验，必须拒绝。人工核对后用 --force 整份重算。
+        if not args.force:
+            print(f"\n拒绝写入：{out} 的 kind/schema/entries_digest 校验不通过。")
+            print("  请先人工核对清单内容；确认无误后再显式 --force 整份重算。")
+            return 5
+        existing = None
+    if existing_broken:
+        if not args.force:
+            print(f"\n拒绝写入：{out} 存在但无法解析。")
+            print("  请先人工修复；确认要丢弃旧内容时再显式 --force 整份重算。")
+            return 5
+        existing = None
 
     if existing and not args.append and not args.force:
         print(f"\n拒绝写入：{out} 已存在。请显式选择：")

@@ -299,7 +299,8 @@ rc = run(jd)
 check("b 版未导出 → 跳过返回 1", rc == 1, rc)
 check("b 版未导出 → stage 未变", read_job(jd)["stage"] == "video_ready", read_job(jd)["stage"])
 check("b 版未导出 → 目录原地", os.path.isdir(os.path.join(series, "cover_job")))
-rc = aj.archive(jd, ARCH, MF, force=True, roots=ROOTS)
+rc = aj.archive(jd, ARCH, MF, force=True, roots=ROOTS,
+                allow_stale_reason="测试：已人工核对（无 sidecar）")
 check("--force 可绕过未完成检查", rc == 0, rc)
 check("--force 后已移动", os.path.isdir(os.path.join(ARCH, "multiver", "cover_job")))
 
@@ -316,7 +317,8 @@ jm.update_job(jd2, {"workflow": {"preset_profile": "a,b"},
                         "b": {"state": "exported", "draft": "multiver2_b",
                               "export_dir": out_b_dir, "export_file": out_b}}}},
               event="test_seed", detail="seed 多版本已完成")
-rc = run(jd2)
+rc = aj.archive(jd2, ARCH, MF, roots=ROOTS,
+                allow_stale_reason="测试：已人工核对（无 sidecar）")
 check("声明版本全部完成 → 正常归档", rc == 0, rc)
 check("全部完成 → 已移动", os.path.isdir(os.path.join(ARCH, "multiver2", "cover_job")))
 

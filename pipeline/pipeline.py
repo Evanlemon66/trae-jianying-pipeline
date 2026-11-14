@@ -13,6 +13,7 @@ from draft_io import (  # noqa: E402
     ceil_to_frame_us as _ceil_to_frame_us,
     material_durations as _material_durations,
 )
+from restore_backups import prune_restore_backups  # noqa: E402  恢复备份源唯一白名单
 
 from jy_cover import set_draft_cover, set_cover_composition
 
@@ -206,6 +207,12 @@ def register_draft_in_root_meta(draft_name, draft_id, duration_us=0):
         return False
 
 
+def _draft_trash_dir():
+    """草稿回收区：放在剪映扫描根之外（同盘父目录），避免残留被当成同名卡片。"""
+    parent = os.path.dirname(str(DRAFT_ROOT).rstrip("\\/"))
+    return os.path.join(parent or str(DRAFT_ROOT), "_draft_trash")
+
+
 def _cleanup_removed_leftovers(draft_name, before_ts):
     """清理 <draft_name>.removed_<ts> 残留（只清本名 + 目标目录已存在 + 早于本次操作）。
 
@@ -239,33 +246,15 @@ def _cleanup_removed_leftovers(draft_name, before_ts):
 
 
 def cleanup_draft_temp_files(draft_dir):
-    """清理草稿目录里的临时/备份文件（template*.tmp、draft_content.json.bak 等）。
+    """清理草稿目录里会让剪映「恢复备份」复活旧稿的备份源。
 
-    这些文件是建稿保存与剪映打开过程中的中间产物；异常退出后残留会让剪映下次
-    打开时判定"上次未正常结束"并弹恢复提示。只清本目录顶层，不递归。
-    .locked 是剪映自己的锁文件，正常关闭时会自行删除 —— 这里不碰。
+    白名单唯一真源在 restore_backups：覆盖 *.tmp、.bak / .bak_<ts> /
+    .before_restore.bak、*bak_<ts>、_pipeline_backup.json 与 .backup/ 目录。
+    这些是建稿保存与剪映打开过程中的中间产物；异常退出后残留会让剪映下次打开时
+    判定"上次未正常结束"并弹恢复提示。只清本目录顶层，不递归 Resources/ 等正常
+    子目录；.locked 是剪映自己的锁文件，这里不碰。
     """
-    if not os.path.isdir(draft_dir):
-        return []
-    baks = ('draft_content.json.bak', 'draft_meta_info.json.bak')
-    removed = []
-    try:
-        names = os.listdir(draft_dir)
-    except OSError:
-        return []
-    for n in names:
-        low = n.lower()
-        if not (low.endswith('.tmp') or any(low.startswith(b) for b in baks)):
-            continue
-        p = os.path.join(draft_dir, n)
-        if not os.path.isfile(p):
-            continue
-        try:
-            os.remove(p)
-            removed.append(p)
-        except OSError:
-            continue
-    return removed
+    return prune_restore_backups(draft_dir)
 
 
 def publish_staged_draft(stage_dir, draft_name, duration_us=0):
@@ -285,7 +274,16 @@ def publish_staged_draft(stage_dir, draft_name, duration_us=0):
     _cleanup_removed_leftovers(draft_name, started_at)
     trash = None
     if os.path.exists(target):
-        trash = target + f".removed_{time.strftime('%Y%m%d_%H%M%S')}"
+        # R16：旧目录改名后若留在剪映扫描根内，失败/崩溃时残留的
+        # draft_meta_info.json 仍写着原名，首页会多出一张同名卡片。
+        # 移到扫描根之外的回收区（同盘），即使残留也不会被剪映渲染。
+        trash_root = _draft_trash_dir()
+        try:
+            os.makedirs(trash_root, exist_ok=True)
+        except OSError:
+            trash_root = os.path.dirname(target)  # 兜底：至少保证能改名
+        trash = os.path.join(
+            trash_root, draft_name + f".removed_{time.strftime('%Y%m%d_%H%M%S')}")
         os.rename(target, trash)
     if not os.path.isdir(os.path.dirname(target)):
         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -492,12 +490,7 @@ def create_empty_draft(draft_name, template_draft_name=None, register=True, stag
         shutil.copytree(dp_root, new_dir)
         jp_new = os.path.join(new_dir, "draft_content.json")
         save_draft(draft, jp_new)
-        for junk in os.listdir(new_dir):
-            if junk.startswith("draft_content.json.bak") or junk.endswith(".tmp"):
-                try:
-                    os.remove(os.path.join(new_dir, junk))
-                except OSError:
-                    pass
+        cleanup_draft_temp_files(new_dir)
 
         meta_path = os.path.join(new_dir, "draft_meta_info.json")
         if os.path.exists(meta_path):
@@ -539,12 +532,7 @@ def create_empty_draft(draft_name, template_draft_name=None, register=True, stag
         shutil.copytree(dp_root, new_dir)
         jp_new = os.path.join(new_dir, "draft_content.json")
         save_draft(draft, jp_new)
-        for bak in os.listdir(new_dir):
-            if bak.startswith("draft_content.json.bak") or bak.endswith(".tmp"):
-                try:
-                    os.remove(os.path.join(new_dir, bak))
-                except OSError:
-                    pass
+        cleanup_draft_temp_files(new_dir)
 
     draft = reset_draft_to_clean(draft)
     draft["id"] = gen_uuid()
@@ -3505,19 +3493,84 @@ def _media_key(path):
     return os.path.normcase(os.path.abspath(str(path)))
 
 
+def _refs_from_draft(draft):
+    """从草稿 JSON 收集音视频素材的本地路径（归一化）。"""
+    refs = set()
+    materials = draft.get("materials") or {}
+    for key in ("videos", "audios"):
+        for m in materials.get(key) or []:
+            if not isinstance(m, dict):
+                continue
+            p = m.get("path")
+            if not isinstance(p, str) or not p.strip():
+                continue
+            if p.startswith(("http://", "https://")):
+                continue
+            refs.add(_media_key(p))
+    return refs
+
+
+def _looks_like_draft_dir(draft_dir):
+    """目录是否是一份草稿（用于区分草稿根下的非草稿目录）。"""
+    if os.path.isdir(os.path.join(draft_dir, ".backup")):
+        return True
+    try:
+        names = os.listdir(draft_dir)
+    except OSError:
+        return False
+    for name in names:
+        low = name.lower()
+        if low in ("_pipeline_backup.json", "draft_meta_info.json", "draft_cover.jpg"):
+            return True
+        if low.startswith(("draft_content.json", "draft_meta_info.json")):
+            return True
+    return False
+
+
+def _refs_from_restore_backup(draft_dir):
+    """草稿内容缺失时从 _pipeline_backup.json 兜底恢复引用；不可用返回 None。
+
+    备份可能对应旧一版时间线，但只会扩大保护集合，用于清理判重是安全的。
+    """
+    backup = os.path.join(draft_dir, "_pipeline_backup.json")
+    if not os.path.isfile(backup):
+        return None
+    try:
+        with open(backup, encoding="utf-8") as f:
+            draft = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return _refs_from_draft(draft)
+
+
 def referenced_media_paths():
-    """扫描所有草稿，收集仍被 audio 材质引用的文件路径。
+    """扫描所有草稿，收集仍被音视频材质引用的文件路径。
 
     剪映草稿只记录素材绝对路径，不会复制音频进草稿；清理工作目录前必须先
     知道哪些文件仍被引用，否则草稿会变成指向不存在文件的空轨。
     任一草稿解析失败时返回 None（调用方必须放弃清理，不能用残缺的引用表删文件）。
+    草稿目录存在但 draft_content.json 缺失时绝不静默跳过（否则整份草稿的素材会被
+    判成未被引用）：先尝试从 _pipeline_backup.json 恢复引用，恢复不了返回 None。
     """
     refs = set()
     if not os.path.isdir(_JIANYING_DRAFT_ROOT):
         return refs
     for name in os.listdir(_JIANYING_DRAFT_ROOT):
-        jp = os.path.join(_JIANYING_DRAFT_ROOT, name, "draft_content.json")
+        draft_dir = os.path.join(_JIANYING_DRAFT_ROOT, name)
+        if not os.path.isdir(draft_dir):
+            continue
+        jp = os.path.join(draft_dir, "draft_content.json")
         if not os.path.isfile(jp):
+            if not _looks_like_draft_dir(draft_dir):
+                continue  # 非草稿目录（锁文件/回收站等），没有引用可言
+            from_backup = _refs_from_restore_backup(draft_dir)
+            if from_backup is None:
+                print(f"  ⚠ 草稿缺少 draft_content.json 且无可用备份，"
+                      f"无法确认引用关系: {name}")
+                return None
+            refs |= from_backup
+            print(f"  ⚠ 草稿缺少 draft_content.json，已从 _pipeline_backup.json "
+                  f"补全引用: {name}")
             continue
         try:
             with open(jp, encoding="utf-8") as f:
@@ -3525,10 +3578,7 @@ def referenced_media_paths():
         except (OSError, ValueError):
             print(f"  ⚠ 草稿读取失败，无法确认引用关系: {os.path.basename(name)}")
             return None
-        for m in (draft.get("materials") or {}).get("audios") or []:
-            p = m.get("path")
-            if p:
-                refs.add(_media_key(p))
+        refs |= _refs_from_draft(draft)
     return refs
 
 
