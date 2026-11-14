@@ -106,6 +106,10 @@ def test_archive_exits_when_lock_busy(tmp_path, monkeypatch):
     assert series.exists(), "拿不到锁时不得移动剧集目录"
     assert "全局导出锁被占用" in out
     assert jm.load_job(str(job_dir / "job.json"))["stage"] == "published"
+    # 锁被占用时日志不能出现"已完成"口径的 stage 变更，只能出现"拟"计划行
+    assert not any(ln.strip() == "stage → archived" for ln in out.splitlines()), \
+        "锁被占用时不得打印已完成态的 stage 变更"
+    assert any("拟 stage → archived" in ln for ln in out.splitlines())
     assert not released
 
 
@@ -118,11 +122,14 @@ def test_archive_releases_lock_after_move(tmp_path, monkeypatch):
     monkeypatch.setattr(aj.export_lock, "release", lambda: released.append(1))
     archive_root = tmp_path / "archive"
 
-    rc, _out = _run(aj.archive, str(job_dir), str(archive_root), str(tmp_path / "mf"),
-                    roots=[str(jobs_root)])
+    rc, out = _run(aj.archive, str(job_dir), str(archive_root), str(tmp_path / "mf"),
+                   roots=[str(jobs_root)])
 
     assert rc == 0
     assert not series.exists()
     assert (archive_root / "剧A" / "cover_job").is_dir()
     assert owners and owners[0].startswith("archive_job")
     assert released == [1]
+    # 取锁成功后才有真实变更行，且只出现一次
+    assert [ln.strip() for ln in out.splitlines()
+            if ln.strip() == "stage → archived"] == ["stage → archived"]

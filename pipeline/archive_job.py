@@ -431,7 +431,8 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
     print(f"  剧集目录: {series_dir}")
     print(f"  归档目标: {target}")
     if not archived:
-        print("  stage → archived")
+        # 取锁前只打印计划，不能用结果口径（锁可能拿不到，届时 stage 并未变）
+        print("  拟 stage → archived（取锁成功后才写入）")
     if dry_run:
         hits = _rewrite_manifests(manifest_dir, series_dir, target, dry_run=True)
         print(f"  manifest 待更新: {hits} 条")
@@ -454,6 +455,7 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
             except (ValueError, OSError) as e:
                 print(f"  [FAIL] 置 stage=archived 失败: {e}")
                 return 2
+            print("  stage → archived")
         os.makedirs(archive_root, exist_ok=True)
         # 归档 = 产物连同出身一起搬走：搬之前把各版本的新鲜度判定固化成快照，
         # 供归档后追溯（stale/evidence_missing 已在上面做过默认阻断与人工放行）。
