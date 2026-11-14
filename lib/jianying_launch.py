@@ -45,16 +45,26 @@ BREAKAWAY_FROM_JOB = 0x01000000
 # 慢机留 14 倍余量；检测窗未消失前一律不判 ready（见 ensure_jianying）。
 HOME_READY_TIMEOUT_S = 120.0
 
+# ── 启动失败分类（两类问题必须分开，不能共用一份处理动作）──────────────
+# 1) 启动即退（instant death）：进程起来后几秒内自己退出。实测签名 1.2–2.1s：
+#    有「环境检测」窗、主窗口 0 B、exit 0；属确定性崩溃，重拉必须换条件
+#    （清残留 + 间隔），不能原样重复。
+# 2) 软失败（soft）：进程活着但等不到窗口 / 窗口激活超时 / 进不了编辑页。
+INSTANT_DEATH_MAX_S = 10.0
 # 启动即死：拉起后 EARLY_DEATH_WINDOW_S 内进程消失 = 启动即死，立即重拉。
-# EARLY_DEATH_RETRIES 是整个运行周期的预算，不与导出层 attempt 退避叠加。
+# EARLY_DEATH_RETRIES 是**每次运行**的重试上限（不是无限重试）：
+#   0 次重试 = 一次就放弃；1 次 = 两次尝试；这里是 2 次 = 最多 3 次尝试。
+# 预算不与导出层 attempt 退避叠加，也不与崩溃框预算（CRASH_RETRIES）互相挤占。
 EARLY_DEATH_WINDOW_S = 20.0
-EARLY_DEATH_RETRIES = 1
-# 必须为 0：早退实例根本没进应用层（主日志 0 B、无窗口、无崩溃转储），
-# 没有需要释放的应用级资源，等待不会提高成功率。
-# 实测（2026-11-14，NAT_RETRY 六轮）：+0.2s 与 +2.0s 重试成功率均为 6/6，无差别；
-# 而重试预算只有 1 次，退避只会把"失败后可恢复"的时间整体推后。
-# 不要给这个值加退避/指数增长——它不是资源释放窗口，只是人为延迟。
-EARLY_DEATH_SETTLE_S = 0.0
+EARLY_DEATH_RETRIES = 2
+# 重拉间隔：固定值，不做指数退避。
+# 作用不是"等资源释放"（早退实例没进应用层），而是配合 clean_launch_residuals
+# 确保 VEDetector/CrashSender/crashpad 完全退出后再拉起，避免新实例立刻撞同一个
+# 检测器窗口。实测（2026-11-14，NAT_RETRY 六轮）+0.2s 与 +2.0s 成功率同为 6/6，
+# 取 2s 只是给进程表稳定留余量，不代表成功率依赖这段等待。
+EARLY_DEATH_SETTLE_S = 2.0
+# 清残留后等待进程表稳定的墙钟上限（clean_launch_residuals 内部再判一次）。
+RESIDUAL_CLEAN_WAIT_S = 5.0
 
 # restart() 的 kill 与新进程之间的静默间隔。
 # 原值 3.0 的依据是"旧进程可能还占着单实例互斥体"；B4 对照观测（2026-11-14，6 轮）
@@ -73,8 +83,18 @@ CRASH_SETTLE_S = 3.0
 # ready 后观察窗：窗口就绪 ≠ 稳定。07:10:23 那次实例 ready 后 8s 内进程消失，
 # 但 ensure_jianying 在 ready 分支直接 return，台账里完全没有这条形态。
 # ready 后 POST_READY_WATCH_S 内进程消失 → 判 died_after_ready，落台账并进重试。
-# 代价：每次成功拉起多等这段观察窗（默认 8s，可按调用方传 post_ready_watch_s=0 关闭）。
-POST_READY_WATCH_S = 8.0
+# 每次成功拉起都要付这段等待，故按实测收敛到 3s：ready 后立死的形态都在 1-2s 内
+# 暴露（11-14 观测），3s 足够覆盖，又不再白等 8s。
+POST_READY_WATCH_S = 3.0
+
+# 检测器停滞判死：主日志 0 字节 + 检测器（VeDetector）日志已写过但连续 5s 零增长
+# + 从未建窗 + 主进程存活 = 这条实例已走死路。
+# 依据（2026-11-15）：成功样本检测器日志最大行间隔 1.0s；失败 A1 的检测器日志
+# 停在 +6s（21,426 B / 137 行，末尾 GetNvSettingDetectorSwitch，随后 nvapi64
+# BEX64 崩溃），主进程却还要空等到 +32s 才退出。5s 阈值可在 +11s 判死重拉。
+# 额外要求「主日志 0 字节」：健康实例在检测器收尾后到建窗之间也有 ~7s 静默
+#（04:33:29 检测器日志停在 +15s，窗口 +21.8s 才出现），只靠"零增长"会误杀。
+DETECTOR_STALL_S = 5.0
 
 _PIPE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pipeline")
 if os.path.isfile(os.path.join(_PIPE_DIR, "export_config.py")) and _PIPE_DIR not in sys.path:
@@ -103,6 +123,14 @@ class LaunchOutcome:
     alive_s: float = 0.0
     ready_at_s: Optional[float] = None          # 首次判定就绪的时刻（相对本次拉起）
     post_ready_died_at_s: Optional[float] = None  # 就绪后存活了多久才消失（ready 后死）
+    exit_at: str = ''            # 判定进程消失的时刻（ISO，本次尝试的退出时刻）
+    death_kind: str = ''         # instant / early / late（进程退出类失败）/ no_window
+    # 主窗口首次出现的时刻（相对本次拉起，秒）；进程活着但一直是 None = 从未建窗
+    window_seen_at_s: Optional[float] = None
+    # 进程首次被判定存活的时刻（相对本次拉起，秒）；仅观测，不参与判定
+    process_seen_at_s: Optional[float] = None
+    # 本次尝试 spawn 的 epoch 秒（仅观测：把上面的相对时刻换算成绝对时刻）
+    spawn_epoch: Optional[float] = None
     how: str = ''                # createprocess / wmi / unknown（按实际父进程判）
     launched: bool = False
     app_log: Optional[str] = None
@@ -151,15 +179,39 @@ class LaunchBudget:
 
 # ── 基础工具 ────────────────────────────────────────────────────────
 
+# 最近若干次探针异常（排障用：超时到底是 UIA 阻塞还是线程环境问题）
+PROBE_ERRORS: list[str] = []
+
+
 def poll_with_timeout(fn: Callable[[], Any], timeout: float) -> tuple[bool, Any]:
-    """在 daemon 线程里执行一次探测，超时判失败（防 UIA 无限阻塞）。"""
+    """在 daemon 线程里执行一次探测，超时判失败（防 UIA 无限阻塞）。
+
+    线程入口做 STA 初始化：UIA 的 COM 对象只能在已初始化的套间里创建/调用，
+    未初始化线程会抛 OSError(-2147221008)，被吞掉后表现为"永远探不到"。
+    异常仍按原逻辑返回 False，但类型与消息记到 PROBE_ERRORS 便于回溯超时原因。
+    """
     result: dict[str, Any] = {}
 
     def _runner():
+        _t_com = time.time()
         try:
-            result["value"] = fn()
+            # COINIT_APARTMENTTHREADED = 0x2（UIA 要求 STA，不能用默认 MTA）
+            ctypes.windll.ole32.CoInitializeEx(None, 0x2)
         except Exception:
             pass
+        if os.environ.get('JY_PROBE_TRACE') == '1':
+            print(f"[probe-trace] com-init start={_t_com:.3f} "
+                  f"dur={time.time() - _t_com:.3f}s", flush=True)
+        try:
+            result["value"] = fn()
+        except Exception as e:
+            PROBE_ERRORS.append(f"{type(e).__name__}: {e}")
+            del PROBE_ERRORS[:-20]
+        finally:
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except Exception:
+                pass
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
@@ -505,22 +557,14 @@ def jianying_log_snapshot(started_epoch: float) -> tuple[Optional[str], Optional
         return os.path.basename(best), None
 
 
-def latest_detector_log(started_epoch: float, max_lines: int = 8,
-                        max_chars: int = 400) -> tuple[Optional[str], Optional[int], str]:
-    """取最近一次启动的检测器日志（按 mtime 取最新，不靠文件名猜）。
-
-    检测器日志文件名各版本不固定（vedetector*.log / *.log 等），因此不匹配文件名，
-    而是取剪映日志目录下「启动时刻之后写过的、非主日志（JianyingPro_*）」中 mtime 最新
-    的那份；找不到时返回 (None, None, '')，不影响主流程。
-
-    返回 (文件名, 字节数, 尾部若干行文本)。
-    """
+def _latest_detector_path(started_epoch: float) -> Optional[str]:
+    """剪映日志目录下「本次启动之后写过」的最新非主日志路径（拿不到返回 None）。"""
     try:
         names = [n for n in os.listdir(_JY_LOG_DIR)
                  if n.lower().endswith('.log')
                  and not n.startswith('JianyingPro_')]   # 排除主日志
     except OSError:
-        return None, None, ''
+        return None
     best, best_mtime = None, 0.0
     for n in names:
         p = os.path.join(_JY_LOG_DIR, n)
@@ -532,6 +576,31 @@ def latest_detector_log(started_epoch: float, max_lines: int = 8,
             continue
         if m > best_mtime:
             best, best_mtime = p, m
+    return best
+
+
+def latest_detector_log_stat(started_epoch: float) -> tuple[Optional[str], Optional[int]]:
+    """检测器日志的轻量状态：(文件名, 字节数)。只 stat，不读内容。"""
+    p = _latest_detector_path(started_epoch)
+    if not p:
+        return None, None
+    try:
+        return os.path.basename(p), os.path.getsize(p)
+    except OSError:
+        return os.path.basename(p), None
+
+
+def latest_detector_log(started_epoch: float, max_lines: int = 8,
+                        max_chars: int = 400) -> tuple[Optional[str], Optional[int], str]:
+    """取最近一次启动的检测器日志（按 mtime 取最新，不靠文件名猜）。
+
+    检测器日志文件名各版本不固定（vedetector*.log / *.log 等），因此不匹配文件名，
+    而是取剪映日志目录下「启动时刻之后写过的、非主日志（JianyingPro_*）」中 mtime 最新
+    的那份；找不到时返回 (None, None, '')，不影响主流程。
+
+    返回 (文件名, 字节数, 尾部若干行文本)。
+    """
+    best = _latest_detector_path(started_epoch)
     if not best:
         return None, None, ''
     try:
@@ -693,6 +762,38 @@ def _fill_log_stats(outcome: LaunchOutcome, started: float) -> None:
 
 # ── 共享启动入口 ────────────────────────────────────────────────────
 
+def classify_death(alive_s: float) -> str:
+    """进程退出类失败分类：instant（启动即退）/ early（早死）/ late（晚死）。"""
+    if alive_s <= INSTANT_DEATH_MAX_S:
+        return 'instant'
+    if alive_s <= EARLY_DEATH_WINDOW_S:
+        return 'early'
+    return 'late'
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec='seconds')
+
+
+def cleanup_residuals(log_fn: Optional[Callable[[str], None]] = None) -> list[str]:
+    """重拉前清残留（委托 lib/jianying_proc.clean_launch_residuals，kill 仍走唯一入口）。
+
+    清理 JianyingPro / VEDetector / CrashSender 与剪映自己的 crashpad_handler；
+    失败不影响重拉，只记一行日志。
+    """
+    log = log_fn or (lambda _m: None)
+    try:
+        import jianying_proc as jp
+    except Exception as e:  # pragma: no cover - 仅在 sys.path 异常时命中
+        log(f'  [cleanup] 跳过（无法加载 jianying_proc: {e}）')
+        return []
+    try:
+        return jp.clean_launch_residuals(wait_s=RESIDUAL_CLEAN_WAIT_S, log_fn=log)
+    except Exception as e:  # pragma: no cover
+        log(f'  [cleanup] 失败（不影响重拉）: {e}')
+        return []
+
+
 def _validate_exe(exe_path: str, required: str, require_exists: bool,
                   validate_version: bool,
                   log_fn: Optional[Callable[[str], None]] = None) -> None:
@@ -742,10 +843,23 @@ def _record_launch(outcome: LaunchOutcome, *, launch_id: str, entry: str,
         'retry_count': max(0, outcome.attempt - 1),
         'result': ('ready' if outcome.outcome == 'ready'
                    else 'timeout' if outcome.outcome == 'timeout'
+                   else 'window_not_created' if outcome.outcome == 'window_not_created'
                    else 'died_after_ready' if outcome.outcome == 'died_after_ready'
                    else 'died'),
         'died_at_s': round(outcome.alive_s, 3) if died else None,
         'alive_s': round(outcome.alive_s, 3),
+        # 窗口首次出现的时刻（相对拉起）；null = 本次尝试进程活着但从未建窗
+        'window_seen_at_s': (round(outcome.window_seen_at_s, 3)
+                             if outcome.window_seen_at_s is not None else None),
+        'process_seen_at_s': (round(outcome.process_seen_at_s, 3)
+                              if outcome.process_seen_at_s is not None else None),
+        # spawn 的 epoch 秒：把「相对拉起」的观测时刻换算成绝对时刻（仅观测）
+        'spawn_epoch': (round(outcome.spawn_epoch, 3)
+                        if outcome.spawn_epoch is not None else None),
+        # 秒退单独留痕：存活时长 + 退出时刻 + 类型（instant/early/late/crash/post_ready）
+        'exit_at': outcome.exit_at or None,
+        'death_kind': outcome.death_kind or None,
+        'instant_death': outcome.death_kind == 'instant',
         # ready 后死单独留痕：alive_s 不能用早退口径（died_at_s ≤ 3s）去解释它。
         'ready_at_s': (round(outcome.ready_at_s, 3)
                        if outcome.ready_at_s is not None else None),
@@ -782,6 +896,44 @@ def _post_ready_watch(alive: Callable[[], bool], ready_at: float, window: float,
         sleep_fn(min(step, remaining))
 
 
+def _stop_stalled_instance(log: Callable[[str], None],
+                           grace_s: float = 1.5) -> bool:
+    """关掉已判死路的实例：先 WM_CLOSE 给 grace_s 自然退出的机会，不退再按进程树强杀。
+
+    死路实例通常没有可响应 WM_CLOSE 的窗口（主日志 0 字节、从未建窗），所以强杀
+    兜底必须有；这里不走 stop_jianying 的 15s 收尾等待——那会把刚省下的 20s 等回去。
+    """
+    try:
+        import jianying_proc as jp
+    except Exception:
+        return False
+    try:
+        if not jp.running():
+            return True
+        n = jp._post_wm_close()
+        if n:
+            log(f"  [detector-stall] 已发 WM_CLOSE（{n} 个窗口），等 {grace_s:g}s 自然退出")
+        _t = time.time()
+        while time.time() - _t < grace_s:
+            if not jp.running():
+                log("  [detector-stall] 已优雅退出")
+                return True
+            time.sleep(0.2)
+        log("  [detector-stall] 未自然退出 → 结束进程树")
+        jp._taskkill(force=True)
+        _t = time.time()
+        while time.time() - _t < 10.0:
+            if not jp.running():
+                return True
+            time.sleep(0.2)
+    except Exception as e:  # noqa: BLE001
+        log(f"  [detector-stall] 关闭失败（仅告警）：{type(e).__name__}: {e}")
+    try:
+        return not jp.running()
+    except Exception:
+        return False
+
+
 def ensure_jianying(
     exe_path: Optional[str] = None,
     *,
@@ -795,6 +947,8 @@ def ensure_jianying(
     ready_fn: Optional[Callable[[], Any]] = None,
     alive_fn: Optional[Callable[[], bool]] = None,
     spawn_fn: Optional[Callable[[str], Any]] = None,
+    cleanup_fn: Optional[Callable[[Optional[Callable[[str], None]]], list]] = None,
+    window_seen_fn: Optional[Callable[[], bool]] = None,
     time_fn: Callable[[], float] = time.time,
     sleep_fn: Callable[[float], None] = time.sleep,
     poll_interval: float = 1.0,
@@ -802,6 +956,8 @@ def ensure_jianying(
     early_death_window: float = EARLY_DEATH_WINDOW_S,
     settle_s: float = EARLY_DEATH_SETTLE_S,
     post_ready_watch_s: float = POST_READY_WATCH_S,
+    detect_detector_stall: bool = True,
+    detector_stall_s: float = DETECTOR_STALL_S,
     entry: str = 'unknown',
     log_fn: Optional[Callable[[str], None]] = None,
     tick_fn: Optional[Callable[[float, int], None]] = None,
@@ -831,8 +987,35 @@ def ensure_jianying(
         if readiness != 'home':
             raise JianyingLaunchError(f'未知就绪口径: {readiness}（缺 ready_fn）')
         ready_fn = _default_home_ready
+    # 窗口是否出现过：只用于区分「进程活着但没建窗」与「窗口在但页面没渲染好」，
+    # 不参与就绪判定、不改变重试行为（超时仍按原逻辑收尾）。
+    window_seen = window_seen_fn or _default_window_seen
+    stall_stat = latest_detector_log_stat if detect_detector_stall else None
 
     deadline = time_fn() + max(0.0, float(timeout))
+
+    def _mark_window_seen() -> None:
+        """就绪判定间隙补记「主窗口已建出」时刻（只观测，不影响判定）。
+
+        轮询里第一次探测就可能阻塞到 ready（首探 ~22s），原实现在循环顶部检查，
+        成功分支直接 break 会漏记；这里在每次探测返回后也补一次，口径与判页层同源
+        （Win32 枚举到该 pid 的可见顶层窗口即算）。
+        """
+        if outcome.window_seen_at_s is not None:
+            return
+        try:
+            _ws = window_seen
+            try:
+                _seen = bool(_ws(pid))
+            except TypeError:
+                _seen = bool(_ws())
+            if _seen:
+                outcome.window_seen_at_s = time_fn() - started
+                log(f"[window-seen] attempt={attempt} pid={pid} "
+                    f"at=+{outcome.window_seen_at_s:.1f}s")
+        except Exception:
+            pass
+
     attempt = 1
     while True:
         started = time_fn()
@@ -848,10 +1031,25 @@ def ensure_jianying(
         how = detect_launch_how(pid, spawn_hint, log)
         log(f'  launch-how: {how} pid={pid or "-"}')
         outcome = LaunchOutcome(exe=exe, pid=pid, attempt=attempt, how=how,
-                                launched=True, outcome='timeout')
+                                launched=True, outcome='timeout',
+                                spawn_epoch=started)
         env_first = None          # 本次尝试内检测窗首次出现时刻
+        det_size = None           # 本次尝试内检测器日志观测到的字节数
+        det_since = None          # 该字节数最后一次变化的时刻（停滞起点）
+        det_name = None
         crashed = False           # 本次失败是否来自崩溃框（走独立预算）
         while True:
+            # 0) 记下进程出现 / 主窗口首次出现的时刻（仅观测，不参与判定）
+            if outcome.process_seen_at_s is None:
+                try:
+                    if alive():
+                        outcome.process_seen_at_s = time_fn() - started
+                        log(f"[process-seen] attempt={attempt} pid={pid} "
+                            f"at=+{outcome.process_seen_at_s:.1f}s")
+                except Exception:
+                    pass
+            if outcome.window_seen_at_s is None:
+                _mark_window_seen()
             # 1) 崩溃框优先：记录（标题/正文/pid/时刻）→ WM_CLOSE → 按启动即死走重试
             crash = crash_dialogs()
             if crash:
@@ -866,6 +1064,8 @@ def ensure_jianying(
                         f"closed={dismiss_window(c['hwnd'])}")
                 outcome.alive_s = time_fn() - started
                 outcome.outcome = 'died'
+                outcome.exit_at = outcome.crash_at
+                outcome.death_kind = 'crash'
                 crashed = True
                 outcome.error = (f'环境检测崩溃框（{c0["title"]}，pid={c0["pid"]}），'
                                  f'已关闭并按崩溃重试')
@@ -888,6 +1088,9 @@ def ensure_jianying(
                     log(f"[env-check] 消失 at=+{time_fn() - started:.1f}s "
                         f"用时 {outcome.env_check_span:.1f}s")
                 ok, val = poll_with_timeout(ready_fn, probe_timeout)
+                # 探测返回后补记窗口时刻：首探可能阻塞到 ready，避免成功分支漏记
+                if outcome.window_seen_at_s is None:
+                    _mark_window_seen()
 
             if ok and val:
                 ready_at = time_fn()
@@ -904,6 +1107,8 @@ def ensure_jianying(
                     outcome.outcome = 'died_after_ready'
                     outcome.post_ready_died_at_s = watched
                     outcome.alive_s = time_fn() - started
+                    outcome.exit_at = _now_iso()
+                    outcome.death_kind = 'post_ready'
                     if env_first is not None and not outcome.env_check_span:
                         outcome.env_check_span = time_fn() - env_first
                     break
@@ -924,24 +1129,70 @@ def ensure_jianying(
                 return outcome
             elapsed = time_fn() - started
             if time_fn() >= deadline:
-                outcome.outcome = 'timeout'
+                # 进程活着但全程没建出任何窗口：这是独立一类失败（window_not_created），
+                # 与「窗口在但页面没渲染好」（timeout）分开报，便于判断是不是卡在启动前期。
+                if outcome.window_seen_at_s is None:
+                    outcome.outcome = 'window_not_created'
+                    outcome.death_kind = 'no_window'
+                else:
+                    outcome.outcome = 'timeout'
                 outcome.alive_s = elapsed
-                outcome.error = f'启动后 {timeout:g}s 内未达到就绪（{readiness}）'
+                outcome.error = (
+                    f'进程存活 {elapsed:.1f}s 但从未创建任何剪映窗口（window_not_created）'
+                    if outcome.outcome == 'window_not_created'
+                    else f'启动后 {timeout:g}s 内未达到就绪（{readiness}）')
                 if env_first is not None and not outcome.env_check_span:
                     outcome.env_check_span = time_fn() - env_first
                 _fill_log_stats(outcome, started)
-                log(f"[startup-timeout] attempt={attempt} pid={pid} how={outcome.how} "
+                tag = ('startup-window-not-created'
+                       if outcome.outcome == 'window_not_created' else 'startup-timeout')
+                log(f"[{tag}] attempt={attempt} pid={pid} how={outcome.how} "
                     f"alive_s={outcome.alive_s:.1f} "
+                    f"window_seen_at={'-' if outcome.window_seen_at_s is None else f'+{outcome.window_seen_at_s:.1f}s'} "
                     f"env_check={1 if outcome.env_check_seen else 0} "
-                    f"env_span={outcome.env_check_span:.1f}s")
+                    f"env_span={outcome.env_check_span:.1f}s "
+                    f"gpu_probes={outcome.app_gpu_probes} "
+                    f"notfind={outcome.app_not_find_device}")
                 _record_launch(outcome, launch_id=launch_id, entry=entry,
                                readiness=readiness, started_iso=started_iso)
                 return outcome
             if not alive():
                 outcome.alive_s = elapsed
+                outcome.exit_at = _now_iso()
                 outcome.outcome = ('died' if elapsed <= early_death_window
                                    else 'died_late')
+                outcome.death_kind = classify_death(elapsed)
                 break
+
+            # 3) 检测器停滞判死：检测器日志已写过、连续 DETECTOR_STALL_S 零增长、
+            #    从未建窗、主进程存活、且主日志 0 字节（应用层毫无进展）→ 死路。
+            #    正常实例在检测器收尾后也会静默 ~7s，但那时主日志已有内容，不会命中。
+            if stall_stat is not None and outcome.window_seen_at_s is None:
+                _dn, _ds = stall_stat(started)
+                _now = time_fn()
+                if _ds:
+                    if _ds != det_size:
+                        det_size, det_since, det_name = _ds, _now, _dn
+                    elif det_since is not None and (_now - det_since) >= detector_stall_s:
+                        _app_bytes = jianying_log_snapshot(started)[1]
+                        if not _app_bytes:
+                            _stall_s = _now - det_since
+                            log(f"[detector-stalled] attempt={attempt} pid={pid} "
+                                f"at=+{_now - started:.1f}s detector_log={det_name} "
+                                f"bytes={det_size} 零增长={_stall_s:.1f}s "
+                                f"app_log_bytes={_app_bytes if _app_bytes is not None else 0} "
+                                f"window_seen=- → 判死重拉")
+                            outcome.alive_s = _now - started
+                            outcome.outcome = 'died'
+                            outcome.death_kind = 'detector_stalled'
+                            outcome.detector_log = det_name
+                            outcome.detector_log_bytes = det_size
+                            outcome.error = (f'检测器日志 {det_size}B 连续 {_stall_s:.0f}s '
+                                             f'零增长、主日志 0 字节且从未建窗'
+                                             f'（detector_stalled）')
+                            _stop_stalled_instance(log)
+                            outcome.exit_at = _now_iso()
+                            break
             if tick_fn:
                 tick_fn(elapsed, attempt)
             sleep_fn(poll_interval)
@@ -949,7 +1200,11 @@ def ensure_jianying(
         if crashed:
             retry = budget.take_crash()
         else:
-            retry = outcome.outcome in ('died', 'died_after_ready') and budget.take()
+            # 重拉口径：退出时"还没建出过任何窗口"→ 无论存活多久都可重拉
+            # （这类死亡是启动链没走完，与窗口建立后崩掉是两回事）；
+            # 已建出窗口后再死，沿用原口径（≤EARLY_DEATH_WINDOW_S 的 died / ready 后死）。
+            no_window = outcome.window_seen_at_s is None
+            retry = (no_window or outcome.outcome in ('died', 'died_after_ready')) and budget.take()
         outcome.crash_retry = bool(crashed and retry)
         if env_first is not None and not outcome.env_check_span:
             outcome.env_check_span = time_fn() - env_first
@@ -967,8 +1222,11 @@ def ensure_jianying(
                 f"retry={1 if retry else 0}")
         else:
             log(f"[startup-died] attempt={attempt} pid={pid} how={outcome.how} "
-                f"started={started_iso} "
-                f"alive_s={outcome.alive_s:.1f} app_log={outcome.app_log or '-'} "
+                f"started={started_iso} exit_at={outcome.exit_at or '-'} "
+                f"kind={outcome.death_kind or 'died'} "
+                f"alive_s={outcome.alive_s:.1f} "
+                f"window_seen_at={'-' if outcome.window_seen_at_s is None else f'+{outcome.window_seen_at_s:.1f}s'} "
+                f"app_log={outcome.app_log or '-'} "
                 f"app_log_bytes={'-' if outcome.app_log_bytes is None else outcome.app_log_bytes} "
                 f"detector_log={outcome.detector_log or '-'} "
                 f"detector_log_bytes={'-' if outcome.detector_log_bytes is None else outcome.detector_log_bytes} "
@@ -984,13 +1242,39 @@ def ensure_jianying(
                 outcome.error = (f'就绪后 {outcome.post_ready_died_at_s:.0f}s 剪映进程退出'
                                  f'（ready 后死，不计入启动即死口径）')
             else:
-                outcome.error = (f'启动后 {outcome.alive_s:.0f}s 剪映进程退出'
-                                 f'（{"启动即死" if outcome.outcome == "died" else "晚死"}）')
+                why = '启动即退' if outcome.death_kind == 'instant' else '晚死'
+                if outcome.window_seen_at_s is None:
+                    why += '，退出时从未建出窗口'
+                outcome.error = (f'启动后 {outcome.alive_s:.1f}s 剪映进程退出'
+                                 f'（{why}）')
+        if not retry and outcome.outcome != 'ready':
+            # 预算耗尽：把"这台机器现在起不来"讲清楚（尝试次数 / 最后退出时刻 / 失败类型），
+            # 上层据此直接报错，不再无限重试。
+            outcome.error = (f'[launch_exhausted:{outcome.death_kind or outcome.outcome}] '
+                             f'共尝试 {outcome.attempt} 次仍未就绪；最后一次退出时刻 '
+                             f'{outcome.exit_at or "-"}，失败类型 {outcome.death_kind or outcome.outcome}。'
+                             f'{outcome.error}')
+            log(f"[startup-exhausted] attempts={outcome.attempt} "
+                f"last_exit_at={outcome.exit_at or '-'} "
+                f"kind={outcome.death_kind or outcome.outcome} "
+                f"error={outcome.error}")
         _record_launch(outcome, launch_id=launch_id, entry=entry,
                        readiness=readiness, started_iso=started_iso)
         if not retry:
             return outcome
-        # 崩溃重拉固定静置，避免新实例立刻再撞同一个 nvapi 崩溃；早死路径仍为 0。
+        # 重拉前先清残留（VEDetector / CrashSender / crashpad / 残留剪映），再按固定间隔拉起：
+        # 秒退是确定性崩溃，原样重复同样的动作解决不了。
+        log(f"[startup-retry] attempt={attempt}→{attempt + 1} "
+            f"kind={outcome.death_kind or outcome.outcome} "
+            f"alive_s={outcome.alive_s:.1f} "
+            f"window_seen_at={'-' if outcome.window_seen_at_s is None else f'+{outcome.window_seen_at_s:.1f}s'} "
+            f"exit_at={outcome.exit_at or '-'} "
+            f"→ 清理残留后重拉")
+        if cleanup_fn is None:
+            cleanup_residuals(log)
+        else:
+            cleanup_fn(log)
+        # 崩溃重拉固定静置，避免新实例立刻再撞同一个 nvapi 崩溃；早死路径用显式间隔。
         sleep_fn(max(settle_s, CRASH_SETTLE_S) if crashed else settle_s)
         attempt += 1
 
@@ -1005,6 +1289,33 @@ def _default_home_ready() -> bool:
         return "HomePage" in (w.ClassName or "")
     except Exception:
         return False
+
+
+def _default_window_seen(pid: Optional[int] = None) -> bool:
+    """窗口出现判定：Win32 枚举到该 pid 的可见顶层窗口即算（不看标题/类名）。
+
+    与判页层同源（都以 Win32 枚举 hwnd 为准）。原实现要求标题已含「剪映」，
+    建窗初期标题还没就绪时会漏检，把「建过窗口后早死」错归成「未建窗」。
+    """
+    try:
+        import jy_page_detect as jpd
+        wins = jpd.enum_top_windows()
+    except Exception:
+        return False
+    if not wins:
+        return False
+    if pid:
+        return any(window_pid(h) == pid for h, _c, _t in wins)
+    # 没有 pid（个别 spawn 实现不回传）：回退到「当前所有剪映主进程的窗口」
+    try:
+        import psutil
+        pids = {p.pid for p in psutil.process_iter(['name'])
+                if (p.info.get('name') or '').lower() == os.path.basename(EXE_NAME).lower()}
+    except Exception:
+        pids = set()
+    if pids:
+        return any(window_pid(h) in pids for h, _c, _t in wins)
+    return any('剪映' in (t or '') for _h, _c, t in wins)
 
 
 # ── 收尾策略 ────────────────────────────────────────────────────────

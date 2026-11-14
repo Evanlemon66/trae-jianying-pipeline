@@ -138,16 +138,20 @@ def artifact_paths_of(mp4_path: str, draft_name: str | None = None) -> dict[str,
 
 def missing_artifacts(draft_name: str | None = None, *, strict_progress: bool = False,
                       mp4_path: str | None = None,
-                      progress_path: str | None = None) -> list[str]:
+                      progress_path: str | None = None,
+                      require_cover: bool = True) -> list[str]:
     """守卫 4：成品三件套缺失项（mp4 / -封面.jpg / progress）。
 
     strict_progress=True 只认成品目录内那份（mp4.progress.json）：导出成功收尾一定
     会写它并删侧写，用于"导出后判成败"；冲突巡检放宽到侧写，避免历史成品误报。
     progress_path：显式指定正片进度文件（直调无 --move 时它落在 output_path 旁）。
+    require_cover=False：调用方声明本次无 cover_job（如准入），封面不在校验范围；
+                         **mp4 / progress 仍照常校验**，不因封面豁免而放松。
     """
     paths = artifact_paths_of(mp4_path, draft_name) if mp4_path else artifact_paths(draft_name or "")
     mp4 = paths["mp4"]
-    missing = [k for k in ("mp4", "封面") if not os.path.isfile(paths[k])]
+    required = ("mp4", "封面") if require_cover else ("mp4",)
+    missing = [k for k in required if not os.path.isfile(paths[k])]
     out_dir = os.path.dirname(mp4)
     side = os.path.join(os.path.dirname(out_dir), os.path.basename(out_dir) + ".progress.json")
     progress_ok = os.path.isfile(progress_path or paths["progress"]) or (
@@ -247,6 +251,7 @@ def gate_after_export(draft_name: str, mp4_path: str, *, job_dir: str | None = N
                       started_at: float | None = None, verify: bool = True,
                       verify_script: str | None = None, creationflags: int = 0,
                       ctx: str = "", progress_path: str | None = None,
+                      require_cover: bool = True,
                       log: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
     """导出子进程返回成功后，按 三件套 → 质检 → 收尾证据 顺序判定成败。
 
@@ -262,8 +267,12 @@ def gate_after_export(draft_name: str, mp4_path: str, *, job_dir: str | None = N
       verify_log    质检明细路径（未跑质检时为 None）
     """
     log = log or (lambda _m: None)
+    if not require_cover:
+        paths = artifact_paths_of(mp4_path, draft_name)
+        if not os.path.isfile(paths["封面"]):
+            log(f"无 cover_job：封面缺省 {paths['封面']}（仅记录，不判失败）")
     missing = missing_artifacts(draft_name, mp4_path=mp4_path, strict_progress=True,
-                                progress_path=progress_path)
+                                progress_path=progress_path, require_cover=require_cover)
     if missing:
         brief = f"导出返回成功但产物不全：缺 {', '.join(missing)}（{mp4_path}）"
         return {"ok": False, "stage": "artifacts", "failure_class": "artifacts_incomplete",

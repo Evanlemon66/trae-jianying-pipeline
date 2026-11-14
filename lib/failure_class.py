@@ -29,6 +29,7 @@ from typing import Optional
 # ── 类别 ─────────────────────────────────────────────────────────
 UI_HANG = "ui_hang"              # 窗口存在但无响应 / 就绪或打开草稿超时
 WINDOW_MISSING = "window_missing"  # 未找到剪映窗口（含拉起后窗口始终没出现）
+WINDOW_NOT_CREATED = "window_not_created"  # 进程活着但从未建出任何窗口（启动期卡住）
 WINDOW_ACTIVATE_TIMEOUT = "window_activate_timeout"  # 找到窗口但激活失败（不可交互）
 LAUNCH_FAILED = "launch_failed"  # 拉起剪映失败（早退重试后仍 died / 启动超时）
 ASSET_MISSING = "asset_missing"  # 草稿或素材不存在/损坏
@@ -41,8 +42,8 @@ TRACK_RESTORE_FAILED = "track_restore_failed"  # 轨道恢复失败（轨道在�
 VERSION_UNSUPPORTED = "version_unsupported"  # 剪映版本不在支持范围（预检拒绝）
 UNKNOWN = "unknown"
 
-CATEGORIES = (UI_HANG, WINDOW_MISSING, WINDOW_ACTIVATE_TIMEOUT, LAUNCH_FAILED,
-              ASSET_MISSING, DISK_FULL, EXPORT_TIMEOUT, VERSION_DIALOG,
+CATEGORIES = (UI_HANG, WINDOW_MISSING, WINDOW_NOT_CREATED, WINDOW_ACTIVATE_TIMEOUT,
+              LAUNCH_FAILED, ASSET_MISSING, DISK_FULL, EXPORT_TIMEOUT, VERSION_DIALOG,
               ARTIFACTS_INCOMPLETE, VERIFY_FAILED, TRACK_RESTORE_FAILED,
               VERSION_UNSUPPORTED, UNKNOWN)
 
@@ -65,6 +66,9 @@ STRATEGY = {
     UI_HANG:        {"retryable": True,  "action": RESTART,       "counts": True},
     # 窗口没出现 ≠ UI 假死：重启一次通常能带回窗口；日志里能与 ui_hang 一眼区分。
     WINDOW_MISSING: {"retryable": True,  "action": RESTART,       "counts": True},
+    # 进程活着但从未建窗（启动期卡在 GPU 枚举/环境检测等）：独立一类，不并入 launch_failed；
+    # 处理动作与「窗口没出现」一致（重启），只是日志里能一眼看出它根本没进到建窗阶段。
+    WINDOW_NOT_CREATED: {"retryable": True, "action": RESTART,    "counts": True},
     # 找到窗口但激活超时 = 窗口在却不可交互（常是假死）：杀进程重建，别在旧实例上重试。
     WINDOW_ACTIVATE_TIMEOUT: {"retryable": True, "action": KILL_RETRY, "counts": True},
     # 拉起失败：本轮不追加同轮重试（EARLY_DEATH_RETRIES=1 不动），交给 cover_watch
@@ -112,6 +116,9 @@ def classify(error: Optional[str], phase: Optional[str] = None) -> tuple[str, st
         return WINDOW_ACTIVATE_TIMEOUT, STRATEGY[WINDOW_ACTIVATE_TIMEOUT]["action"]
     if "[window_missing]" in e:
         return WINDOW_MISSING, STRATEGY[WINDOW_MISSING]["action"]
+    # 进程活着但从未建窗：标记形如 [window_not_created alive=… pid=…]，故不能带闭合括号
+    if "[window_not_created" in e:
+        return WINDOW_NOT_CREATED, STRATEGY[WINDOW_NOT_CREATED]["action"]
 
     # 0.5 剪映版本不在支持范围（预检拒绝）：重试无意义，直接终态并提示支持版本。
     #     必须先于「未找到 / 超时」等宽泛关键词，否则会被误判成可重试的 ui_hang。
@@ -124,6 +131,13 @@ def classify(error: Optional[str], phase: Optional[str] = None) -> tuple[str, st
     if _has(e, "恢复轨道失败", "可视区外", "无法判定是锁定还是不可见",
             "轨道锁定或隐藏"):
         return TRACK_RESTORE_FAILED, STRATEGY[TRACK_RESTORE_FAILED]["action"]
+
+    # 0.7 导出后门禁（子进程 rc=3 回传的 brief）：先判质检，再判产物不全。
+    #     两者都必须早于「文件不存在 / 超时」等宽泛规则，否则会被 asset_missing 抢走。
+    if _has(e, "verify rc=", "质检未通过"):
+        return VERIFY_FAILED, STRATEGY[VERIFY_FAILED]["action"]
+    if _has(e, "产物不全", "缺产物证据", "导出后校验未通过"):
+        return ARTIFACTS_INCOMPLETE, STRATEGY[ARTIFACTS_INCOMPLETE]["action"]
 
     # 1. 磁盘不足：不可重试，拒绝启动
     if _has(e, "磁盘空间不足", "磁盘不足", "空间不足", "no space", "ENOSPC"):

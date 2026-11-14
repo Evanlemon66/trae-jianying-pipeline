@@ -43,6 +43,7 @@ _EXAMPLES_DIR = os.path.normpath(os.path.join(
 if _EXAMPLES_DIR not in sys.path:
     sys.path.insert(0, _EXAMPLES_DIR)
 import jy_instance  # noqa: E402
+import jy_page_detect as jpd  # noqa: E402 （窗口枚举/判页/激活的唯一实现）
 
 PROPERTY_ID_FULLDESC = 30159   # LegacyIAccessible.Description（剪映语义标记都在这）
 
@@ -651,7 +652,8 @@ def _resolve_prop(ctrl, prop_id):
 
 
 def _ctrl_desc(ctrl):
-    return (_resolve_prop(ctrl, PROPERTY_ID_FULLDESC) or "").lower()
+    """Description 小写口径（唯一实现在 jy_page_detect.ctrl_desc）。"""
+    return jpd.ctrl_desc(ctrl)
 
 
 def _ctrl_name(ctrl):
@@ -677,54 +679,16 @@ def _ctrl_rect(ctrl):
 
 
 # ================= 窗口连接 =================
-# Win32 原生查找（不走 UIA COM 树）：UIA 枚举在本机会被卡住 2min+（编辑页加载/僵尸窗口），
-# 而窗口"是否出现"用 EnumWindows 毫秒级即可判定——命中后按句柄直绑 UIA 控件，绕开枚举卡顿。
+# 窗口枚举 / 类名匹配 / 判页 统一在 lib/jy_page_detect.py（启动链与业务链共用一份）。
+# 本模块保留同名函数作为薄封装，既有调用方与测试不用改。
 def _enum_top_windows():
-    """EnumWindows 枚举可见顶层窗口 → [(hwnd, class_name, title)]。纯 Win32，毫秒级。"""
-    import ctypes
-    from ctypes import wintypes
-    out = []
-    user32 = ctypes.windll.user32
-    _Proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    buf = ctypes.create_unicode_buffer(512)
-    # 64 位句柄截断防御：不设 argtypes 时 hwnd 默认按 32 位 c_int 传
-    user32.EnumWindows.argtypes = [_Proc, wintypes.LPARAM]
-    user32.IsWindowVisible.argtypes = [wintypes.HWND]
-    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-
-    def _cb(hwnd, _lp):
-        try:
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            buf.value = ''
-            user32.GetClassNameW(hwnd, buf, 512)
-            cls = buf.value or ''
-            buf.value = ''
-            user32.GetWindowTextW(hwnd, buf, 512)
-            out.append((int(hwnd), cls, buf.value or ''))
-        except Exception:
-            pass
-        return True
-
-    try:
-        user32.EnumWindows(_Proc(_cb), 0)
-    except Exception:
-        pass
-    return out
+    """EnumWindows 枚举可见顶层窗口 → [(hwnd, class_name, title)]（实现在 jpd）。"""
+    return jpd.enum_top_windows()
 
 
 def _good_class_native(cls):
-    c = (cls or '').lower()
-    if c.startswith('homepage_qmltype') or c.startswith('mainwindow_qmltype'):
-        return True
-    if c.startswith('jianying'):
-        return True
-    # 实测（2026-10）：冷启动后剪映主窗口类名是 Qt622QWindowIcon（Qt 6 通用顶层类，
-    # 而非历史观察的 HomePage_QMLTYPE）。title 含「剪映」前提已保证不误抓其他 Qt 应用。
-    if c.endswith('qwindowicon'):
-        return True
-    return False
+    """剪映主窗口类名匹配（可配置集合，含 Qt*QWindowIcon；实现在 jpd）。"""
+    return jpd.window_class_ok(cls)
 
 
 def find_jianying_native():
@@ -734,18 +698,26 @@ def find_jianying_native():
 
 
 def enum_jianying_windows():
-    """所有剪映真窗口（首页+编辑页可能同时存在）→ [(hwnd, cls, title)]。Win32 毫秒级。"""
-    try:
-        return [(h, c, t) for h, c, t in _enum_top_windows()
-                if '剪映' in t and _good_class_native(c)]
-    except Exception:
-        return []
+    """所有剪映真窗口（首页+编辑页可能同时存在）→ [(hwnd, cls, title)]（实现在 jpd）。"""
+    return jpd.enum_jianying_windows()
 
 
 # ================= HWND 持久化恢复（e2e cdp-recovery 模式）=================
 # 第一次绑定成功后缓存 HWND；下次优先 attach 到这个句柄（省掉 Win32 枚举 + UIA 搜索）。
 # 恢复前必须验证 identity（标题含剪映 + 类名合法）——连到错误的窗口比不连更糟。
 _LAST_HWND = {'hwnd': 0, 'cls': '', 'title': '', 'page': None}
+
+# 连接路径计时开关（纯观测）：JY_NAV_TRACE=1 时打印每次 connect 的各步耗时
+_NAV_TRACE = os.environ.get('JY_NAV_TRACE') == '1'
+
+
+def _nvtrace(stage: str, t0: Optional[float] = None, extra: str = '') -> None:
+    if not _NAV_TRACE:
+        return
+    now = time.time()
+    dur = '' if t0 is None else f' dur={now - t0:.3f}s'
+    hms = time.strftime('%H:%M:%S', time.localtime(now)) + f'.{int(now * 1000) % 1000:03d}'
+    print(f'[nav-trace] {hms} {stage}{dur} {extra}'.rstrip(), flush=True)
 
 
 def hwnd_identity_ok(hwnd):
@@ -784,13 +756,17 @@ def _try_reattach_cached_hwnd():
     hwnd = _LAST_HWND.get('hwnd') or 0
     if not hwnd:
         return None
+    _t = time.time()
     ident = hwnd_identity_ok(hwnd)
+    _nvtrace('cache-identity', _t, f'hwnd={hwnd} ok={bool(ident)}')
     if not ident:
         ddebug(f"  [hwnd] 缓存句柄 {hwnd} 已失效/不可见 → 重新查找")
         invalidate_hwnd_cache()
         return None
     title, cls = ident
+    _t = time.time()
     bound = _bind_uia_by_hwnd(hwnd, cls)
+    _nvtrace('cache-bind', _t, f'hwnd={hwnd} page={bound[1] if bound else None}')
     if not bound or bound[0] is None:
         return None
     win, pt = bound
@@ -813,7 +789,9 @@ def _bind_uia_by_hwnd(hwnd, known_cls=None, cache=True, activate=True):
     cache=False 用于候选窗口探测（只有最终选中的窗口才写缓存）。
     activate=False 用于探测（避免反复抢焦点/置顶）。"""
     try:
+        _t = time.time()
         win = uia.ControlFromHandle(hwnd)
+        _nvtrace('from-handle', _t, f'hwnd={hwnd} ok={win is not None}')
         if win is not None:
             bound = _activate_and_classify(win, known_cls, activate=activate)
             if bound and bound[0] is not None and cache:
@@ -838,11 +816,16 @@ def _select_best_native():
     """原生枚举所有剪映窗口 → 逐个判页 → edit 优先，其次 home。
     打开草稿会在**新窗口**打开编辑页，所以必须全量扫描而不能只认一个句柄。"""
     hits = enum_jianying_windows()
+    _nvtrace('enum-windows', extra='; '.join(
+        f'hwnd={h} cls={c} title={t!r}' for h, c, t in hits) or 'none')
     if not hits:
         return None, None
     best_edit = best_home = None
     for hwnd, cls, title in hits:
+        _t = time.time()
         bound = _bind_uia_by_hwnd(hwnd, cls, cache=False, activate=False)
+        _nvtrace('bind-candidate', _t,
+                 f'hwnd={hwnd} page={bound[1] if bound else None}')
         if not bound or bound[0] is None:
             continue
         win, pt = bound
@@ -855,20 +838,51 @@ def _select_best_native():
         # 所有窗口都判不出页（编辑页加载中）：先绑第一个可见窗口，page=None
         hwnd, cls, title = hits[0]
         ddebug(f"  [hwnd] {len(hits)} 个剪映窗口均判不出页（加载中）→ 绑定 hwnd={hwnd}")
-        return _bind_uia_by_hwnd(hwnd, cls) or (None, None)
+        _t = time.time()
+        _bound = _bind_uia_by_hwnd(hwnd, cls)
+        _nvtrace('bind-first-loading', _t,
+                 f'hwnd={hwnd} page={_bound[1] if _bound else None}')
+        return _bound or (None, None)
     hwnd, cls, win, pt = chosen
-    try:
-        win.SetActive()
-        win.SetTopmost(True)
-        time.sleep(0.2)
-        win.SetTopmost(False)
-    except Exception:
-        pass
+    # 选中窗口后置前：记录真实激活结果（失败只告警，不影响选窗/判页）
+    _t = time.time()
+    jpd.activate_window(win, hwnd=hwnd, log=ddebug)
+    _nvtrace('activate-selected', _t, f'hwnd={hwnd} page={pt}')
     _LAST_HWND['hwnd'] = hwnd
     _LAST_HWND['cls'] = cls
     _LAST_HWND['page'] = pt
     ddebug(f"  [hwnd] 选定窗口 hwnd={hwnd} cls={cls} page={pt}（候选 {len(hits)} 个）")
     return win, pt
+
+
+# 枚举为空时的短等重枚举（切草稿会先销毁旧窗、后建新窗，中间有可见性空档）
+_WINDOW_REAPPEAR_WAIT_S = 2.0
+_WINDOW_REAPPEAR_STEP_S = 0.3
+
+
+def _wait_jianying_window(timeout: float = _WINDOW_REAPPEAR_WAIT_S):
+    """枚举为空时短等：每 300ms 重枚举一次，返回 (hits, pid_alive)。
+
+    pid_alive=True 表示按剪映进程 pid 枚举到了不可见顶层窗口：实例还在，
+    只是窗口尚未可见/标题未就绪 —— 这是瞬态，继续轮询即可，不是「没窗口」。
+    """
+    deadline = time.time() + max(0.0, float(timeout))
+    pid_alive = False
+    while True:
+        hits = enum_jianying_windows()
+        if hits:
+            return hits, pid_alive
+        try:
+            pids = jpd.jianying_pids()
+            if pids:
+                pid_alive = pid_alive or any(
+                    jl.window_pid(h) in pids and jpd.window_class_ok(c)
+                    for h, c, _t in jpd.enum_top_windows(visible_only=False))
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return [], pid_alive
+        time.sleep(_WINDOW_REAPPEAR_STEP_S)
 
 
 def connect_jianying(retry=True, max_wait=60):
@@ -880,42 +894,45 @@ def connect_jianying(retry=True, max_wait=60):
     Qt*QWindowIcon 开头的窗口（标题必须含「剪映」），排除 Chrome_WidgetWin_1 假窗口。
     """
     # ⓪ HWND 持久化恢复：句柄有效且能判页才复用（最快路径）
+    _t_all = time.time()
+    _t = time.time()
     cached = _try_reattach_cached_hwnd()
+    _nvtrace('cache', _t, f'hit={bool(cached)} page={cached[1] if cached else None}')
     if cached:
+        _nvtrace('connect-total', _t_all, f'page={cached[1]} via=cache')
         return cached
 
     # ① Win32 原生全量扫描（毫秒级）：枚举所有剪映窗口 → 判页 → edit 优先
+    _t = time.time()
+    _hits = enum_jianying_windows()
     win, pt = _select_best_native()
+    _nvtrace('native', _t, f'hits={len(_hits)} page={pt}')
     if win is not None:
+        _nvtrace('connect-total', _t_all, f'page={pt} via=native')
         return win, pt
 
-    # ② 直接找（UIA 兜底，兼容 Qt6 通用顶层类）
-    for hint in ["剪映专业版"]:
-        try:
-            win = uia.WindowControl(searchDepth=1, Name=hint)
-            if win.Exists(0):
-                cls = win.ClassName or ""
-                if _good_class_native(cls):
-                    return _activate_and_classify(win)
-                # 假窗口，继续找
-                dprint(f"跳过假窗口 ClassName={cls!r}")
-        except Exception:
-            continue
+    # ①b 枚举为空：先短等重枚举，不再直接走 UIA 兜底。
+    # 打开草稿会「销毁首页窗口 → 再建编辑页窗口」，中间有 <1s 的可见性空档；
+    # 实测此时 UIA 按名搜索固定 20.3s（exists=False），随后的
+    # GetRootControl().GetChildren() 还要 22.0s，合计 40s+ 全是白等。
+    _t = time.time()
+    _hits2, _pid_seen = _wait_jianying_window()
+    _nvtrace('wait-window', _t, f'hits={len(_hits2)} pid_alive={_pid_seen}')
+    if _hits2:
+        win, pt = _select_best_native()
+        _nvtrace('native-retry', _t, f'hits={len(_hits2)} page={pt}')
+        if win is not None:
+            _nvtrace('connect-total', _t_all, f'page={pt} via=native-retry')
+            return win, pt
 
-    # 兜底：遍历顶层窗口
-    try:
-        for w in uia.GetRootControl().GetChildren():
-            try:
-                if "剪映" in (w.Name or "") and _good_class_native(w.ClassName or ""):
-                    return _activate_and_classify(w)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    if retry:
+    # 短等后仍无窗口：按 pid 能看到不可见窗口（_pid_seen=True）说明实例还在、
+    # 窗口没建好，直接返回让调用方按自己的节奏再试；进程根本没在跑则走拉起。
+    # 非标准类名的窗口由实例管理器里的按名兜底负责，不在这里用 20s 级 UIA 搜索。
+    _nvtrace('uia-fallback', extra=f'skip pid_alive={_pid_seen}')
+    if retry and not _pid_seen:
         dprint("未找到剪映窗口，尝试启动...")
         return launch_and_connect(max_wait=max_wait)
+    _nvtrace('connect-total', _t_all, 'page=None')
     return None, None
 
 
@@ -957,100 +974,28 @@ def _wmi_launch(exe_path):
 
 
 def launch_and_connect(exe_path=None, max_wait=60, retries=0, readiness='window'):
-    """拉起/复用剪映并等到就绪，返回已绑定的 (win, page)。
+    """拉起/复用剪映并等到首页，返回已绑定的 (win, page)。
 
-    版本校验、cwd、breakaway/WMI 兜底、进程存活轮询、启动即死重拉全部交给
-    lib/jianying_launch.ensure_jianying。
+    统一入口：本函数不再自己拉起，直接转调 `launch_via_manager`
+    （内部即 `JyInstance.ensure_for_export`）。原先的 readiness='window'
+    "有窗口就算就绪"口径已废弃——它会把初始化中的半成品窗口当成可用实例，
+    也是探针脚本绕过重试预算的来源。
 
-    readiness 两种口径（默认 'window'，与既有准入行为一致）：
-      'window' 任意真 QML 窗口出现即就绪 → 返回 (win, page)，page 可能是 edit；
-      'home'   必须等首页判定为 home 才就绪（page 恒为 home）。
-
-    retries 默认 0：准入的重拉由 ui_nav._launch_until_card 按 max_launch 负责，
-    共用层不再叠加预算。
+    保留形参只为兼容既有调用方：
+      max_wait  冷启动就绪墙钟（小于 120s 时按 120s 处理，避免冷启动被截断）
+      retries   已失效（重拉预算统一在实例管理器的 LaunchBudget 里）
+      readiness 已失效（就绪口径固定为「首页真能枚举出可交互控件」）
     """
-    t_launch = time.time()
-    diag = {'elapsed': 0.0, 'all_jy': [], 'last_log': 0.0, 'last_diag': 0.0}
-
-    def _probe():
-        el = time.time() - t_launch
-        diag['elapsed'] = el
-        # 环境检测窗排他：检测窗（VEDetector 转圈/崩溃框）还在就不算就绪。
-        # readiness='window' 只看"有真 QML 窗口"，检测期的半成品窗口会把判定骗过去。
-        try:
-            if jl.env_check_windows():
-                return None
-        except Exception:
-            pass
-        # Win32 原生检测（毫秒级，不受 UIA 枚举卡顿影响）。
-        # all_jy = 标题含剪映的所有可见窗口（含 Chrome_WidgetWin_1 假窗口/初始化中窗口）
-        t_chk = time.time()
-        try:
-            all_jy = [(h, c, t) for h, c, t in _enum_top_windows() if '剪映' in t]
-        except Exception:
-            all_jy = []
-        diag['all_jy'] = all_jy
-        chk_s = time.time() - t_chk
-        if chk_s > 3:
-            dprint(f"  [diag] 本轮 Win32 窗口枚举耗时 {chk_s:.1f}s（异常，正常应 <0.1s）")
-        # 真 QML 窗口（HomePage/MainWindow）出现 → 立即返回
-        real = [(h, c, t) for h, c, t in all_jy if _good_class_native(c)]
-        if not real:
-            return None
-        hwnd, cls, title = real[0]
-        dprint(f"  剪映窗口已出现（{el:.0f}s）cls={cls}")
-        bound = _bind_uia_by_hwnd(hwnd, cls)
-        if bound and bound[0] is not None:
-            return bound
-        # 句柄绑定失败（极少见）→ UIA 搜索兜底
-        try:
-            win = uia.WindowControl(searchDepth=1, Name='剪映专业版')
-            if win.Exists(2):
-                return _activate_and_classify(win)
-        except Exception:
-            pass
-        return None
-
-    def _probe_home():
-        """readiness='home'：窗口出现还不够，必须已判定在首页。"""
-        bound = _probe()
-        if bound and bound[0] is not None and bound[1] == 'home':
-            return bound
-        return None
-
-    def _tick(_elapsed, _attempt):
-        el = diag['elapsed']
-        all_jy = diag['all_jy']
-        if el - diag['last_log'] >= 15:
-            diag['last_log'] = el
-            if all_jy:
-                cls_set = ', '.join(sorted({c for _, c, _ in all_jy}))
-                dprint(f"  ...剪映启动等待中（{el:.0f}s）已检测到窗口: {cls_set}")
-            else:
-                dprint(f"  ...剪映启动等待中（{el:.0f}s）（尚未检测到剪映任何窗口）")
-        elif all_jy and el - diag['last_diag'] >= 30:
-            # 只有假窗口/初始化中窗口：进程已拉起，QML 主窗口还没创建（肉眼看到的
-            # 任务栏图标/闪屏属于这种）→ 每 30s 提示一次，说明检测没有瞎等
-            diag['last_diag'] = el
-            dprint(f"  [diag] 剪映进程已拉起，主窗口初始化中（{el:.0f}s）: "
-                   f"{sorted({c for _, c, _ in all_jy})}")
-
-    ready_fn = _probe_home if readiness == 'home' else _probe
-    outcome = jl.ensure_jianying(
-        exe_path=exe_path, timeout=max_wait, readiness=readiness, retries=retries,
-        entry='admit',
-        ready_fn=ready_fn, poll_interval=2.0, log_fn=dprint, tick_fn=_tick)
-    if outcome.ok:
-        return outcome.value
-    if outcome.outcome == 'timeout':
-        raise RuntimeError(f"启动后 {max_wait}s 内未找到剪映窗口")
-    raise RuntimeError(
-        f"启动后 {outcome.alive_s:.0f}s 剪映进程退出（启动即死，pid={outcome.pid}），"
-        f"未等到主窗口")
+    if readiness != 'home':
+        dprint(f"  [launch] readiness={readiness!r} 已废弃，统一按首页可交互判就绪")
+    return launch_via_manager(force_clean=False,
+                              timeout=max(jl.HOME_READY_TIMEOUT_S, float(max_wait)),
+                              exe_path=exe_path)
 
 
 
-def launch_via_manager(readiness='home', force_clean=False, timeout=120.0):
+def launch_via_manager(readiness='home', force_clean=False, timeout=120.0,
+                       exe_path=None):
     """准入冷启动：复用导出链的实例判定（`JyInstance.ensure_for_export`）。
 
     与 `launch_and_connect` 的区别：就绪口径固定为 home（首页真能枚举出可交互
@@ -1063,7 +1008,7 @@ def launch_via_manager(readiness='home', force_clean=False, timeout=120.0):
     """
     if readiness != 'home':
         raise ValueError(f"准入只支持 readiness='home'（收到 {readiness!r}）")
-    exe = resolve_jianying_exe()
+    exe = exe_path or resolve_jianying_exe()
     mgr = jy_instance.JyInstance(find_exe=lambda: exe, log=dprint)
     mgr.ensure_for_export(force_clean=force_clean, timeout=timeout, entry='admit')
     win = mgr.backend.rebind_window()
@@ -1072,41 +1017,16 @@ def launch_via_manager(readiness='home', force_clean=False, timeout=120.0):
     return _activate_and_classify(win)
 
 
-_PAGE_FEATS = (
-    ('edit', 'maintimelineroot'),    # 实测：编辑页时间线根节点，深度仅 2
-    ('edit', 'vesettingpanel'),      # 右侧设置面板展开时才有（辅助特征）
-    ('home', 'homepagedrafttitle'),  # 首页草稿卡片
-)
+_PAGE_FEATS = tuple(jpd.PAGE_FEATS)
 
 
 def _detect_page(win):
-    """按 FullDescription 特征判页（Qt 通用窗口类名判不出页时唯一依据）。
-    实测（2026-11 剪映 5.9/Qt6）：首页与编辑页标题都叫「剪映专业版」，
-    编辑页必有 MainTimeLineRoot（深度 2）；旧的 VESettingPanel 在未展开设置面板时不存在。
-    单次遍历同时检测所有特征、命中 edit 即提前返回，避免首页重复全树扫描。"""
-    found = {'edit': False, 'home': False}
+    """按 Description 特征判页（唯一实现在 jy_page_detect.detect_page）。
 
-    def walk(ctrl, depth):
-        if depth > 10 or found['edit']:
-            return
-        desc = _ctrl_desc(ctrl)
-        for pt, feat in _PAGE_FEATS:
-            if feat in desc:
-                found[pt] = True
-        if found['edit']:
-            return
-        try:
-            for c in ctrl.GetChildren():
-                walk(c, depth + 1)
-        except Exception:
-            pass
-
-    walk(win, 0)
-    if found['edit']:
-        return 'edit'
-    if found['home']:
-        return 'home'
-    return None
+    首页与编辑页标题都叫「剪映专业版」，Qt 通用窗口类名也判不出页；
+    特征：MainTimeLineRoot/VESettingPanel → edit，HomePageDraftTitle → home。
+    """
+    return jpd.detect_page(win)
 
 
 # ================= S3-A2：窗口放置策略（参数化） =================
@@ -1264,27 +1184,21 @@ def _ensure_window_placement(win):
 
 
 def _activate_and_classify(win, known_cls=None, activate=True):
+    _t_act = _t_page = None
     if activate:
-        try:
-            win.SetActive()
-            win.SetTopmost(True)
-            time.sleep(0.2)
-            win.SetTopmost(False)
-        except Exception:
-            pass
+        # 激活是独立动作：记录图标化/前台窗口/SetActive/SetForegroundWindow 的真实
+        # 结果，失败只告警（日志 [activate] … [warn]），不影响下面的判页与成败。
+        _t_act = time.time()
+        jpd.activate_window(win, log=dprint)
         _ensure_window_placement(win)
+        _nvtrace('activate', _t_act, f'hwnd={getattr(win, "NativeWindowHandle", 0)}')
 
-    # 优先用 Win32 已测得的类名（避免 UIA 属性读取再被卡）
-    cls = known_cls or (win.ClassName or "")
-    if "MainWindow" in cls:
-        return win, "edit"
-    elif "HomePage" in cls:
-        return win, "home"
-    # Qt 通用类名（Qt622QWindowIcon）：desc 特征判页
-    pt = _detect_page(win)
-    if pt:
-        return win, pt
-    return win, None
+    # 判页统一走 jy_page_detect（Description 特征优先，类名仅兜底提示）
+    cls = known_cls or (getattr(win, "ClassName", "") or "")
+    _t_page = time.time()
+    pt = jpd.detect_page(win, known_cls=cls)
+    _nvtrace('detect-page', _t_page, f'page={pt} cls={cls!r}')
+    return win, pt
 
 
 def ensure_maximized(win):

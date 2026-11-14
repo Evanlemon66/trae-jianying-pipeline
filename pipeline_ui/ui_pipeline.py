@@ -332,7 +332,7 @@ def step_finalize(workdir):
             'error': None if ok else 'verify failed'}
 
 
-def step_export(workdir, draft_name=None, resolution=None):
+def step_export(workdir, draft_name=None, resolution=None, require_cover=True):
     """导出 MP4。调用 .trae/skills/jianying-editor/examples/robust_auto_export.py。
     其 CLI: robust_auto_export.py <draft_name> <output_path> [--move] [--retries N] [--resolution X]"""
     import subprocess
@@ -421,6 +421,10 @@ def step_export(workdir, draft_name=None, resolution=None):
             cmd += ['--expect-duration', str(expected_s)]
         if resolution:
             cmd += ['--resolution', resolution]
+        if not require_cover:
+            # 准入无 cover_job：显式声明"本次不校验封面"，不靠文件存在性猜
+            cmd += ['--no-cover']
+            dprint("  导出三件套口径：无 cover_job → 只校验 mp4 + progress（封面缺失仅记录）")
         timeout = _step_timeout('export', expected_s)
         dprint(f"  导出草稿「{draft_name}」→ {output_path}（时长 {expected_s}s，"
                f"分辨率 {resolution or '沿用剪映当前值'}，导出后搬回 workdir，超时 {timeout}s）")
@@ -441,13 +445,22 @@ def step_export(workdir, draft_name=None, resolution=None):
             except OSError:
                 pass
 
+            # 导出子进程 stdout/stderr 单独落盘（行缓冲 + 子进程无缓冲），不再只留在内存
+            _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+            os.makedirs(_log_dir, exist_ok=True)
+            _export_log = os.path.join(
+                _log_dir, 'export_child_%s.log' % time.strftime('%Y%m%d_%H%M%S'))
+            _child_env = hidden_child_env()
+            _child_env['PYTHONUNBUFFERED'] = '1'
+            _log_fh = open(_export_log, 'w', encoding='utf-8', buffering=1)
+            dprint(f"  导出子进程日志: {_export_log}")
             proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                stdout=_log_fh, stderr=subprocess.STDOUT, text=True,
                 encoding='utf-8', errors='replace',
                 stdin=subprocess.DEVNULL,   # 避免脚本失败路径 input() 在无 tty 时 EOFError
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-                env=hidden_child_env(),
+                env=_child_env,
             )
 
             def _sizes_mb():
@@ -485,7 +498,15 @@ def step_export(workdir, draft_name=None, resolution=None):
                            + (f"（临时新增 {delta:.0f}MB，写盘中）" if delta > 0.5
                               else "（临时无新增，准备阶段/未写盘）"))
 
-            out, err = proc.communicate()
+            try:
+                _log_fh.close()
+            except Exception:
+                pass
+            try:
+                out = open(_export_log, encoding='utf-8', errors='replace').read()
+            except OSError:
+                out = ''
+            err = ''
             elapsed = time.time() - t0
             if proc.returncode == 0:
                 dprint(f"[6] 导出 MP4 ✅  耗时 {elapsed:.1f}s")
@@ -493,8 +514,13 @@ def step_export(workdir, draft_name=None, resolution=None):
                         'inputs': {'cmd': cmd}}
             else:
                 dprint(f"[6] 导出 MP4 ❌  返回码 {proc.returncode}")
+                # 门禁结论打在 stdout（如「导出后校验未通过: 缺 封面」），只看 stderr
+                # 会拿到空错误、failure_class 落 unknown —— 两条流都要回传。
+                dprint(f"  stdout(尾): {(out or '')[-800:]}")
                 dprint(f"  stderr: {(err or '')[-500:]}")
-                return {'ok': False, 'duration_s': round(elapsed, 1), 'error': (err or '')[-300:],
+                detail = '\n'.join(x for x in ((out or '').strip(), (err or '').strip()) if x)
+                return {'ok': False, 'duration_s': round(elapsed, 1),
+                        'error': detail[-800:] or f'export 子进程返回码 {proc.returncode}',
                         'inputs': {'cmd': cmd}}
         except Exception as e:
             elapsed = time.time() - t0

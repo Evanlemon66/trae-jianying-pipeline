@@ -2000,8 +2000,11 @@ def subtitle_gate(draft_name, roots=None):
     return jm.subtitle_missing(best[0])
 
 
-def _post_export_gate(draft_name, output_path):
+def _post_export_gate(draft_name, output_path, require_cover=True):
     """直调本脚本的收尾守卫：无 job 上下文，只跑 4/5/6（三件套→质检→收尾证据）。
+
+    require_cover=False 表示本次没有 cover_job（如准入）：三件套只验 mp4 + progress，
+    封面缺失只记录不判失败；mp4 / progress 缺失仍照常失败。
 
     前置三项守卫（reap / 配置覆盖 / 归档旧产物）需要 job 目录，直调没有落点，
     这里**显式**打印跳过说明——静默略过会让排查误以为守卫已经跑过。
@@ -2017,6 +2020,7 @@ def _post_export_gate(draft_name, output_path):
         draft_name, mp4, job_dir=None, started_at=_TASK.get("start_time"),
         verify=True, verify_script=os.path.join(_REPO_ROOT, "pipeline", "verify_export.py"),
         creationflags=_NO_WINDOW, progress_path=output_path + ".progress.json",
+        require_cover=require_cover,
         log=lambda m: dprint(f"[guard] {m}"))
     return res["ok"], res["brief"]
 
@@ -2040,6 +2044,9 @@ if __name__ == "__main__":
                              "默认由实例管理器判定复用还是重启")
     parser.add_argument("--resolution", default=None, choices=["480P", "720P", "1080P", "2K", "4K"],
                         help="导出分辨率（默认 None=沿用剪映当前值）")
+    parser.add_argument("--no-cover", action="store_true",
+                        help="本次无 cover_job：导出后门禁只校验 mp4 + progress，"
+                             "封面缺失仅记录不判失败（显式声明，不靠文件存在性推断）")
 
     args = parser.parse_args()
 
@@ -2065,7 +2072,8 @@ if __name__ == "__main__":
                 cold_start=args.cold_start and attempt == 1,
                 resolution=args.resolution)
             if os.environ.get("JY_GUARD_PARENT") != "1":
-                gate_ok, gate_brief = _post_export_gate(args.draft_name, args.output_path)
+                gate_ok, gate_brief = _post_export_gate(
+                    args.draft_name, args.output_path, require_cover=not args.no_cover)
                 if not gate_ok:
                     print(f"⛔ 导出后校验未通过: {gate_brief}")
                     sys.exit(3)

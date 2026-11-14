@@ -6,9 +6,10 @@
   1. 隐藏并锁定识别字幕产生的两条字幕轨（顶部成簇 text 轨）
   2. Home + Ctrl+A 选中主轨道（ui_core.select_main_track，高频操作统一封装）
   3. Ctrl+Shift+S 分离音频
-  4. 对账 draft_content.json 判分离是否真的成功（三项硬校验，见 _check_separation）
+  4. 对账 draft_content.json 判分离是否真的成功（先持续采样到稳定态，再三项硬校验，
+     见 _wait_separation_applied / _check_separation）
   5. 解除所有轨道的锁定和隐藏（restore_all_tracks）
-  6. 只隐藏中文字幕轨（两条字幕轨中从上到下第二条，用户确认）
+  6. 先把时间线滚回顶层，再只隐藏中文字幕轨（顶层两条 text 轨中从上到下第二条，用户确认）
   7. 把最终所有轨道元素和坐标写入 ui_calibration.json（final_layout）供后续步骤使用
 
 快捷键结论（2026-11 核对 + 用户实测）：
@@ -51,6 +52,7 @@ from ui_core import (
 from ui_track_ops import (
     scan_tracks, find_main_track, lock_track, restore_all_tracks,
     _set_row_hidden, is_row_locked, get_lock_x,
+    scroll_timeline_vertical,
     _HDR_SCALE,
 )
 from ui_calibration import update_param
@@ -97,38 +99,13 @@ def _safe_scan(win):
     return [], None, 0, 0, 0, 0, win
 
 
-def _subs_from_hint(hint):
-    """从 [4/6] 已扫过的 rows 推导字幕轨簇，避免再跑一次完整 scan_tracks。
-    隐藏行采不到片段像素 → type 会是 unknown，因此这里只用 y 间距成簇：
-    顶部连续两行且与第三行断开（> 40px 逻辑间距）即视为字幕轨对。
-    形态不符（不足 2 行 / 第三条间距过近）返回 (None, None) 让调用方回退完整扫描。
-    返回 (cluster_rows[:2], eye_x) 或 (None, None)。
-    """
-    if not hint or not hint[0]:
-        return None, None
-    rows, eye_x = hint[0], hint[5]
-    gap = 40 * max(float(_HDR_SCALE), 0.5)
-    ordered = sorted(rows, key=lambda r: r['ymid'])
-    cluster = []
-    for r in ordered:
-        if not cluster or r['ymid'] - cluster[-1]['ymid'] <= gap:
-            cluster.append(r)
-        else:
-            break
-    if len(cluster) < 2:
-        return None, None
-    return cluster[:2], eye_x
+def _cluster_text_rows(rows):
+    """顶部连续成簇的 text 轨 = 识别字幕产生的字幕轨（中文+英文）。
 
-
-def _top_text_cluster(win):
-    """
-    顶部连续成簇的 text 轨 = 识别字幕产生的字幕轨（中文+英文）。
     与下方误分类的旧轨用 40px 逻辑间距断开（按 _HDR_SCALE 换算：1920 下 40px，
     4K@150% 下 60px，否则 4K 实测字幕行间距 42px 会被断成单条）。
-    返回 (cluster_rows 按 ymid 升序, eye_x, win)。
     """
     gap = 40 * max(float(_HDR_SCALE), 0.5)
-    rows, _, _, _, _, eye_x, win = _safe_scan(win)
     text_rows = sorted([r for r in rows if r['type'] == 'text'], key=lambda r: r['ymid'])
     cluster = []
     for r in text_rows:
@@ -136,7 +113,65 @@ def _top_text_cluster(win):
             cluster.append(r)
         else:
             break
-    return cluster, eye_x, win
+    return cluster
+
+
+def _top_text_cluster(win):
+    """扫一次并返回顶部 text 簇。返回 (cluster_rows 按 ymid 升序, eye_x, win)。"""
+    rows, _, _, _, _, eye_x, win = _safe_scan(win)
+    return _cluster_text_rows(rows), eye_x, win
+
+
+def _scroll_to_top(win, max_steps=8):
+    """朝上滚时间线，直到三模态均无位移（=已到顶）。返回 (ok, why)。
+
+    复用 scroll_timeline_vertical 的多模态轮转：reason='all_modes_failed' 表示
+    keyboard / scrollbar / wheel 全都没有位移 —— 这正是"已经在顶层"的判据。
+    """
+    for i in range(max_steps):
+        r = scroll_timeline_vertical(win, direction='up')
+        if r.get('ok'):
+            continue
+        if r.get('reason') == 'all_modes_failed':
+            dprint(f"  ✅ 已到顶层：第 {i + 1} 次上滚三模态均无位移"
+                   f"（tried={[t.get('mode') for t in (r.get('tried') or [])]}）")
+            return True, f'第 {i + 1} 次上滚三模态均无位移'
+        return False, f'滚动不可用（{r.get("reason")}）'
+    return False, f'连续上滚 {max_steps} 次仍有位移，未确认到顶'
+
+
+def _top_text_cluster_checked(win):
+    """回顶后复扫校验：最上面那簇 text 必须是 2 行（中文+英文字幕轨）。
+
+    "顶层"指 text 轨里的最上一簇，不是"整条时间线最顶行"——实测预设组里可能有
+    video 行排在 text 簇上方（例如 ymid 971 的 video 在 1042/1084 的 text 之上），
+    按"最顶行必须是 text"判会无条件误报。
+    返回 (cluster, eye_x, win, why)；why 为空串表示校验通过。
+    """
+    rows, _, _, _, _, eye_x, win = _safe_scan(win)
+    cluster = _cluster_text_rows(rows)
+    if not cluster:
+        return cluster, eye_x, win, '扫描未采到任何 text 行'
+    if len(cluster) < 2:
+        return cluster, eye_x, win, (f'最上层 text 簇只有 {len(cluster)} 行（预期 2 行，'
+                                     f'ymid={[r["ymid"] for r in cluster]}）')
+    if len(cluster) > 2:
+        return cluster, eye_x, win, (f'最上层 text 簇有 {len(cluster)} 行（预期 2 行，'
+                                     f'ymid={[r["ymid"] for r in cluster]}）')
+    return cluster, eye_x, win, ''
+
+
+def _verify_zh_hidden(win, ymid):
+    """隐藏后复扫确认原中文字幕行确实变成 hidden。返回 (ok, why, win)。"""
+    rows, _, _, _, _, _, win = _safe_scan(win)
+    if not rows:
+        return False, '隐藏后复扫未采到任何轨道行', win
+    hit = min(rows, key=lambda r: abs(r['ymid'] - ymid))
+    if abs(hit['ymid'] - ymid) > 40:
+        return False, f'复扫找不到原中文字幕行（ymid={ymid}，最近行 ymid={hit["ymid"]}）', win
+    if not hit['hidden']:
+        return False, f'中文字幕轨 ymid={ymid} 复检仍可见', win
+    return True, f'ymid={ymid} hidden=True', win
 
 
 def _write_final_layout(win, audio_row, type_overrides=None):
@@ -174,6 +209,15 @@ def _write_final_layout(win, audio_row, type_overrides=None):
 
 # ============ 分离结果硬校验（draft_content.json 前后对账）============
 SEPARATE_AUDIO_HOTKEY = ('ctrl', 'shift', 's')
+
+# 终态采样（取代旧的"等到有变化 → 再等 2s 取一次"单点读数）
+# 上一轮主轨 5→0 的破坏性落盘发生在按键后约 50s，任何 T+5s 的单点读数都看不见。
+TERMINAL_SAMPLE_INTERVAL_S = 0.5   # 采样间隔（秒）
+TERMINAL_STABLE_HOLD_S = 40.0      # 连续多久无落盘变化才算进入稳定态
+TERMINAL_TIMEOUT_S = 180.0         # 总采样超时（秒）
+TERMINAL_NOCHANGE_S = 30.0         # 这么久连一次变化都没有 → 快捷键没有生效
+_SEP_KEY_SENDS = 0                 # 本次运行累计发送 Ctrl+Shift+S 的次数
+
 # 不同版本/素材来源写"视频原声"用的字段名不一，命中任一即视为显式标记
 _ORIGINAL_SOUND_KEYS = ('video_original_sound', 'is_video_original_sound',
                         'original_sound')
@@ -211,6 +255,7 @@ def _draft_sig(path):
     main = _main_track(tracks)
     return {
         'mtime': os.path.getmtime(path),
+        'size': os.path.getsize(path),          # 终态采样用：任何落盘都会变
         'n_tracks': len(tracks),
         'main_id': (main or {}).get('id'),
         'main_segments': len((main or {}).get('segments') or []),
@@ -223,6 +268,9 @@ def _draft_sig(path):
         'video_ids': {v.get('id') for v in videos if v.get('id')},
         'audio_tracks': [{'id': t.get('id'), 'segments': t.get('segments') or []}
                          for t in tracks if t.get('type') == 'audio'],
+        # 每条 audio 轨的段数（采样日志要能一眼看出"新增 audio 轨且片段指向视频原声"）
+        'audio_shape': tuple(len(t.get('segments') or [])
+                             for t in tracks if t.get('type') == 'audio'),
         'audios_by_id': {a.get('id'): a for a in audios if a.get('id')},
     }
 
@@ -249,7 +297,11 @@ def _audio_from_video(seg, mat, sig):
         for key, val in holder.items():
             if isinstance(val, str) and val in sig['video_ids']:
                 return True, f'{holder_name}.{key} 指向视频素材'
-    if str(mat.get('type') or '').lower() in ('extract', 'video_extract'):
+    mtype = str(mat.get('type') or '').lower()
+    if 'original_sound' in mtype:
+        # 分离音频写出的素材类型就叫 video_original_sound（上一轮破坏性签名同此）
+        return True, f'material.type={mat.get("type")}'
+    if mtype in ('extract', 'video_extract'):
         return True, f'material.type={mat.get("type")}'
     if mat.get('path') and mat.get('path') in sig['video_paths']:
         return True, 'material.path 与视频素材同源'
@@ -293,29 +345,147 @@ def _check_separation(before, after):
                    f'audios={len(after["audios_by_id"])}）')
 
 
-def _wait_separation_applied(path, before, timeout_sec):
-    """等剪映 autosave 把分离结果写进 draft_content.json（剪映异步落盘，不是即时）。
+def _state_key(sig):
+    """终态采样用的可比指纹：草稿一有落盘就会变（字节数/轨道/主轨段/视频素材/音频段）。"""
+    return (sig['size'], sig['n_tracks'], sig['main_segments'],
+            sig['n_videos'], sig['audio_shape'])
 
-    先等"确有变化"（音频轨/轨道数/主轨段数/视频素材数任一变化），再等一拍取稳定态。
-    超时返回 None → 调用方按"快捷键没生效"报错，不再用界面现象兜底。
+
+def _fmt_ts(ts):
+    return time.strftime('%H:%M:%S', time.localtime(ts)) + f'.{int((ts % 1) * 1000):03d}'
+
+
+def _destroyed_reason(before, sig):
+    """破坏性签名 → 原因串；健康返回 None。
+
+    四条都是上一轮实测过的"视频被吃掉"形态，任一命中就不许再往下走：
+      ① 主轨段数减少（按主轨 id 回查，不重新找最底 video 行）
+      ② 主轨被清空
+      ③ materials.videos 减少（视频片段被换成音频素材）
+      ④ 新增 audio 段指向 video_original_sound，且原有视频素材 id 消失
     """
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        time.sleep(1.5)
+    main_id = before.get('main_id')
+    now = sig['track_index'].get(main_id) if main_id else None
+    if not main_id or now is None:
+        return f'主轨(id={main_id})在分离后消失'
+    if now['type'] != 'video':
+        return f'主轨被改成 {now["type"]}（应为 video）'
+    if now['n_segments'] == 0 and before['main_segments'] > 0:
+        return f'主轨被清空（{before["main_segments"]}→0 段）'
+    if now['n_segments'] < before['main_segments']:
+        return f'主轨段数减少 {before["main_segments"]}→{now["n_segments"]}'
+    if sig['n_videos'] < before['n_videos']:
+        return (f'materials.videos 减少 {before["n_videos"]}→{sig["n_videos"]}'
+                f'（视频片段被换成了音频素材）')
+    old_ids = {t['id'] for t in before['audio_tracks']}
+    new_tracks = [t for t in sig['audio_tracks'] if t['id'] not in old_ids]
+    gone = set(before.get('video_ids') or ()) - set(sig['video_ids'])
+    if new_tracks and gone:
+        for t in new_tracks:
+            for seg in t['segments']:
+                mat = sig['audios_by_id'].get(seg.get('material_id')) or {}
+                ok, why = _audio_from_video(seg, mat, sig)
+                if ok:
+                    return (f'新增 video_original_sound 音频段顶替视频（{why}），'
+                            f'原视频素材减少 {len(gone)} 个')
+    return None
+
+
+def _send_separate_hotkey(win):
+    """发送分离快捷键并计数（采样日志要能回答"这段时间里有没有第二次键事件"）。"""
+    global _SEP_KEY_SENDS
+    op_mark('组合键', 'Ctrl+Shift+S（分离音频）')
+    _key_inject_evidence(win, SEPARATE_AUDIO_HOTKEY)
+    pyautogui.hotkey(*SEPARATE_AUDIO_HOTKEY)
+    _SEP_KEY_SENDS += 1
+    dprint(f"  ⌨️ Ctrl+Shift+S 已发送（本次运行累计 {_SEP_KEY_SENDS} 次）")
+    return _SEP_KEY_SENDS
+
+
+def _wait_separation_applied(path, before, timeout_sec=None):
+    """按键后**持续采样** draft_content.json，直到稳定态 / 破坏性签名 / 超时。
+
+    旧实现是"等到有变化 → 再等 2s 取一次"，等于拿中间态读数判成功；上一轮主轨
+    5→0 的落盘发生在按键后约 50s，单点读数永远看不见。现在逐拍留日志：
+      [采样 NN +X.Xs] HH:MM:SS.mmm size=… main=…段 videos=… audio_tracks=… audio_segs=(…)
+    返回 {'state','sig','samples','first_drop','stable_at','reason','key_sends'}：
+      stable     连续 TERMINAL_STABLE_HOLD_S 无变化（且期间确有落盘变化）
+      destroyed  命中破坏性签名（调用方必须立刻失败 + 回滚，不得 continue）
+      timeout    总超时，或 TERMINAL_NOCHANGE_S 内连一次变化都没有（键没生效）
+    """
+    timeout = TERMINAL_TIMEOUT_S if timeout_sec is None else float(timeout_sec)
+    t_start = time.time()
+    deadline = t_start + timeout
+    prev_key = _state_key(before)
+    last_sig = before
+    last_change_at = t_start
+    changed_any = False
+    first_drop = None
+    n = 0
+    dprint(f"  [终态采样] 间隔 {TERMINAL_SAMPLE_INTERVAL_S}s / 稳定判定 "
+           f"{TERMINAL_STABLE_HOLD_S:.0f}s / 超时 {timeout:.0f}s（按键后立即开始）")
+    while True:
+        time.sleep(TERMINAL_SAMPLE_INTERVAL_S)
+        now = time.time()
+        n += 1
         try:
             sig = _draft_sig(path)
         except Exception:
-            continue          # 剪映正在写盘，JSON 可能是半截，下一轮重读
-        if (len(sig['audio_tracks']) != len(before['audio_tracks'])
-                or sig['n_tracks'] != before['n_tracks']
-                or sig['main_segments'] != before['main_segments']
-                or sig['n_videos'] != before['n_videos']):
-            time.sleep(2.0)   # 落盘可能分多批写，再取一次稳定态
-            try:
-                return _draft_sig(path)
-            except Exception:
-                return sig
-    return None
+            dprint(f"  [采样 {n:02d} +{now - t_start:5.1f}s] {_fmt_ts(now)} "
+                   f"读盘失败（剪映正在写盘，下一拍重试）")
+            if now >= deadline:
+                break
+            continue
+        key = _state_key(sig)
+        changed = key != prev_key
+        shape = ' '.join(str(x) for x in sig['audio_shape']) or '-'
+        dprint(f"  [采样 {n:02d} +{now - t_start:5.1f}s] {_fmt_ts(now)} "
+               f"size={sig['size']} mtime={_fmt_ts(sig['mtime'])} "
+               f"main={sig['main_segments']}段 videos={sig['n_videos']} "
+               f"audio_tracks={len(sig['audio_shape'])} audio_segs=({shape})"
+               f"{' ←变化' if changed else ''}")
+        if sig['main_segments'] < before['main_segments'] and first_drop is None:
+            first_drop = (now, now - t_start,
+                          f'主轨 {before["main_segments"]}→{sig["main_segments"]} 段')
+            dprint(f"  🧨 首次读到主轨段数下降 @ {_fmt_ts(now)}"
+                   f"（按键后 +{now - t_start:.1f}s，Ctrl+Shift+S 累计 "
+                   f"{_SEP_KEY_SENDS} 次）")
+        if changed:
+            changed_any = True
+            last_change_at = now
+        prev_key = key
+        last_sig = sig
+
+        bad = _destroyed_reason(before, sig)
+        if bad:
+            dprint(f"  🧨 破坏性签名 @ {_fmt_ts(now)}（按键后 +{now - t_start:.1f}s）：{bad}"
+                   f"；共采样 {n} 次，Ctrl+Shift+S 累计 {_SEP_KEY_SENDS} 次")
+            return {'state': 'destroyed', 'sig': sig, 'samples': n,
+                    'first_drop': first_drop, 'stable_at': None, 'reason': bad,
+                    'key_sends': _SEP_KEY_SENDS}
+        if changed_any and now - last_change_at >= TERMINAL_STABLE_HOLD_S:
+            dprint(f"  ✅ 终态稳定：连续 {TERMINAL_STABLE_HOLD_S:.0f}s 无落盘变化"
+                   f"（末次变化 @ {_fmt_ts(last_change_at)}，共采样 {n} 次，"
+                   f"Ctrl+Shift+S 累计 {_SEP_KEY_SENDS} 次）")
+            return {'state': 'stable', 'sig': sig, 'samples': n,
+                    'first_drop': first_drop, 'stable_at': now, 'reason': '',
+                    'key_sends': _SEP_KEY_SENDS}
+        if not changed_any and now - t_start >= TERMINAL_NOCHANGE_S:
+            dprint(f"  ⚠️ 终态采样：{TERMINAL_NOCHANGE_S:.0f}s 内草稿无任何变化"
+                   f"（共采样 {n} 次，Ctrl+Shift+S 累计 {_SEP_KEY_SENDS} 次）")
+            return {'state': 'timeout', 'sig': last_sig, 'samples': n,
+                    'first_drop': None, 'stable_at': None,
+                    'reason': '草稿无任何变化（快捷键未生效或焦点不在时间线）',
+                    'key_sends': _SEP_KEY_SENDS}
+        if now >= deadline:
+            break
+    dprint(f"  ⚠️ 终态采样超时：{timeout:.0f}s 内未进入稳定态"
+           f"（共采样 {n} 次，末次变化 @ {_fmt_ts(last_change_at)}，"
+           f"Ctrl+Shift+S 累计 {_SEP_KEY_SENDS} 次）")
+    return {'state': 'timeout', 'sig': last_sig, 'samples': n,
+            'first_drop': first_drop, 'stable_at': None,
+            'reason': f'{timeout:.0f}s 内草稿未进入稳定态',
+            'key_sends': _SEP_KEY_SENDS}
 
 
 def _key_inject_evidence(win, keys):
@@ -386,7 +556,7 @@ def _key_inject_evidence(win, keys):
         dprint(f"  [key-evidence] {ln}")
 
 
-def run_extract_audio(workdir: str = ".", timeout_sec: int = 30) -> dict:
+def run_extract_audio(workdir: str = ".", timeout_sec: float = TERMINAL_TIMEOUT_S) -> dict:
     """分离音频：把选中主轨视频片段的音轨拆成独立音频轨。快捷键 Ctrl+Shift+S。"""
     op_stage('5 分离音频')
     t0 = time.time()
@@ -448,24 +618,39 @@ def run_extract_audio(workdir: str = ".", timeout_sec: int = 30) -> dict:
     dprint(f"  分离前草稿: 主轨(id={before_sig['main_id']}) "
            f"{before_sig['main_segments']} 段，videos={before_sig['n_videos']}，"
            f"audio 轨={len(before_sig['audio_tracks'])}，总轨={before_sig['n_tracks']}")
-    op_mark('组合键', 'Ctrl+Shift+S（分离音频）')
-    _key_inject_evidence(win, SEPARATE_AUDIO_HOTKEY)
-    pyautogui.hotkey(*SEPARATE_AUDIO_HOTKEY)
+    _send_separate_hotkey(win)
     time.sleep(1)
 
-    # --- Step 4: 严格校验：draft_content.json 前后对账（不看界面现象）---
-    dprint(f"\n[4/6] 校验分离结果（draft 前后对账，超时 {timeout_sec}s）")
-    after_sig = _wait_separation_applied(draft_path, before_sig, timeout_sec)
-    if after_sig is None:
-        return _fail('分离音频失败：超时后 draft_content.json 无变化'
-                     '（快捷键未生效或焦点不在时间线）')
+    # --- Step 4: 终态校验：持续采样到稳定态后再对账（不看界面现象）---
+    dprint(f"\n[4/6] 校验分离终态（持续采样 draft，稳定判定 "
+           f"{TERMINAL_STABLE_HOLD_S:.0f}s / 超时 {timeout_sec:.0f}s）")
+    res = _wait_separation_applied(draft_path, before_sig, timeout_sec)
+    if res['state'] == 'destroyed':
+        if res.get('first_drop'):
+            when = (f'{_fmt_ts(res["first_drop"][0])}（按键后 +{res["first_drop"][1]:.1f}s，'
+                    f'{res["first_drop"][2]}）')
+        else:
+            when = '未知'
+        return _fail('分离音频失败：终态质检未通过 —— ' + res['reason'] +
+                     f'；破坏性签名首次出现于 {when}，Ctrl+Shift+S 累计发送 '
+                     f'{res["key_sends"]} 次；已停止，不进入 restore / 隐藏字幕'
+                     f'（逐拍读数见上方 [采样] 行）')
+    if res['state'] != 'stable':
+        return _fail('分离音频失败：终态采样超时 —— ' + res['reason'] +
+                     f'；共采样 {res["samples"]} 次，Ctrl+Shift+S 累计发送 '
+                     f'{res["key_sends"]} 次（逐拍读数见上方 [采样] 行）')
+    after_sig = res['sig']
     sep_ok, sep_detail = _check_separation(before_sig, after_sig)
     if not sep_ok:
-        return _fail(f'分离音频失败：{sep_detail}')
+        return _fail(f'分离音频失败：终态质检未通过 —— {sep_detail}'
+                     f'（稳定落盘 @ {_fmt_ts(res["stable_at"])}，'
+                     f'采样 {res["samples"]} 次）')
     dprint(f"  ✅ 分离校验通过: {sep_detail}"
            f"（videos {before_sig['n_videos']}→{after_sig['n_videos']}，"
            f"主轨 {before_sig['main_segments']}→"
-           f"{after_sig['track_index'][before_sig['main_id']]['n_segments']} 段）")
+           f"{after_sig['track_index'][before_sig['main_id']]['n_segments']} 段；"
+           f"稳定落盘 @ {_fmt_ts(res['stable_at'])}，采样 {res['samples']} 次，"
+           f"Ctrl+Shift+S 累计 {res['key_sends']} 次）")
 
     # 界面侧只用于定位"分离出的音频行"供落盘；定位不到不影响成功判定
     rows1, img1, WL1, WT1, WW1, eye_x1, win = _safe_scan(win)
@@ -488,7 +673,21 @@ def run_extract_audio(workdir: str = ".", timeout_sec: int = 30) -> dict:
     restore_result = restore_all_tracks(win, scan_hint=hint)
     if not restore_result.get('ok'):
         reason = restore_result.get('reason')
-        if reason == 'scroll_unavailable':
+        if reason == 'lock_unresponsive':
+            detail = '; '.join(
+                f"{u.get('kind')}@ymid={u.get('click_ymid')}"
+                f"(type={(u.get('evidence') or {}).get('type')},"
+                f"track={(u.get('evidence') or {}).get('track_guess')})"
+                for u in (restore_result.get('unresponsive') or []))
+            err = ('恢复轨道失败：点击前已重扫定位（排除坐标过期），点击后状态仍不翻转，'
+                   f'判定该行不响应锁列/眼睛点击，已停止盲点。明细: {detail}')
+        elif reason == 'coverage_insufficient':
+            pre = restore_result.get('prescan') or {}
+            err = (f"恢复轨道失败：恢复前覆盖预扫只扫到 {pre.get('count')}/"
+                   f"{restore_result.get('expected_tracks')} 条轨道"
+                   f"（steps={pre.get('steps')}，ambiguous={pre.get('ambiguous')}），"
+                   '未达到全量覆盖，已按约定一次都不点（请人工滚动时间线后复跑）')
+        elif reason == 'scroll_unavailable':
             err = ('恢复轨道失败：仍有轨道在时间线可视区外，滚轮/滚动条/键盘均无法滚动，'
                    '无法判定是锁定还是不可见（请人工滚动时间线后复跑）')
         else:
@@ -499,21 +698,26 @@ def run_extract_audio(workdir: str = ".", timeout_sec: int = 30) -> dict:
         return {'ok': False, 'duration_s': round(time.time() - t0, 1),
                 'error': err, 'restore': restore_result}
 
-    # --- Step 6: 只隐藏中文字幕轨（从上到下第二条字幕轨）---
-    dprint("\n[6/6] 隐藏中文字幕轨（从上到下第二条）")
-    # 字幕轨 y 坐标与 [4/6] 那次扫描一致（隐藏/解锁都不引起行位移，已在 5.9 实测）
-    # → 优先复用，避免再跑一次 ~10s 的 scan_tracks；簇形态不符则回退完整扫描
-    subs2, eye_x = _subs_from_hint(hint)
-    if subs2 is None:
-        dprint("  [fallback] 复用行形态不符（顶部簇≠2 行），回退完整扫描")
-        subs2, eye_x, win = _top_text_cluster(win)
-    type_overrides = {}
-    if len(subs2) >= 2:
-        zh = subs2[1]
-        type_overrides[zh['ymid']] = 'text'   # 隐藏后采不到像素，落盘时补正类型
-        _set_row_hidden(win, eye_x, zh['ymid'], True, f"中文字幕轨 ymid={zh['ymid']}")
-    else:
-        dprint(f"  ⚠️ 字幕轨簇只有 {len(subs2)} 条，无法定位中文轨，跳过")
+    # --- Step 6: 先回顶层，再只隐藏中文字幕轨（顶层两条 text 轨中从上到下第二条）---
+    dprint("\n[6/6] 回顶层 → 隐藏中文字幕轨（从上到下第二条）")
+    # 为什么必须先回顶：分离音频后时间线可能停在下方轨道，复用分离前的旧 ymid 会点到
+    # 别的行（上一轮点到了 sticker 轨）。这里先滚到顶，再以**当前扫描**的坐标点，一次都不猜。
+    top_ok, top_why = _scroll_to_top(win)
+    if not top_ok:
+        return _fail(f'隐藏字幕轨失败：top_not_reached —— {top_why}；一次都不点')
+    subs2, eye_x, win, cluster_why = _top_text_cluster_checked(win)
+    if cluster_why:
+        return _fail(f'隐藏字幕轨失败：top_cluster_mismatch —— {cluster_why}；'
+                     f'一次都不点')
+    zh = subs2[1]
+    type_overrides = {zh['ymid']: 'text'}   # 隐藏后采不到像素，落盘时补正类型
+    dprint(f"  中文字幕轨候选: 顶层 text 簇 ymid={[r['ymid'] for r in subs2]} "
+           f"→ 取第 2 行 ymid={zh['ymid']}")
+    _set_row_hidden(win, eye_x, zh['ymid'], True, f"中文字幕轨 ymid={zh['ymid']}")
+    hid_ok, hid_why, win = _verify_zh_hidden(win, zh['ymid'])
+    if not hid_ok:
+        return _fail(f'隐藏字幕轨失败：终态质检未通过 —— {hid_why}')
+    dprint(f"  ✅ 中文字幕轨已隐藏（命中 ymid={zh['ymid']}，{hid_why}）")
 
     # --- Step 7: 最终布局落盘（全程唯一一次完整 scan_tracks）---
     dprint("\n[7/7] 最终轨道布局写入 ui_calibration.json")
@@ -532,7 +736,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--workdir', default='.')
-    parser.add_argument('--timeout', type=int, default=30)
+    parser.add_argument('--timeout', type=float, default=TERMINAL_TIMEOUT_S)
     args = parser.parse_args()
     result = run_extract_audio(workdir=args.workdir, timeout_sec=args.timeout)
     print(f"\n结果: {result}")

@@ -771,6 +771,148 @@ def _draft_track_count() -> int:
         return 0
 
 
+def _draft_track_ledger() -> list:
+    """draft_content.json 轨道台账（取证用）：按数组顺序列出 idx/type/attribute/段数。
+
+    数组自下而上：idx 0 = 时间线最底部（主轨）。读不到草稿返回 []（不阻断）。
+    """
+    try:
+        from ui_recognize_translate import DRAFT_ROOT, _active_draft_name
+        name = _active_draft_name()
+        if not name:
+            return []
+        p = os.path.join(DRAFT_ROOT, name, 'draft_content.json')
+        with open(p, encoding='utf-8') as f:
+            d = json.load(f)
+        return [{'idx': i, 'type': t.get('type'), 'attribute': t.get('attribute'),
+                 'segments': len(t.get('segments') or [])}
+                for i, t in enumerate(d.get('tracks') or [])]
+    except Exception as e:
+        dprint(f"  ⚠️ 读取草稿轨道台账失败（{type(e).__name__}: {e}）")
+        return []
+
+
+def _band_at(ymid, rows, tol=10):
+    """在行带列表里找 ymid 对应的行：优先判定 ymid 是否落在某行带内（±tol），
+    否则取中心最近且距离 ≤ tol 的行。找不到返回 None（该行可能已滚出视口）。"""
+    for r in rows or []:
+        if r['y_top'] - tol <= ymid <= r['y_bot'] + tol:
+            return r
+    best = None
+    for r in rows or []:
+        d = abs(r['ymid'] - ymid)
+        if d <= tol and (best is None or d < abs(best['ymid'] - ymid)):
+            best = r
+    return best
+
+
+def _type_at(ymid, fresh_rows, rows_hint):
+    """该 ymid 的行类型：先看本次重扫（轻扫 type 恒为 unknown），退回上一轮完整扫描。"""
+    band = _band_at(ymid, fresh_rows, 10)
+    if band and band.get('type') not in (None, 'unknown'):
+        return band['type']
+    if rows_hint:
+        cand = min(rows_hint, key=lambda r: abs(r['ymid'] - ymid))
+        if abs(cand['ymid'] - ymid) <= 40:
+            return cand.get('type')
+    return band.get('type') if band else None
+
+
+def _guess_track_index(ymid, screen_rows, ledger):
+    """屏幕行 → 草稿轨序号猜测（数组自下而上：屏幕最上一行 = 最高 idx）。
+    只有屏幕行数与草稿轨数一致时才给猜测，否则 None（绝不硬猜）。"""
+    if not ledger or not screen_rows or len(screen_rows) != len(ledger):
+        return None
+    idx = next((i for i, r in enumerate(screen_rows) if r['ymid'] == ymid), None)
+    if idx is None:
+        return None
+    return len(ledger) - 1 - idx
+
+
+def _lock_strip_evidence(img, WT, ymid) -> dict:
+    """锁列条带取证：RGB 均值 + 蓝像素（判断"看着像锁着"是否有像素依据）。"""
+    strip = get_param('track_header', 'lock_strip', [38, 62])
+    mean = _strip_mean(img, WT, ymid, strip)
+    return {'lock_mean': [round(float(v), 1) for v in mean] if mean is not None else None,
+            'lock_blue': _strip_blue_count(img, WT, ymid, strip)}
+
+
+def _row_target_state(img, WL, WT, WW, kind, ymid) -> bool:
+    """目标状态是否已达成：lock → 不再锁定；eye → 不再隐藏。"""
+    if kind == 'lock':
+        return not is_row_locked(img, WT, ymid)
+    return not is_row_hidden(img, WL, WT, WW, ymid)
+
+
+def _restore_dirty_row(win, kind, y_prev, rows_hint, lock_x, eye_x,
+                       ledger=None, max_attempts=2, tol=10) -> dict:
+    """恢复单行：**点击前重扫** → 用扫描到的当前位置 → 点击 → 立即复检。
+
+    把两种"点了没生效"分开（用户口径）：
+      ① 坐标过期：重扫发现整摞位移，旧 ymid 已落不到那一行 → 改用扫描到的 ymid，
+         drifted=True / shift=位移，日志据此确认是旧坐标问题；
+      ② 行本身不响应：重扫命中同一位置（无位移），点击后像素状态仍不翻转 →
+         不再盲点，返回 reason='unresponsive' + 取证（type/hidden/锁列像素/点击坐标）。
+    返回 {'ok','kind','prev_ymid','click_ymid','click_x','drifted','shift','attempts',
+          'reason','evidence'}。
+    """
+    res = {'ok': False, 'kind': kind, 'prev_ymid': int(y_prev), 'click_ymid': None,
+           'click_x': int(lock_x if kind == 'lock' else eye_x), 'drifted': False,
+           'shift': 0, 'attempts': 0, 'reason': 'not_run', 'evidence': {}}
+    x = res['click_x']
+    target = int(y_prev)
+
+    while res['attempts'] < max_attempts:
+        WL, WT, WW, WH = get_window_rect(win)
+        fresh, _tr, img, _wl, _wt = _light_scan(win)
+        if not fresh or img is None:
+            res['reason'] = 'no_image'
+            return res
+        band = _band_at(target, fresh, tol)
+        if band is None:
+            shift = _estimate_vshift([r['ymid'] for r in (rows_hint or [])],
+                                     [r['ymid'] for r in fresh])
+            moved = _band_at(target + shift, fresh, tol) if shift else None
+            if moved is None:
+                res['reason'] = 'row_lost'
+                return res
+            res['drifted'] = True
+            res['shift'] = int(moved['ymid']) - int(y_prev)
+            target = int(moved['ymid'])
+        else:
+            if abs(band['ymid'] - target) > 2:
+                res['drifted'] = True
+                res['shift'] = int(band['ymid']) - int(y_prev)
+            target = int(band['ymid'])
+        res['click_ymid'] = target
+        ev = _lock_strip_evidence(img, WT, target)
+        ev['type'] = _type_at(target, fresh, rows_hint)
+        ev['hidden'] = bool(band.get('hidden'))
+        ev['track_guess'] = _guess_track_index(target, rows_hint, ledger)
+        res['evidence'] = ev
+
+        if _row_target_state(img, WL, WT, WW, kind, target):
+            res.update(ok=True, reason='already')
+            return res
+
+        res['attempts'] += 1
+        op_mark('点击锁定' if kind == 'lock' else '点击眼睛',
+                f'ymid={target} → {"解锁" if kind == "lock" else "恢复可见"} '
+                f'@({x},{target}) 尝试{res["attempts"]}（点击前重扫）')
+        dprint(f"  点击{'锁定' if kind == 'lock' else '眼睛'} @({x},{target}) "
+               f"尝试{res['attempts']}（点击前重扫命中 ymid={target}）")
+        pyautogui.click(x, target)
+        time.sleep(0.5 if kind == 'lock' else 0.7)
+        img2 = np.array(capture_region(WL, WT, WW, WH))
+        if _row_target_state(img2, WL, WT, WW, kind, target):
+            res.update(ok=True, reason='flipped')
+            return res
+        # 未翻转：下一轮循环重扫，若行又漂移会重新对齐（①），否则继续判不响应（②）
+
+    res['reason'] = 'unresponsive'
+    return res
+
+
 def _estimate_vshift(pre_ymids, post_ymids, tol=6) -> int:
     """滚动前后整摞轨道的纵向位移（post - pre），用于平移跨滚动累计的覆盖坐标。
 
@@ -790,11 +932,87 @@ def _estimate_vshift(pre_ymids, post_ymids, tol=6) -> int:
     return best_d if best_m >= 2 else 0
 
 
+def _count_distinct_ys(ys, tol=10) -> List[float]:
+    """把一组 y 坐标按容差聚类，返回聚类中心列表（用于累计"见过几行"）。"""
+    out: List[float] = []
+    for y in sorted(float(v) for v in ys):
+        if not out or y - out[-1] > tol:
+            out.append(y)
+    return out
+
+
+def _prescan_track_coverage(win, expected_tracks, max_steps=12) -> dict:
+    """恢复前覆盖预扫：**只扫不点**，滚遍整条时间线确认全部轨道都能扫到。
+
+    用户口径：覆盖不够就不许动手。上一轮只复用 4 行扫描就硬点（3/8 覆盖），
+    ymid=855 点 2 次判 unresponsive，本质是"只看得见 3 行还在硬干"。
+
+    计数：每次滚动后用整摞位移把已见行坐标平移到新视口再并入当前行；
+    位移估计失败（无法对齐累计坐标）时不猜，最终判覆盖证伪。
+    返回 {'ok','count','steps','ambiguous','reason'}。
+    """
+    rows, _img, _wl, _wt, _ww, _eye = scan_tracks(win)
+    if not rows:
+        return {'ok': False, 'count': 0, 'steps': 0, 'ambiguous': False,
+                'reason': 'no_rows'}
+    acc = [float(r['ymid']) for r in rows]
+    uniq = _count_distinct_ys(acc)
+    dprint(f"  覆盖预扫起点: 本屏 {len(rows)} 行，累计不同行 "
+           f"{len(uniq)}/{expected_tracks or '?'}")
+    if expected_tracks and len(uniq) >= expected_tracks:
+        return {'ok': True, 'count': len(uniq), 'steps': 0,
+                'ambiguous': False, 'reason': 'ok'}
+
+    done = {'up': False, 'down': False}
+    steps = 0
+    ambiguous = False
+    direction = 'up'
+    while steps < max_steps and not (done['up'] and done['down']):
+        if done[direction]:
+            direction = 'down'
+            if done['down']:
+                break
+        pre = [r['ymid'] for r in rows]
+        rr = scroll_timeline_vertical(win, direction)
+        steps += 1
+        if not rr.get('ok'):
+            done[direction] = True
+            dprint(f"  覆盖预扫[{direction}] 滚不动（{rr.get('reason')}）→ 该端到头")
+            continue
+        rows, _img, _wl, _wt, _ww, _eye = scan_tracks(win)
+        if not rows:
+            continue
+        shift = _estimate_vshift(pre, [r['ymid'] for r in rows])
+        if shift:
+            acc = [y + shift for y in acc]
+        else:
+            ambiguous = True
+            dprint(f"  ⚠️ 覆盖预扫[{direction}] 位移估计失败，累计坐标无法对齐")
+        acc.extend(float(r['ymid']) for r in rows)
+        uniq = _count_distinct_ys(acc)
+        dprint(f"  覆盖预扫[{direction}] 第{steps}步: 本屏 {len(rows)} 行，"
+               f"累计不同行 {len(uniq)}/{expected_tracks or '?'}")
+        if expected_tracks and len(uniq) >= expected_tracks:
+            return {'ok': True, 'count': len(uniq), 'steps': steps,
+                    'ambiguous': ambiguous, 'reason': 'ok'}
+
+    ok = (not expected_tracks) or (len(uniq) >= expected_tracks and not ambiguous)
+    if not ok:
+        dprint(f"  ❌ 覆盖预扫不足：累计 {len(uniq)}/{expected_tracks or '?'} 行"
+               f"（ambiguous={ambiguous}，steps={steps}）→ 不允许开始点击")
+    return {'ok': ok, 'count': len(uniq), 'steps': steps,
+            'ambiguous': ambiguous, 'reason': 'ok' if ok else 'coverage_insufficient'}
+
+
 def restore_all_tracks(win, max_rounds=6, scan_hint=None, expected_tracks=None) -> dict:
     """
-    收尾合并操作：边扫边解锁/恢复可见，边滚边累计覆盖，最后终验。
+    收尾合并操作：**先覆盖预扫（只扫不点）**，确认能扫到全部轨道后，再边扫边
+    解锁/恢复可见，边滚边累计覆盖，最后终验。
 
-    判据（取代旧的"一屏齐活"）：
+    判据：
+      ⓪ 恢复前预扫：滚遍时间线累计不同行，覆盖 < expected_tracks 直接返回
+         reason='coverage_insufficient'，**一次都不点**。不再复用调用方那 4 行
+         局部扫描（上一轮 3/8 覆盖硬点就是它导致的）。
       ① 每轮只处理**当前可视区**里的脏行：锁定行点锁列、隐藏行点眼睛列，
          点后轻量复检；复检不干净就下一轮重扫重试（行可能漂移）。
       ② 可视区干净后向未走到的方向滚一屏，把视口外的轨道滚进来继续处理；
@@ -804,9 +1022,10 @@ def restore_all_tracks(win, max_rounds=6, scan_hint=None, expected_tracks=None) 
       ④ 上下两端都滚不动仍覆盖不足 → reason='scroll_unavailable'（看不见 ≠ 锁着），
          上层据此落 track_restore_failed，不再混进 unknown。
 
-    scan_hint=(rows, img, WL, WT, WW, eye_x)：复用调用方刚扫过的结果。
+    scan_hint 仅在读不到草稿轨道数（expected_tracks=0）时兜底复用。
     返回 {'unlocked','unhidden','ok','reason','still_locked','still_hidden',
-          'scroll_unavailable','scroll_tried','drift_rounds','covered','expected_tracks'}
+          'scroll_unavailable','scroll_tried','drift_rounds','covered',
+          'expected_tracks','prescan'}
     """
     from ui_calibration import get_param
     WL, WT, WW, WH = get_window_rect(win)
@@ -818,6 +1037,11 @@ def restore_all_tracks(win, max_rounds=6, scan_hint=None, expected_tracks=None) 
     expected_tracks = int(expected_tracks or 0)
     if expected_tracks:
         dprint(f"  预期轨道数 = {expected_tracks}（draft_content.json tracks 长度）")
+    ledger = _draft_track_ledger()
+    if ledger:
+        dprint(f"  草稿轨道台账（数组自下而上，idx0=时间线最底部）: {ledger}")
+    else:
+        dprint("  ⚠️ 草稿轨道台账为空（无法把屏幕行映射回 draft 轨序号）")
 
     total_unlocked = total_unhidden = 0
     covered = set()          # 已确认干净的轨道（ymid，滚动后按位移补偿）
@@ -828,11 +1052,28 @@ def restore_all_tracks(win, max_rounds=6, scan_hint=None, expected_tracks=None) 
     scroll_unavailable = False
     still_locked: List[int] = []
     still_hidden: List[int] = []
+    unresponsive_rows: List[dict] = []
     rows = img = eye_x = None
     tr = _safe_timeline_rect(win)
-    if scan_hint and scan_hint[0]:
+
+    # ⓪ 覆盖预扫（只扫不点）：必须先把全部轨道滚进视野，覆盖不足一次都不点。
+    #    不再复用调用方 scan_hint —— 上一轮复用的 4 行只覆盖 3/8，却照着硬点。
+    prescan = {'ok': True, 'count': 0, 'steps': 0, 'ambiguous': False,
+               'reason': 'skipped'}
+    if expected_tracks:
+        prescan = _prescan_track_coverage(win, expected_tracks)
+        dprint(f"  覆盖预扫结果: {prescan}")
+        if not prescan.get('ok'):
+            return {'unlocked': 0, 'unhidden': 0, 'ok': False,
+                    'reason': 'coverage_insufficient',
+                    'still_locked': [], 'still_hidden': [],
+                    'scroll_unavailable': False, 'scroll_tried': [],
+                    'drift_rounds': 0, 'covered': [],
+                    'expected_tracks': expected_tracks,
+                    'unresponsive': [], 'ledger': ledger, 'prescan': prescan}
+    elif scan_hint and scan_hint[0]:
         rows, img, eye_x = scan_hint[0], scan_hint[1], scan_hint[5]
-        dprint(f"  [reuse] 复用上一阶段轨道扫描（{len(rows)} 行，跳过入口 scan_tracks）")
+        dprint(f"  [reuse] 未读到草稿轨道数，仅此情况复用上一阶段扫描（{len(rows)} 行）")
 
     for rnd in range(max_rounds):
         if rows is None:
@@ -859,22 +1100,36 @@ def restore_all_tracks(win, max_rounds=6, scan_hint=None, expected_tracks=None) 
         locked = [r['ymid'] for r in in_view if is_row_locked(img, WT, r['ymid'])]
         hidden = [r['ymid'] for r in in_view if r['hidden']]
 
-        if locked:
-            dprint(f"  解锁 {len(locked)} 行: {locked}")
-            for y in locked:
-                op_mark('点击锁定', f'ymid={y} → 解锁 @({lock_x},{y}) 尝试1')
-                pyautogui.click(lock_x, y)
-                time.sleep(0.4)
-            time.sleep(0.6)
-            total_unlocked += len(locked)
-        if hidden:
-            dprint(f"  恢复可见 {len(hidden)} 行: {hidden}")
-            for y in sorted(hidden, reverse=True):   # 下→上，避免行高变化带偏后续 y
-                op_mark('点击眼睛', f'ymid={y} → 恢复可见 @({eye_x},{y}) 尝试1')
-                pyautogui.click(eye_x, y)
-                time.sleep(0.4)
-            time.sleep(0.6)
-            total_unhidden += len(hidden)
+        # 逐行恢复：每次点击前重扫定位（防坐标过期），点击后立即复检（防假成功）
+        dirty = [('lock', y) for y in locked] + [('eye', y) for y in hidden]
+        unresponsive = []
+        for kind, y in dirty:
+            rr = _restore_dirty_row(win, kind, y, rows, lock_x, eye_x, ledger)
+            if rr.get('drifted'):
+                dprint(f"  📍 坐标修正[{kind}]：上一轮 ymid={rr['prev_ymid']} → "
+                       f"点击前重扫 ymid={rr['click_ymid']}（位移 {rr['shift']:+d}px，"
+                       f"旧坐标已过期）")
+            if rr['ok']:
+                if kind == 'lock':
+                    total_unlocked += 1
+                else:
+                    total_unhidden += 1
+                dprint(f"  {'🔓' if kind == 'lock' else '👁'} {kind} 已恢复 "
+                       f"ymid={rr['click_ymid']}（尝试{rr['attempts']}次，{rr['reason']}）")
+            else:
+                unresponsive.append(rr)
+                ev = rr.get('evidence') or {}
+                dprint(f"  ❌ {kind} 点击无效 ymid={rr['prev_ymid']}"
+                       f"（点击前重扫 ymid={rr.get('click_ymid')}）reason={rr['reason']} "
+                       f"尝试{rr['attempts']}次 坐标=({rr.get('click_x')},{rr.get('click_ymid')}) "
+                       f"type={ev.get('type')} hidden={ev.get('hidden')} "
+                       f"锁定条带均值={ev.get('lock_mean')} 蓝像素={ev.get('lock_blue')} "
+                       f"草稿轨猜测={ev.get('track_guess')}")
+        if unresponsive:
+            # 不再"点一次再看还是锁着"地空转：同一行重扫命中同一位置且点击无效即停
+            unresponsive_rows = unresponsive
+            rows = None
+            break
 
         # ② 轻量复检 + 本轮覆盖累计（点击后行可能漂移，先重排再判）
         time.sleep(0.8)
@@ -950,17 +1205,34 @@ def restore_all_tracks(win, max_rounds=6, scan_hint=None, expected_tracks=None) 
             covered.update(r['ymid'] for r in in_view
                            if r['ymid'] not in still_locked and r['ymid'] not in still_hidden)
 
+    # 终验若已把"不响应"的行判干净（点击延迟生效），从失败明细里剔除；
+    # 仍脏或已滚出可视区（无法确认）的保留——宁可判失败也不虚报
+    if unresponsive_rows and not clean_confirmed:
+        dirty_now = set(still_locked) | set(still_hidden)
+        in_view_now = {r['ymid'] for r in (rows2 or [])}
+        kept = []
+        for u in unresponsive_rows:
+            y = u.get('click_ymid')
+            if y in dirty_now or y not in in_view_now:
+                kept.append(u)
+            else:
+                dprint(f"  ℹ️ ymid={y} 终验已干净（点击延迟生效），不计入不响应")
+        unresponsive_rows = kept
+
     # 覆盖不足 = 有轨道始终没被滚进可视区/没被扫到（不是"锁定"，也不能判绿）
     if expected_tracks and len(covered) < expected_tracks:
         scroll_unavailable = True
         dprint(f"  ⚠️ 覆盖不足：已确认干净 {len(covered)}/{expected_tracks} 条轨道，"
                f"缺失轨道仍在可视区外或未被扫到（看不见 ≠ 已解锁）")
 
-    ok = not scroll_unavailable and not still_locked and not still_hidden
+    ok = (not scroll_unavailable and not still_locked and not still_hidden
+          and not unresponsive_rows)
 
-    # 结论分类：把"看不见"和"真锁着"分开
+    # 结论分类：把"看不见"、"不响应"和"真锁着"分开
     if ok:
         reason = 'clean'
+    elif unresponsive_rows:
+        reason = 'lock_unresponsive'
     elif still_locked or still_hidden:
         reason = 'still_dirty'
     elif scroll_unavailable:
@@ -971,6 +1243,11 @@ def restore_all_tracks(win, max_rounds=6, scan_hint=None, expected_tracks=None) 
     if reason == 'clean':
         dprint(f"  ✅ 收尾完成：解锁 {total_unlocked} 行、恢复可见 {total_unhidden} 行，"
                f"覆盖 {len(covered)}/{expected_tracks or '?'} 条轨道")
+    elif reason == 'lock_unresponsive':
+        dprint(f"  ❌ 有 {len(unresponsive_rows)} 行点击后状态不翻转（重扫命中同一位置，"
+               f"不是坐标过期）："
+               f"{[(u['kind'], u.get('click_ymid'), (u.get('evidence') or {}).get('type')) for u in unresponsive_rows]}"
+               f" → 判定该行不响应锁列/眼睛点击，已停止盲点")
     elif reason == 'scroll_unavailable':
         dprint("  ⚠️ 有轨道不在可视区，且三种滚动模态都滚不到："
                "这是「看不见」，不能判成「锁定」；需人工滚动后复跑")
@@ -978,7 +1255,8 @@ def restore_all_tracks(win, max_rounds=6, scan_hint=None, expected_tracks=None) 
             'reason': reason, 'still_locked': still_locked, 'still_hidden': still_hidden,
             'scroll_unavailable': scroll_unavailable, 'scroll_tried': scroll_tried,
             'drift_rounds': drift_rounds, 'covered': sorted(covered),
-            'expected_tracks': expected_tracks}
+            'expected_tracks': expected_tracks, 'unresponsive': unresponsive_rows,
+            'ledger': ledger, 'prescan': prescan}
 
 
 def hide_text_tracks_only(win) -> List[int]:
@@ -1059,11 +1337,21 @@ def _strip_mean(img, WT, ymid, strip, half_h=12):
 
 def is_row_locked(img, WT, ymid) -> bool:
     """
-    锁定态检测：
-      ① 若准入已学习 lock_on_mean / lock_off_mean → RGB 均值最近邻（可靠）
-      ② 否则退回蓝像素规则（签名为校准前的临时值，可能误判）
+    锁定态检测（**蓝像素为主判据**）：
+      ① 蓝像素 >= 阈值 → 确实锁着（真锁时蓝量充足，判据不退化）；
+      ② 蓝像素 == 0 → 一定没锁。深色轨道底色的亮度条带不作为锁态依据
+         （上一轮 ymid=855 就是被 lock_on_mean 亮度最近邻误判成"已锁"，
+         点击后状态不翻转，被判 unresponsive）；
+      ③ 0 < 蓝像素 < 阈值（弱蓝，图标边缘/半透明）→ 有已学习签名时用 RGB
+         最近邻兜底，否则按未锁处理。
     """
     strip = get_param('track_header', 'lock_strip', [38, 62])
+    thresh = int(get_param('track_header', 'lock_blue_threshold', 8))
+    n_blue = _strip_blue_count(img, WT, ymid, strip)
+    if n_blue >= thresh:
+        return True
+    if n_blue == 0:
+        return False
     on = get_param('track_header', 'lock_on_mean', None)
     off = get_param('track_header', 'lock_off_mean', None)
     cur = _strip_mean(img, WT, ymid, strip)
@@ -1071,8 +1359,7 @@ def is_row_locked(img, WT, ymid) -> bool:
         d_on = float(np.linalg.norm(cur - np.array(on, dtype=float)))
         d_off = float(np.linalg.norm(cur - np.array(off, dtype=float)))
         return d_on < d_off
-    return _strip_blue_count(img, WT, ymid, strip) >= int(
-        get_param('track_header', 'lock_blue_threshold', 8))
+    return False
 
 
 def lock_track(win, ymid, want_locked=True, max_retry=3) -> bool:

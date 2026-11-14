@@ -92,6 +92,87 @@ def _taskkill(force: bool) -> None:
         pass
 
 
+# 启动失败后需要清掉的残留辅助进程（剪映本体 + 环境检测器 + 崩溃上报）。
+# 只按固定镜像名处理，避免误杀其它程序；crashpad_handler 同名进程很多，
+# 必须按可执行文件/命令行路径里是否含剪映目录来判定。
+RESIDUAL_IMAGES = ('VEDetector.exe', 'CrashSender.exe')
+_CRASHPAD_NAMES = ('crashpad_handler.exe',)
+_JY_PATH_MARKS = ('jianying', 'lveditor', 'videofusion')
+
+
+def _process_pids(images: tuple[str, ...]) -> dict[str, list[int]]:
+    """按镜像名收集 pid；psutil 不可用时返回空（调用方会退 tasklist）。"""
+    want = {n.lower() for n in images}
+    out: dict[str, list[int]] = {}
+    try:
+        import psutil
+        for p in psutil.process_iter(['name']):
+            n = (p.info.get('name') or '').lower()
+            if n in want:
+                out.setdefault(n, []).append(p.pid)
+    except Exception:
+        pass
+    return out
+
+
+def _crashpad_jianying_pids() -> list[int]:
+    """只挑剪映自己的 crashpad_handler（按 exe / cmdline 路径判定）。"""
+    pids: list[int] = []
+    try:
+        import psutil
+        for p in psutil.process_iter(['name', 'exe', 'cmdline']):
+            if (p.info.get('name') or '').lower() not in _CRASHPAD_NAMES:
+                continue
+            blob = ' '.join([p.info.get('exe') or ''] +
+                            list(p.info.get('cmdline') or [])).lower()
+            if any(m in blob for m in _JY_PATH_MARKS):
+                pids.append(p.pid)
+    except Exception:
+        pass
+    return pids
+
+
+def _kill_pids(pids: list[int]) -> None:
+    for pid in pids:
+        try:
+            subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'],
+                           capture_output=True, timeout=10, creationflags=_NO_WINDOW)
+        except Exception:
+            pass
+
+
+def clean_launch_residuals(wait_s: float = 5.0,
+                           log_fn: Optional[Callable[[str], None]] = None) -> list[str]:
+    """重拉前清残留：结束上次启动留下的检测器/崩溃上报/残留剪映进程。
+
+    只清理固定镜像名（JianyingPro / VEDetector / CrashSender）与剪映目录下的
+    crashpad_handler；进程本就不在时不做任何动作。返回被清理的镜像名列表，
+    供启动层把「清过什么」写进日志/台账（而不是静默）。
+    """
+    log = log_fn or (lambda _m: None)
+    found = _process_pids((EXE_NAME,) + RESIDUAL_IMAGES)
+    crashpads = _crashpad_jianying_pids()
+    if not found and not crashpads:
+        return []
+    cleaned: list[str] = []
+    for name, pids in found.items():
+        _kill_pids(pids)
+        cleaned.append(name)
+        log(f'  [cleanup] 结束残留进程 {name}（pid={",".join(map(str, pids))}）')
+    if crashpads:
+        _kill_pids(crashpads)
+        cleaned.append('crashpad_handler.exe')
+        log(f'  [cleanup] 结束剪映 crashpad_handler（pid={",".join(map(str, crashpads))}）')
+    deadline = time.time() + max(0.0, float(wait_s))
+    while time.time() < deadline:
+        left = _process_pids((EXE_NAME,) + RESIDUAL_IMAGES)
+        if not left and not _crashpad_jianying_pids():
+            break
+        time.sleep(0.2)
+    log(f'  [cleanup] 残留已清: {", ".join(cleaned)}')
+    return cleaned
+
+
 def stop_jianying(grace_s: float = 20.0, force: bool = False,
                   log_fn: Optional[Callable[[str], None]] = None,
                   allow_force: bool = True) -> bool:

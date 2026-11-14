@@ -53,23 +53,26 @@ if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 import jianying_launch as jl  # noqa: E402
 import jianying_proc as jp  # noqa: E402
+import jy_page_detect as jpd  # noqa: E402  （窗口枚举/判页/可交互的唯一实现）
 
 STATES = ("stopped", "launching", "home", "editing", "exporting")
 PROCESS_NAME = "jianyingpro.exe"
 
+# 分段耗时观测开关（只影响日志输出，不影响判据/超时/重试）
+_PROBE_TRACE = os.environ.get("JY_PROBE_TRACE") == "1"
+
 
 def _pick_main_window(children, pids):
-    """从顶层窗口里挑剪映主窗口：进程名 + ClassName 双条件，不依赖中文标题。
+    """从顶层窗口里挑剪映主窗口：进程名 + 类名（统一走 jy_page_detect 的可配置集合）。
 
-    界面语言/版本改名时中文 Name 匹配会落空；ClassName 里的 MainWindow/
-    HomePage 与进程名是稳定的，可作为兜底。保持纯函数便于单测。
+    界面语言/版本改名时中文 Name 匹配会落空；类名匹配集涵盖
+    HomePage_QMLTYPE_* / MainWindow_QMLTYPE_* / Qt*QWindowIcon，可作为稳定兜底。
     """
     for c in children:
         try:
             if pids and getattr(c, "ProcessId", None) not in pids:
                 continue
-            cls = getattr(c, "ClassName", "") or ""
-            if "MainWindow" in cls or "HomePage" in cls:
+            if jpd.window_class_ok(getattr(c, "ClassName", "") or ""):
                 return c
         except Exception:
             continue
@@ -97,15 +100,8 @@ def _window_by_process(uia):
 
 
 def _is_draft_card(control, _depth=0):
-    """首页草稿卡片：LegacyIAccessible.Description = HomePageDraftTitle:<草稿名>。
-
-    与 robust_auto_export.open_draft 的卡片判定同源，用来验证首页真的渲染出了
-    可交互内容（而不是只有一个 HomePage 类名的空壳/卡死窗口）。
-    """
-    try:
-        return str(control.GetPropertyValue(30159) or "").startswith("HomePageDraftTitle:")
-    except Exception:
-        return False
+    """首页草稿卡片（口径统一在 jy_page_detect，保留本名供既有引用）。"""
+    return jpd._is_draft_card(control)
 
 # ── 启动即死检测（口径统一在 jianying_launch，模块内保留同名别名供调用方引用）──
 EARLY_DEATH_WINDOW_S = jl.EARLY_DEATH_WINDOW_S
@@ -180,6 +176,31 @@ class UIABackend(Backend):
         self.window = None
         # 启动日志出口：JyInstance 会把它绑到管理器同一输出口（导出链的 dprint）
         self.log: Callable[[str], None] = print
+        # 分段计时观测：首次"判出页面"/"可交互通过"的 epoch 秒（只记录，不影响判据）
+        self.timing: dict[str, float] = {}
+        # 最近一次激活（rebind_window 内 activate_window 的原始返回，排障用）
+        self.last_activation: dict = {}
+
+    def _stamp(self, key: str, cond: bool) -> None:
+        """计时观测（不改判据）：条件首次为真时记时刻，后续不覆盖。"""
+        if cond and key not in self.timing:
+            self.timing[key] = time.time()
+
+    def _note_window(self, hwnd: int = 0) -> None:
+        """计时观测：首次绑定到主窗口的 epoch 时刻（只记录，不参与任何判定）。"""
+        if 'window_first' not in self.timing:
+            self.timing['window_first'] = time.time()
+            self.timing['window_hwnd'] = int(hwnd or 0)
+
+    def _trace(self, stage: str, ts: float, ret: Any = '-', err: str = '-') -> None:
+        """分段耗时观测（仅 JY_PROBE_TRACE=1 时输出；不改判据/超时/重试）。"""
+        if not _PROBE_TRACE:
+            return
+        try:
+            self.log(f"[probe-trace] {stage} start={ts:.3f} "
+                     f"dur={time.time() - ts:.3f}s ret={ret} err={err}")
+        except Exception:
+            pass
 
     def _u(self):
         if self._uia is None:
@@ -210,66 +231,116 @@ class UIABackend(Backend):
         return False
 
     def window_exists(self) -> bool:
+        """窗口是否存在：纯 Win32 枚举（毫秒级，与判页层同源）。
+
+        原实现走 `_main_window()`：Win32 枚举为空时会退到 UIA 按名搜索，实测每次
+        固定 ~20s。冷启动「还没建窗」阶段每轮探针都被拖 20s，顺带把启动层的检测器
+        停滞判死饿死（探不到 5s 采样间隔）。窗口存在性本来就不需要 UIA。
+        """
         try:
-            return bool(self._main_window())
+            return bool(jpd.any_jianying_window())
         except Exception:
             return False
 
     def _main_window(self):
         """剪映主窗口；找不到返回 None。
 
-        教训：回退用的搜索条件不是窗口。Name='导出' 只是一个查询描述，
-        未做 Exists 校验就把它当主窗口交出去，后续读 ClassName 会白等 10s
-        搜索超时（看起来像剪映假死）。任何 rebind 路径都不能跳过存在性校验。
-        中文标题只作首选：界面语言/版本改名时兜底按进程名 + ClassName 找顶层窗口。
+        首选 Win32 枚举（毫秒级）+ `ControlFromHandle` 绑定，不再对每个顶层窗口
+        做 UIA 名字搜索：`WindowControl(Name=…).Exists()` 实测每次固定 ~20.1s，
+        超过探针超时后会让"窗口明明在"被判成超时。
+        Win32 拿不到时才退回按名搜索（兜底不得跳过存在性校验）。
         """
-        uia = self._u()
-        w = uia.WindowControl(searchDepth=1, Name="剪映专业版")
-        if w.Exists(0):
-            return w
-        export_win = uia.WindowControl(searchDepth=1, Name="导出")
-        if export_win.Exists(0):
-            return export_win
-        return _window_by_process(uia)
+        _t = time.time()
+        try:
+            uia = self._u()
+            # 1) Win32 枚举：标题含「剪映」+ 类名收口（qwindowicon 等），拿到 hwnd 直接绑定
+            try:
+                for hwnd, cls, title in jpd.enum_jianying_windows():
+                    try:
+                        ctrl = uia.ControlFromHandle(hwnd)
+                    except Exception:
+                        continue
+                    if ctrl is not None:
+                        self._note_window(hwnd)
+                        self._trace('find-window', _t, ret=f'win32:{hwnd} {cls!r}')
+                        return ctrl
+            except Exception:
+                pass
+            # 2) 兜底：UIA 按窗口名搜索（仅 Win32 拿不到时走；调用方保证
+            #    已存在剪映窗口，冷启动「还没建窗」阶段不会走到这里）
+            w = uia.WindowControl(searchDepth=1, Name="剪映专业版")
+            if w.Exists(0):
+                self._note_window(getattr(w, 'NativeWindowHandle', 0))
+                self._trace('find-window', _t, ret="fallback:title='剪映专业版'")
+                return w
+            export_win = uia.WindowControl(searchDepth=1, Name="导出")
+            if export_win.Exists(0):
+                self._note_window(getattr(export_win, 'NativeWindowHandle', 0))
+                self._trace('find-window', _t, ret="fallback:title='导出'")
+                return export_win
+            found = _window_by_process(uia)
+            if found is not None:
+                self._note_window(getattr(found, 'NativeWindowHandle', 0))
+            self._trace('find-window', _t, ret=f'fallback:by-process:{bool(found)}')
+            return found
+        except Exception as e:
+            self._trace('find-window', _t, err=f'{type(e).__name__}: {e}')
+            raise
 
 
     def _home_ready(self, w) -> bool:
-        """首页「真能用」：除 ClassName 是 HomePage 外，还必须能枚举到可交互控件。
-
-        UI 假死时窗口类名仍是 HomePage_QMLTYPE_*，只看 ClassName 会把卡死实例判成
-        就绪，自愈于是 skip 掉重启。这里要求 UIA 真能读到草稿卡片（与 open_draft
-        同一 Desc 前缀），读不到再退到首页按钮/文本；UIA 调用阻塞或抛错（假死典型
-        表现）一律判不可用。外层 _probe 另有线程超时兜底。
-        """
-        try:
-            card = w.TextControl(searchDepth=6, Compare=_is_draft_card)
-            if card.Exists(0) and card.IsEnabled:
-                return True
-        except Exception:
-            pass
-        try:
-            btn = w.ButtonControl(searchDepth=6)
-            if btn.Exists(0) and btn.IsEnabled:
-                return True
-        except Exception:
-            pass
-        try:
-            return bool(w.TextControl(searchDepth=6).Exists(0))
-        except Exception:
-            return False
+        """首页「真能用」：草稿卡片/启用按钮/任意文本三级降级（口径见 jy_page_detect）。"""
+        return jpd.page_interactive(w, 'home')
 
     def is_home(self) -> bool:
+        """首页就绪：判页口径统一走 jy_page_detect（Description 特征优先）。"""
+        _t0 = time.time()
         try:
+            # 冷启动还没建窗：直接判否。否则 _main_window 的 UIA 按名兜底每次
+            # 固定 ~20s（实测），会把探针周期拖成 20s 并饿死检测器停滞判死。
+            if not jpd.any_jianying_window():
+                return False
             w = self._main_window()
-            return bool(w) and "HomePage" in (w.ClassName or "") and self._home_ready(w)
-        except Exception:
+            if not w:
+                return False
+            _t = time.time()
+            page = jpd.detect_page(w)
+            self._trace('detect_page(home)', _t, ret=page)
+            self._stamp('page_home', page == 'home')
+            if page != 'home':
+                return False
+            _t = time.time()
+            ok = jpd.page_interactive(w, 'home')
+            self._trace('page_interactive(home)', _t, ret=ok)
+            self._stamp('interactive_home', ok)
+            return ok
+        except Exception as e:
+            self._trace('is_home', _t0, err=f'{type(e).__name__}: {e}')
             return False
 
     def is_edit(self) -> bool:
+        """编辑页就绪：不再只认类名，必须有时间线根 + 可枚举的启用控件。"""
+        _t0 = time.time()
         try:
+            # 同 is_home：没建窗就不进 _main_window，避免 20s 的 UIA 按名兜底
+            if not jpd.any_jianying_window():
+                return False
             w = self._main_window()
-            return bool(w) and "MainWindow" in (w.ClassName or "")
-        except Exception:
+            if not w:
+                return False
+            _t = time.time()
+            page = jpd.detect_page(w)
+            self._trace('detect_page(edit)', _t, ret=page)
+            self._stamp('page_edit', page == 'edit')
+            if page != 'edit':
+                return False
+            _t = time.time()
+            ok = jpd.page_interactive(w, 'edit')
+            self._trace('page_interactive(edit)', _t, ret=ok)
+            self._stamp('interactive_edit', ok)
+            return ok
+        except Exception as e:
+            self._trace('is_edit', _t0, err=f'{type(e).__name__}: {e}')
             return False
 
     def launch(self, exe: str) -> Any:
@@ -306,13 +377,8 @@ class UIABackend(Backend):
         if w is None:
             return None
         self.window = w
-        try:
-            w.SetActive()
-            w.SetTopmost(True)
-            time.sleep(0.2)
-            w.SetTopmost(False)
-        except Exception:
-            pass
+        # 激活是独立动作：记录真实结果（含前台锁），失败只告警，不改变就绪判定
+        self.last_activation = jpd.activate_window(w, log=self.log)
         return w
 
 
@@ -326,14 +392,21 @@ class JyInstance:
                  time_fn: Callable[[], float] = time.time,
                  sleep_fn: Callable[[float], None] = time.sleep,
                  poll_interval: float = 1.0,
-                 probe_timeout: float = 8.0,
+                 probe_timeout: float = 30.0,
+                 cleanup_fn: Optional[Callable[[Optional[Callable[[str], None]]], list]] = None,
+                 detect_detector_stall: bool = True,
                  log: Callable[[str], None] = print):
         self.backend = backend or UIABackend()
         self._find_exe = find_exe
         self._time = time_fn
         self._sleep = sleep_fn
+        # 重拉前清残留（默认委托启动共用层）；测试注入 no-op，避免碰真实进程。
+        self._cleanup = cleanup_fn
         self.poll_interval = poll_interval
         self.probe_timeout = probe_timeout
+        # 检测器日志停滞判死：真实启动默认开（失败 A1 可省 ~20s 白等）；
+        # 单测（假时钟）必须关，否则会 stat 到真实日志目录。
+        self.detect_detector_stall = detect_detector_stall
         self._log = log
         # 后端启动日志（「启动/启动方式」两行）绑定到管理器同一输出口，
         # 保证导出链真实打印，而不是被默认 print 吞掉或写到别处。
@@ -345,6 +418,9 @@ class JyInstance:
         self._budget = jl.LaunchBudget(EARLY_DEATH_RETRIES)
         # 最近一次 launch 的结果（died/timeout 等），供统一判定打 launch_failed 标记
         self.last_outcome = None
+        # 就绪判定那一次探到的页面名（home/editing）；启动成功后直接复用它，
+        # 不再额外重复判页（原先会多花 8s 做一次同样的确认）。
+        self._last_ready_page = None
         # 台账分类：导出链 export / 准入链 admit；由 ensure_for_export 显式设置
         self.entry = "export"
 
@@ -369,6 +445,29 @@ class JyInstance:
             ok, v = _poll_with_timeout(b.window_exists, self.probe_timeout)
             return ok and bool(v)
         return False
+
+    def _probe_ready_page(self):
+        """启动就绪判据：主窗口在且处于首页或编辑页（= 可交互）。返回页面名或 None。
+
+        5.9 冷启动会自动恢复上次草稿、直接进编辑页；只等 home 会白等到 180s 超时
+        并误报 launch_failed。编辑页同样算"启动成功"，由 ensure_for_export 软关回首页。
+        """
+        _tr = getattr(self.backend, "_trace", None)
+        if _tr is not None:  # 只做观测：UIA 连接/取根节点耗时（探测线程内）
+            _t = time.time()
+            try:
+                _u = getattr(self.backend, "_u", None)
+                _root = _u().GetRootControl() if _u is not None else None
+                _tr("uia-root", _t, ret=f"ok:{bool(_root)}")
+            except Exception as e:
+                _tr("uia-root", _t, err=f"{type(e).__name__}: {e}")
+        if self._probe("home"):
+            self._last_ready_page = "home"
+            return "home"
+        if self._probe("editing"):
+            self._last_ready_page = "editing"
+            return "editing"
+        return None
 
     def detect(self) -> str:
         """探测当前真实状态并同步 self.state。"""
@@ -422,7 +521,11 @@ class JyInstance:
         return gone and not self.backend.process_running()
 
     def launch(self, timeout: float = HOME_READY_TIMEOUT_S) -> bool:
-        """stopped → launching → home。返回是否在 timeout 内到达 home。
+        """stopped → launching → 可交互页面。返回是否在 timeout 内到达首页**或编辑页**。
+
+        就绪口径（2026-11-14 修正）：进程可交互 + 主窗口在 + 页面属于 {home, editing}。
+        5.9 冷启动会自动恢复上次草稿直接进编辑页，只等 home 会白等 180s 并误报
+        launch_failed；编辑页同样算启动成功，后续由 ensure_for_export 软关回首页。
 
         实际启动动作统一交给 lib/jianying_launch.ensure_jianying：
           - 版本强校验 / cwd=exe 目录 / breakaway + WMI 兜底；
@@ -440,8 +543,10 @@ class JyInstance:
             self.state = "launching"
             deadline = self._time() + timeout
             while self._time() < deadline:
-                if self._probe("home"):
-                    self.state = "home"
+                st = self._probe_ready_page()
+                if st:
+                    self.state = st
+                    self._log(f"实例管理器：已有进程可交互（页面={st}）→ 启动就绪")
                     self.last_outcome = None
                     return True
                 if not self.backend.process_running():
@@ -458,25 +563,64 @@ class JyInstance:
         if not exe:
             raise JyInstanceError("无法定位剪映安装路径，无法启动（冷启动失败）")
         self.state = "launching"
+        self._last_ready_page = None
         outcome = jl.ensure_jianying(
             exe_path=exe, timeout=timeout, readiness="home",
             require_exists=False, budget=self._budget,
             entry=self.entry,
-            ready_fn=lambda: self._probe("home"),
+            ready_fn=lambda: bool(self._probe_ready_page()),
             alive_fn=self.backend.process_running,
             spawn_fn=self.backend.launch,
+            cleanup_fn=self._cleanup,
             time_fn=self._time, sleep_fn=self._sleep,
             poll_interval=self.poll_interval, probe_timeout=self.probe_timeout,
+            detect_detector_stall=self.detect_detector_stall,
             log_fn=self._log)
         # 供上层（robust_auto_export）区分"拉起本身失败"与普通 UI 假死：
         # died/timeout 才进跨轮重拉，其他失败仍走原退避。
         self.last_outcome = outcome
         if outcome.ok:
-            self.state = "home"
+            # 判页结论直接取就绪判定那一次的结果（同一次判定，不重复探测）
+            st = self._last_ready_page or "home"
+            self.state = st
+            self._log(f"实例管理器：冷启动就绪，页面={st}"
+                      f"{'（5.9 自动恢复草稿，交由 ensure_for_export 软关回首页）' if st == 'editing' else ''}")
+            # 就绪后置前：独立动作，只做一次，失败只告警、不参与成败判定
+            self._activate_after_ready()
             return True
         if outcome.outcome in ("died", "died_late", "died_after_ready"):
             self.state = "stopped"
         return False
+
+    def _activate_after_ready(self) -> None:
+        """就绪后把主窗口置前一次（复用 backend.rebind_window → activate_window）。
+
+        独立动作：不含重试、不进轮询循环、不改 self.state / last_outcome；
+        异常与"前台锁"只记录告警。
+        """
+        fn = getattr(self.backend, "rebind_window", None)
+        if fn is None:
+            return
+        _stamps = getattr(self.backend, 'timing', None)
+        if isinstance(_stamps, dict):
+            _stamps['activate_start'] = time.time()   # 观测：激活开始 epoch
+        try:
+            fn()
+        except Exception as e:
+            self._log(f"[activate] 就绪后置前失败（仅告警）：{type(e).__name__}: {e}")
+            return
+        finally:
+            if isinstance(_stamps, dict):
+                _stamps['activate_done'] = time.time()
+        rec = getattr(self.backend, "last_activation", None) or {}
+        if rec:
+            before = (rec.get("before") or {}).get("fg_title")
+            after = (rec.get("after") or {}).get("fg_title")
+            self._log(f"[activate] 就绪后置前 hwnd={rec.get('hwnd')} "
+                      f"setactive={rec.get('setactive')} "
+                      f"setforeground={rec.get('setforeground')} "
+                      f"topmost={rec.get('topmost')} in_front={rec.get('in_front')} "
+                      f"fg_before={before!r} -> fg_after={after!r}")
 
     def restart(self, timeout: float = HOME_READY_TIMEOUT_S) -> bool:
         """kill → 静默 RESTART_SETTLE_S → launch → 等 home。返回是否到达 home。
@@ -537,13 +681,31 @@ class JyInstance:
     REUSE_READY_GRACE_S = 30.0
 
     def _raise_unready(self, what: str) -> None:
-        """拉起/重启未到达可用首页：把 launch 的 died/timeout 打成 launch_failed 标记。"""
+        """拉起/重启未到达可用首页：把失败类型、存活时长、退出时刻带进异常。
+
+        上层只需看异常消息就能区分：
+          [launch_failed:instant]  启动即退（进程几秒内自己退出）
+          [launch_failed:timeout]  软失败（进程在且窗口在，但等不到可交互页面）
+          [window_not_created]     进程在但从未建出任何窗口（独立一类，不混进 launch_failed）
+          [launch_exhausted:…]     重试预算耗尽（多带尝试次数/最后退出时刻）
+        """
         out = self.last_outcome
         oc = getattr(out, "outcome", "") if out is not None else ""
-        if oc in ("died", "died_late", "died_after_ready", "timeout"):
+        if oc == "window_not_created":
             raise JyInstanceError(
-                f"[launch_failed:{oc} alive={out.alive_s:.1f}s attempt={out.attempt} "
-                f"env_check={int(bool(out.env_check_seen))}] {what}后未到达可交互首页")
+                f"[window_not_created alive={out.alive_s:.1f}s pid={out.pid or '-'} "
+                f"attempt={out.attempt} "
+                f"window_seen_at={'-' if getattr(out, 'window_seen_at_s', None) is None else f'+{out.window_seen_at_s:.1f}s'} "
+                f"how={getattr(out, 'how', '') or '-'}] "
+                f"{what}后进程活着但从未创建剪映窗口。"
+                f"{getattr(out, 'error', '') or ''}")
+        if oc in ("died", "died_late", "died_after_ready", "timeout"):
+            kind = getattr(out, "death_kind", "") or oc
+            raise JyInstanceError(
+                f"[launch_failed:{kind} alive={out.alive_s:.1f}s attempt={out.attempt} "
+                f"exit_at={getattr(out, 'exit_at', '') or '-'} "
+                f"env_check={int(bool(out.env_check_seen))}] {what}后未到达可交互首页。"
+                f"{getattr(out, 'error', '') or ''}")
         raise JyInstanceError(f"{what}后未到达可交互首页（窗口未就绪/UI 假死）")
 
     def ensure_for_export(self, force_clean: bool = False,
@@ -569,13 +731,13 @@ class JyInstance:
 
         if force_clean:
             self._log("实例判定：显式要求干净启动 → 重启剪映")
-            if self.restart(timeout):
+            if self.restart(timeout) and self._normalize_home_after_start(timeout):
                 return True
             self._raise_unready("冷启动")
 
         if not self.backend.process_running():
             self._log("实例判定：剪映未运行 → 拉起")
-            if self.launch(timeout):
+            if self.launch(timeout) and self._normalize_home_after_start(timeout):
                 return True
             self._raise_unready("拉起")
 
@@ -596,10 +758,24 @@ class JyInstance:
             self._log("实例判定：宽限内首页恢复可交互 → 复用")
             return True
         self._log("实例判定：宽限内首页仍不可交互（疑似 UI 假死）→ 干净重启")
-        if self.restart(timeout):
+        if self.restart(timeout) and self._normalize_home_after_start(timeout):
             return True
         self._raise_unready("重启")
         return False  # pragma: no cover - _raise_unready 必抛
+
+    def _normalize_home_after_start(self, timeout: float) -> bool:
+        """启动成功后的归位：5.9 冷启动自动恢复草稿会停在编辑页 → 软关回首页。
+
+        只在 state == 'editing' 时动作；首页直接放行。软关失败按 go_home 的
+        allow_restart 兜底（重启后若又落编辑页，再软关一次）。
+        """
+        if self.state != "editing":
+            return True
+        self._log("实例判定：启动后停在编辑页（自动恢复草稿）→ 软关回首页")
+        if self.go_home(timeout=SOFT_HOME_TIMEOUT_S, allow_restart=True,
+                        restart_timeout=timeout):
+            return True
+        return False
 
     def go_home(self, timeout: float = SOFT_HOME_TIMEOUT_S, allow_restart: bool = True,
                 restart_timeout: float = HOME_READY_TIMEOUT_S) -> bool:

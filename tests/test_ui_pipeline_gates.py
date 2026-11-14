@@ -64,10 +64,11 @@ def test_restore_last_light_failure_forces_full_scan_and_fails(monkeypatch):
 def _draft_sig_before():
     """分离前的草稿指纹：主轨 5 段 / videos=7 / 没有 audio 轨。"""
     return {
-        'mtime': 0.0, 'n_tracks': 5, 'main_id': 'main1', 'main_segments': 5,
+        'mtime': 0.0, 'size': 40000, 'n_tracks': 5, 'main_id': 'main1',
+        'main_segments': 5,
         'track_index': {'main1': {'type': 'video', 'n_segments': 5}},
         'n_videos': 7, 'video_paths': set(), 'video_ids': set(),
-        'audio_tracks': [], 'audios_by_id': {},
+        'audio_tracks': [], 'audio_shape': (), 'audios_by_id': {},
     }
 
 
@@ -75,9 +76,10 @@ def _draft_sig_after_ok():
     """分离成功：主轨 5 段不变、videos 不变、新增 audio 轨且素材带原声标记。"""
     sig = _draft_sig_before()
     sig.update({
-        'mtime': 1.0, 'n_tracks': 6,
+        'mtime': 1.0, 'size': 41000, 'n_tracks': 6,
         'track_index': {'main1': {'type': 'video', 'n_segments': 5}},
         'audio_tracks': [{'id': 'aud1', 'segments': [{'material_id': 'am1'}]}],
+        'audio_shape': (1,),
         'audios_by_id': {'am1': {'id': 'am1', 'video_original_sound': True}},
     })
     return sig
@@ -87,8 +89,13 @@ def _patch_extract_draft(monkeypatch, after_sig=None):
     """把分离前后的 draft 对账换成固定指纹（单测不读真实草稿）。"""
     monkeypatch.setattr(ui_extract_audio, '_draft_path', lambda: 'draft.json')
     monkeypatch.setattr(ui_extract_audio, '_draft_sig', lambda _p: _draft_sig_before())
-    monkeypatch.setattr(ui_extract_audio, '_wait_separation_applied',
-                        lambda *_a, **_k: after_sig or _draft_sig_after_ok())
+    monkeypatch.setattr(
+        ui_extract_audio, '_wait_separation_applied',
+        lambda *_a, **_k: {
+            'state': 'stable', 'sig': after_sig or _draft_sig_after_ok(),
+            'samples': 1, 'first_drop': None, 'stable_at': 2.0,
+            'reason': '', 'key_sends': 1,
+        })
 
 
 def test_extract_audio_propagates_restore_failure(monkeypatch, tmp_path):
@@ -114,8 +121,6 @@ def test_extract_audio_propagates_restore_failure(monkeypatch, tmp_path):
     _patch_extract_draft(monkeypatch)
     monkeypatch.setattr(ui_extract_audio, 'restore_all_tracks',
                         lambda *args, **kwargs: {'ok': False})
-    monkeypatch.setattr(ui_extract_audio, '_subs_from_hint',
-                        lambda _hint: ([dict(main, type='text'), dict(main, type='text', ymid=140)], 75))
     monkeypatch.setattr(ui_extract_audio, '_set_row_hidden',
                         lambda *args: forbidden_calls.append('hide_chinese'))
     monkeypatch.setattr(ui_extract_audio, '_write_final_layout',

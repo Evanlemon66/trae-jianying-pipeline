@@ -99,7 +99,7 @@ STAGES = ['fullscreen', 'tracks', 'select', 'audio_tab', 'locate', 'enable', 'wa
 # 故兜底偏移从窗口右缘反推：1920 下 1920-458=1462，与旧字面量等价；4K 下随右缘走。
 AUDIO_TAB_FALLBACK_FROM_RIGHT_LOGICAL = (458, 57)
 AUDIO_TAB_RETRY_DX_LOGICAL = (-22, 22, -40, 40, -60, 60)   # 面板校验失败横移候选
-VOCAL_CHECKBOX_OFFSET_LOGICAL = [-3, 0]        # 「人声分离」文字框 → 对勾
+VOCAL_CHECKBOX_OFFSET_LOGICAL = [-8, 0]        # 「人声分离」文字左缘 → 复选框实测中心
 MAIN_TRACK_LOGICAL = {
     'cover_x_range': [120, 160],   # 主轨封面按钮 M2 的 x 区间（相对时间线左缘）
     'lock_x': 50, 'mute_x': 98, 'cover_x': 143,
@@ -108,12 +108,23 @@ MAIN_TRACK_LOGICAL = {
 }
 
 
-_RUN_STATE = {'ui_params': {}, 'results': {}, 'calib': {}, 'marks': [], 'error': None}
+_RUN_STATE = {'ui_params': {}, 'results': {}, 'calib': {}, 'marks': [], 'error': None,
+              'failed_stage': None}
 
 
 def _infer_failed_stage(marks, results):
-    """失败阶段 = 已成功打点之后的下一阶段；无打点时为首阶段。"""
-    done = [n.split('.')[0] for n, _ in marks if n.split('.')[0] in STAGES]
+    """失败阶段 = 已成功打点之后的下一阶段；无打点时为首阶段。
+
+    打点前缀可能和 STAGES 不同名：音频阶段打点用 `audio.*`，归到 `audio_tab`。
+    显式声明了失败阶段时以显式值为准（见 _dump_report），不靠这里猜。
+    """
+    alias = {'audio': 'audio_tab'}
+    done = []
+    for n, _ in marks:
+        p = n.split('.')[0]
+        p = alias.get(p, p)
+        if p in STAGES:
+            done.append(p)
     idx = max(STAGES.index(s) for s in done) if done else -1
     nxt = idx + 1
     if nxt >= len(STAGES):
@@ -156,7 +167,8 @@ def _dump_report(ui_params, results, calib, marks, final=False,
                 'metrics': r.get('metrics', {}),
             }
         if error and not failed_stage:
-            failed_stage = _infer_failed_stage(marks, results)
+            # 阶段内显式声明优先（如 enable 勾选不通过），其次才是打点推断
+            failed_stage = _RUN_STATE.get('failed_stage') or _infer_failed_stage(marks, results)
         t_base = marks[0][1] if marks else time.time()
         rec = {
             'generated_by': 'admission_test',
@@ -721,6 +733,12 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         calib['vocal_switch']['vocal_mode'] = vocal_mode
         dprint(f'  勾选验证 = {enabled}')
         _shot(win, '_admission_enabled.png')
+        # 勾选验证不通过 = 失败，不往下走（单次点击 + 20s 轮询未确认就继续跑是假成功）。
+        # 注意：失败时不能打 enable.check_switch 点，否则 failed_stage 会被推成 wait。
+        if not enabled:
+            _RUN_STATE['failed_stage'] = 'enable'
+            raise RuntimeError('enable 失败：人声分离开关单次点击后 20s 轮询未确认开启'
+                               '（勾选验证=False，蓝勾/该行处理中/百分比三判据都未命中）')
         _mark('enable.check_switch')
 
         # 用户明确：勾选后立刻选下拉模式，再等分离完成；只有一次分离
@@ -742,6 +760,12 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         win = ensure_fullscreen(win)     # 守卫：万一前面误退全屏，这里恢复基准态
         res = wait_vocal_done(win, timeout=600, appear_timeout=120)
         dprint(f'  分离等待结果: {res}')
+        # 整个过程没见到"处理中" = 从没开始处理，不能当已完成（也不打点，保持 failed_stage=wait）
+        if not res.get('ok'):
+            _RUN_STATE['failed_stage'] = 'wait'
+            raise RuntimeError(
+                f"wait 失败: 人声分离未完成（reason={res.get('reason')}，"
+                f"seen_processing={res.get('seen_processing')}）")
         _mark('wait.separation_done')
 
         calib['processing_keywords'] = ['人声分离等待处理', '等待处理', '处理中', '正在处理']
@@ -814,7 +838,8 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         dprint('\n[export] 导出 MP4（对齐 pipeline [6]）')
         win = ensure_fullscreen(win)
         from ui_pipeline import step_export
-        r = step_export(OUT_DIR)
+        # 准入草稿无 cover_job：显式声明不校验封面（三件套只验 mp4 + progress）
+        r = step_export(OUT_DIR, require_cover=False)
         dprint(f"  export 结果: ok={r.get('ok')} error={r.get('error')}")
         if not r.get('ok'):
             raise RuntimeError(f"export 失败: {r.get('error')}")
