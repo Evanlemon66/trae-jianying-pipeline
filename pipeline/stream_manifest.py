@@ -16,6 +16,8 @@
 默认行为（信任"用户让清理＝已发布"，发布流程尚未自动化）：
   `clean --job` 默认清**整部剧的所有版本**（基础版 + 各 `_<版本>` 克隆版）：
   清理 ① __jycache__ ② _work_* 工作目录 ③ 各版本导出成品目录（mp4+封面+progress.json）；
+  bundle 布局还会一并删同级导出心跳 `<导出根>/<草稿>.progress.json`（删除前打印其状态，
+  `status=running` 说明是上次导出的残留）；平铺布局的 progress 已在三件套内，不重复计。
   **默认不删 C 盘剪映草稿**，需显式 --include-drafts。
   只清某一个版本必须显式 `--profile <p>`：此时只删该版本的成品目录，
   __jycache__ / _work_* / C 盘草稿等共享产物一律保留，并提示仍被多少个版本引用。
@@ -332,6 +334,16 @@ def receipts_status(source_dir):
     return False, "无成功回执（receipts 为空、platform json 未标 published/url）"
 
 
+def _progress_side_status(path):
+    """读导出心跳 <草稿>.progress.json 的 status（读不到返回 unknown）。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return str((data or {}).get("status") or "unknown")
+    except (OSError, ValueError):
+        return "unknown"
+
+
 def _plan(paths, draft_name, include_drafts, intermediates_only=False,
           only_export=False):
     """清理计划：中间产物 → 成品 →（可选）草稿。返回 [(label, kind, path)]。
@@ -351,6 +363,11 @@ def _plan(paths, draft_name, include_drafts, intermediates_only=False,
         if os.path.basename(parent) == draft_name:
             # 新布局：成品/封面/进度同处「剧名子目录」，整目录一次清理
             items.append(("export_bundle", "export_bundle", parent))
+            # 同级还有导出心跳 <导出根>/<草稿>.progress.json：整目录档一并清；
+            # 删除时会打印它当时的状态（status=running 说明是上次导出的残留）。
+            side = os.path.join(os.path.dirname(parent), draft_name + ".progress.json")
+            if os.path.isfile(side):
+                items.append(("progress_side", "export_file", side))
         else:
             # 旧平铺布局兼容：逐个列成品与伴随文件
             stem = os.path.splitext(os.path.abspath(ef))[0]
@@ -374,7 +391,12 @@ def _output_plan_items(out):
             bundle = parent
     # 只认「目录名 == 草稿名」的成品包，避免把上级目录当成品删
     if bundle and draft and os.path.basename(os.path.abspath(bundle)) == draft:
-        return [("export_bundle", "export_bundle", os.path.abspath(bundle))]
+        items = [("export_bundle", "export_bundle", os.path.abspath(bundle))]
+        side = os.path.join(os.path.dirname(os.path.abspath(bundle)),
+                            draft + ".progress.json")
+        if os.path.isfile(side):
+            items.append(("progress_side", "export_file", side))
+        return items
     if ef:
         stem = os.path.splitext(os.path.abspath(ef))[0]
         items.append(("export_file", "export_file", os.path.abspath(ef)))
@@ -648,6 +670,9 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
                     print(f"  [warn] 墓碑写入失败（不影响清理）: {e}")
             cleaned = []
             for n, label, kind, p, size in ready:
+                if label == "progress_side":
+                    print(f"  [心跳] {p} status={_progress_side_status(p)}"
+                          "（残留，随成品目录一并清理）")
                 if os.path.isdir(p):
                     shutil.rmtree(p, ignore_errors=True)
                 else:

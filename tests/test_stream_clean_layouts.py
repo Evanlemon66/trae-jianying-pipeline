@@ -72,6 +72,8 @@ def test_flat_layout_deletes_only_three_items(tmp_path, monkeypatch):
     made = make_bundle(flat, name)
     other = flat / "other.mp4"
     other.write_bytes(b"y" * 10)
+    side = flat / (name + ".progress.json")
+    side.write_text(json.dumps({"status": "running"}), encoding="utf-8")
     _make_job(src, name, str(made["mp4"]))
 
     rc, out = _run_clean(monkeypatch, tmp_path, name,
@@ -83,10 +85,32 @@ def test_flat_layout_deletes_only_three_items(tmp_path, monkeypatch):
     assert not os.path.exists(str(made["progress"]))
     assert not os.path.exists(str(made["cover"]))
     assert other.exists(), "平铺布局不得误删无关文件"
+    assert side.exists(), "平铺布局不额外删同级心跳（progress 已在三件套内）"
     assert out.count("[已删]") == 3, "平铺布局应删 mp4 / progress / 封面三项"
     assert "剧A.progress.json" in out
     assert "剧A-封面.jpg" in out
     assert "export_bundle" not in out
+
+
+def test_bundle_clean_removes_stale_progress_heartbeat(tmp_path, monkeypatch):
+    """bundle 整目录档：同级 status=running 的导出心跳一并删掉，且删除前打印状态。"""
+    name = "剧A"
+    src = tmp_path / "剧A" / "src"
+    bundle = tmp_path / "out" / name
+    made = make_bundle(bundle, name)
+    side = bundle.parent / (name + ".progress.json")
+    side.write_text(json.dumps({"status": "running", "done": False}),
+                    encoding="utf-8")
+    _make_job(src, name, str(made["mp4"]))
+
+    rc, out = _run_clean(monkeypatch, tmp_path, name,
+                         {"source_dir": str(src),
+                          "export_file": str(made["mp4"])})
+
+    assert rc == 0
+    assert not bundle.exists(), "bundle 目录应整体删除"
+    assert not side.exists(), "同级导出心跳应一并删除"
+    assert "[心跳]" in out and "status=running" in out, "删除前必须写明心跳状态"
 
 
 def test_protected_areas_not_loosened(tmp_path, monkeypatch):
