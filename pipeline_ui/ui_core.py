@@ -29,6 +29,13 @@ from contextlib import contextmanager
 
 import uiautomation as uia
 
+# 启动共用层：exe 定位/版本校验/拉起/等待就绪/早死重拉统一走 lib/jianying_launch.py
+_LIB_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'lib'))
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+import jianying_launch as jl  # noqa: E402
+
 PROPERTY_ID_FULLDESC = 30159   # LegacyIAccessible.Description（剪映语义标记都在这）
 
 
@@ -904,150 +911,69 @@ def connect_jianying(retry=True, max_wait=60):
     return None, None
 
 
-# ================= 剪映可执行文件解析（版本强校验） =================
+# ================= 剪映可执行文件解析（版本强校验，实现已并入共用启动层） =================
 # 5.9 是 UI 自动化唯一适配版本；本机若还装了新版（如 8.9/11.x），注册表命中
 # 往往是新版 —— 解析结果必须校验 exe 文件版本，绝不静默拉起错误版本。
-REQUIRED_JY_VERSION = '5.9.0.11632'
-_JY_EXE_NAME = 'JianyingPro.exe'
+REQUIRED_JY_VERSION = jl.REQUIRED_JY_VERSION
+_JY_EXE_NAME = jl.EXE_NAME
+# 让剪映脱离调用方所在的作业对象：终端/父进程结束时不会把剪映连带回收
+# （否则会留下 .locked / template.tmp 等残留，下次打开触发恢复提示）。
+_BREAKAWAY_FROM_JOB = jl.BREAKAWAY_FROM_JOB
 
 
-class _VS_FIXEDFILEINFO(ctypes.Structure):
-    _fields_ = [
-        ('dwSignature', ctypes.c_uint32), ('dwStrucVersion', ctypes.c_uint32),
-        ('dwFileVersionMS', ctypes.c_uint32), ('dwFileVersionLS', ctypes.c_uint32),
-        ('dwProductVersionMS', ctypes.c_uint32), ('dwProductVersionLS', ctypes.c_uint32),
-        ('dwFileFlagsMask', ctypes.c_uint32), ('dwFileFlags', ctypes.c_uint32),
-        ('dwFileOS', ctypes.c_uint32), ('dwFileType', ctypes.c_uint32),
-        ('dwFileSubtype', ctypes.c_uint32), ('dwFileDateMS', ctypes.c_uint32),
-        ('dwFileDateLS', ctypes.c_uint32),
-    ]
+def _launch_flags(breakaway=True):
+    """剪映启动参数：隐藏控制台窗口 +（默认）脱离当前作业（实现在共用层）。"""
+    return jl.launch_flags(breakaway=breakaway)
 
 
 def _exe_file_version(path):
-    """读 exe 的 VS_FIXEDFILEINFO 文件版本（如 5.9.0.11632）。失败返回空串。"""
-    try:
-        from ctypes import wintypes
-        ver = ctypes.windll.version
-        size = ver.GetFileVersionInfoSizeW(path, None)
-        if not size:
-            return ''
-        buf = ctypes.create_string_buffer(size)
-        if not ver.GetFileVersionInfoW(path, 0, size, buf):
-            return ''
-        ptr, ln = ctypes.c_void_p(), wintypes.UINT()
-        if not ver.VerQueryValueW(buf, '\\', ctypes.byref(ptr), ctypes.byref(ln)):
-            return ''
-        ffi = ctypes.cast(ptr, ctypes.POINTER(_VS_FIXEDFILEINFO)).contents
-        ms, ls = ffi.dwFileVersionMS, ffi.dwFileVersionLS
-        return f'{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}'
-    except Exception:
-        return ''
+    return jl.exe_file_version(path)
 
 
 def _jy_version_of(exe_path):
-    """版本口径：优先 exe 文件版本，读不到再退回安装目录末级目录名。"""
-    return (_exe_file_version(exe_path)
-            or os.path.basename(os.path.dirname(os.path.abspath(exe_path))))
+    return jl.jianying_version_of(exe_path)
 
 
 def _registry_jianying_exes():
-    """从卸载注册表收集剪映候选 exe（HKCU/HKLM × 32/64 位视图，可能多版本共存）。"""
-    import winreg
-    out = []
-    sub = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
-    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
-            try:
-                with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ | view) as key:
-                    for i in range(winreg.QueryInfoKey(key)[0]):
-                        try:
-                            with winreg.OpenKey(key, winreg.EnumKey(key, i)) as sk:
-                                dn = winreg.QueryValueEx(sk, "DisplayName")[0]
-                                if "剪映专业版" not in dn:
-                                    continue
-                                try:
-                                    ico = (winreg.QueryValueEx(sk, "DisplayIcon")[0] or '').strip('"')
-                                except Exception:
-                                    ico = ''
-                                if ico:
-                                    out.append((f'注册表 DisplayIcon({dn})',
-                                                os.path.join(os.path.dirname(ico), _JY_EXE_NAME)))
-                                try:
-                                    loc = (winreg.QueryValueEx(sk, "InstallLocation")[0] or '').strip()
-                                except Exception:
-                                    loc = ''
-                                if loc:
-                                    out.append((f'注册表 InstallLocation({dn})',
-                                                os.path.join(loc, _JY_EXE_NAME)))
-                        except Exception:
-                            continue
-            except Exception:
-                continue
-    return out
+    return jl.registry_jianying_exes()
 
 
 def resolve_jianying_exe(required=REQUIRED_JY_VERSION):
-    """解析剪映可执行文件并强制校验版本。
+    """解析剪映可执行文件并强制校验版本（实现在共用层，带来源清单）。"""
+    return jl.resolve_jianying_exe(required, log_fn=dprint)
 
-    优先级：presets.json 的 jianying_dir → 环境变量 JY_JIANYING_DIR → 卸载注册表。
-    非 required 版本的候选一律跳过并记录原因；全部不匹配时抛 RuntimeError，
-    绝不静默返回注册表指向的其它大版本（本机注册表就指向 8.9）。
+
+def _wmi_launch(exe_path):
+    """用 WMI 在终端作业之外拉起剪映（实现在共用层，保留本函数供既有测试/调用方）。"""
+    return jl.wmi_launch(exe_path, log_fn=dprint)
+
+
+def launch_and_connect(exe_path=None, max_wait=60, retries=0, readiness='window'):
+    """拉起/复用剪映并等到就绪，返回已绑定的 (win, page)。
+
+    版本校验、cwd、breakaway/WMI 兜底、进程存活轮询、启动即死重拉全部交给
+    lib/jianying_launch.ensure_jianying。
+
+    readiness 两种口径（默认 'window'，与既有准入行为一致）：
+      'window' 任意真 QML 窗口出现即就绪 → 返回 (win, page)，page 可能是 edit；
+      'home'   必须等首页判定为 home 才就绪（page 恒为 home）。
+
+    retries 默认 0：准入的重拉由 ui_nav._launch_until_card 按 max_launch 负责，
+    共用层不再叠加预算。
     """
-    cands = []
-    try:
-        _pipe = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                              '..', 'pipeline'))
-        if _pipe not in sys.path:
-            sys.path.insert(0, _pipe)
-        from export_config import get_jianying_dir
-        jd = (get_jianying_dir() or '').strip()
-        if jd:
-            cands.append((f'presets.json jianying_dir={jd}', os.path.join(jd, _JY_EXE_NAME)))
-    except Exception as e:
-        ddebug(f'  [jy-path] 读取 presets.json 失败: {e}')
-    env_dir = (os.environ.get('JY_JIANYING_DIR') or '').strip()
-    if env_dir:
-        cands.append((f'JY_JIANYING_DIR={env_dir}', os.path.join(env_dir, _JY_EXE_NAME)))
-    cands.extend(_registry_jianying_exes())
-
-    problems = []
-    for src, p in cands:
-        if not p or not os.path.exists(p):
-            problems.append(f'{src} → 不存在: {p}')
-            continue
-        ver = _jy_version_of(p)
-        if ver != required:
-            problems.append(f'{src} → 版本 {ver or "unknown"} ≠ {required}: {p}')
-            continue
-        dprint(f'剪映可执行文件: {p}（版本 {ver}，来源: {src}）')
-        return p
-    raise RuntimeError(
-        f'未找到剪映 {required}（不会静默拉起其它版本）：\n  ' + '\n  '.join(problems) +
-        '\n请在 pipeline/presets.json 的 jianying_dir 指向 5.9.0.11632 安装目录')
-
-
-def launch_and_connect(exe_path=None, max_wait=60):
-    import subprocess
-
-    if exe_path:
-        if not os.path.exists(exe_path):
-            raise RuntimeError(f'指定的剪映可执行文件不存在: {exe_path}')
-        ver = _jy_version_of(exe_path)
-        if ver != REQUIRED_JY_VERSION:
-            raise RuntimeError(f'指定的剪映版本 {ver or "unknown"} ≠ {REQUIRED_JY_VERSION}，'
-                               f'拒绝启动: {exe_path}')
-    else:
-        exe_path = resolve_jianying_exe()
-
-    dprint(f"启动: {exe_path}")
-    subprocess.Popen([exe_path], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-
     t_launch = time.time()
-    last_log = 0.0
-    last_diag = 0.0
-    while time.time() - t_launch < max_wait:
-        time.sleep(2)
+    diag = {'elapsed': 0.0, 'all_jy': [], 'last_log': 0.0, 'last_diag': 0.0}
+
+    def _probe():
         el = time.time() - t_launch
+        diag['elapsed'] = el
+        # 环境检测窗排他：检测窗（VEDetector 转圈/崩溃框）还在就不算就绪。
+        # readiness='window' 只看"有真 QML 窗口"，检测期的半成品窗口会把判定骗过去。
+        try:
+            if jl.env_check_windows():
+                return None
+        except Exception:
+            pass
         # Win32 原生检测（毫秒级，不受 UIA 枚举卡顿影响）。
         # all_jy = 标题含剪映的所有可见窗口（含 Chrome_WidgetWin_1 假窗口/初始化中窗口）
         t_chk = time.time()
@@ -1055,38 +981,65 @@ def launch_and_connect(exe_path=None, max_wait=60):
             all_jy = [(h, c, t) for h, c, t in _enum_top_windows() if '剪映' in t]
         except Exception:
             all_jy = []
+        diag['all_jy'] = all_jy
         chk_s = time.time() - t_chk
         if chk_s > 3:
             dprint(f"  [diag] 本轮 Win32 窗口枚举耗时 {chk_s:.1f}s（异常，正常应 <0.1s）")
-        if el - last_log >= 15:
-            last_log = el
+        # 真 QML 窗口（HomePage/MainWindow）出现 → 立即返回
+        real = [(h, c, t) for h, c, t in all_jy if _good_class_native(c)]
+        if not real:
+            return None
+        hwnd, cls, title = real[0]
+        dprint(f"  剪映窗口已出现（{el:.0f}s）cls={cls}")
+        bound = _bind_uia_by_hwnd(hwnd, cls)
+        if bound and bound[0] is not None:
+            return bound
+        # 句柄绑定失败（极少见）→ UIA 搜索兜底
+        try:
+            win = uia.WindowControl(searchDepth=1, Name='剪映专业版')
+            if win.Exists(2):
+                return _activate_and_classify(win)
+        except Exception:
+            pass
+        return None
+
+    def _probe_home():
+        """readiness='home'：窗口出现还不够，必须已判定在首页。"""
+        bound = _probe()
+        if bound and bound[0] is not None and bound[1] == 'home':
+            return bound
+        return None
+
+    def _tick(_elapsed, _attempt):
+        el = diag['elapsed']
+        all_jy = diag['all_jy']
+        if el - diag['last_log'] >= 15:
+            diag['last_log'] = el
             if all_jy:
                 cls_set = ', '.join(sorted({c for _, c, _ in all_jy}))
                 dprint(f"  ...剪映启动等待中（{el:.0f}s）已检测到窗口: {cls_set}")
             else:
                 dprint(f"  ...剪映启动等待中（{el:.0f}s）（尚未检测到剪映任何窗口）")
-        # 真 QML 窗口（HomePage/MainWindow）出现 → 立即返回
-        real = [(h, c, t) for h, c, t in all_jy if _good_class_native(c)]
-        if real:
-            hwnd, cls, title = real[0]
-            dprint(f"  剪映窗口已出现（{el:.0f}s）cls={cls}")
-            bound = _bind_uia_by_hwnd(hwnd, cls)
-            if bound and bound[0] is not None:
-                return bound
-            # 句柄绑定失败（极少见）→ UIA 搜索兜底
-            try:
-                win = uia.WindowControl(searchDepth=1, Name='剪映专业版')
-                if win.Exists(2):
-                    return _activate_and_classify(win)
-            except Exception:
-                pass
-        elif all_jy and el - last_diag >= 30:
+        elif all_jy and el - diag['last_diag'] >= 30:
             # 只有假窗口/初始化中窗口：进程已拉起，QML 主窗口还没创建（肉眼看到的
             # 任务栏图标/闪屏属于这种）→ 每 30s 提示一次，说明检测没有瞎等
-            last_diag = el
+            diag['last_diag'] = el
             dprint(f"  [diag] 剪映进程已拉起，主窗口初始化中（{el:.0f}s）: "
                    f"{sorted({c for _, c, _ in all_jy})}")
-    raise RuntimeError(f"启动后 {max_wait}s 内未找到剪映窗口")
+
+    ready_fn = _probe_home if readiness == 'home' else _probe
+    outcome = jl.ensure_jianying(
+        exe_path=exe_path, timeout=max_wait, readiness=readiness, retries=retries,
+        entry='admit',
+        ready_fn=ready_fn, poll_interval=2.0, log_fn=dprint, tick_fn=_tick)
+    if outcome.ok:
+        return outcome.value
+    if outcome.outcome == 'timeout':
+        raise RuntimeError(f"启动后 {max_wait}s 内未找到剪映窗口")
+    raise RuntimeError(
+        f"启动后 {outcome.alive_s:.0f}s 剪映进程退出（启动即死，pid={outcome.pid}），"
+        f"未等到主窗口")
+
 
 
 _PAGE_FEATS = (

@@ -42,6 +42,19 @@ from export_config import export_mp4_path, parse_preset_profiles  # noqa: E402
 import preset_ops as _po  # noqa: E402
 import job_manifest as jm  # noqa: E402
 import subtitle_guard  # noqa: E402
+
+
+def _record_export_freshness(draft_name, out_mp4):
+    """导出成功后记录成品出身（sidecar + E2 基线）；失败只告警。"""
+    try:
+        import freshness
+        jd = freshness.job_dir_for_draft(draft_name)
+        if jd and out_mp4 and os.path.isfile(out_mp4):
+            freshness.record_export(jd, freshness.version_for_draft(jd, draft_name),
+                                    draft_name, out_mp4)
+    except Exception as e:
+        print(f"  [warn] 记录成品新鲜度失败（忽略）: {e}")
+
 try:
     import export_lock as _elock  # noqa: E402
 except Exception:  # 锁模块缺失时退化为无锁（保持旧行为）
@@ -56,32 +69,35 @@ def _ensure_jianying_closed(grace_s=15.0):
     （八仙 2026-11-02 实测：04:08 剪映回写导致封面丢失）。
     先优雅退出，超时未退再强杀；导出阶段会自动重新拉起剪映。
     """
-    import subprocess as _sp
+    import jianying_proc as jp
 
-    def _running():
-        try:
-            out = _sp.check_output(["tasklist", "/fi", "imagename eq JianyingPro.exe"],
-                                   text=True, stderr=_sp.DEVNULL,
-                                   creationflags=NO_WINDOW)
-            return "JianyingPro.exe" in out
-        except Exception:
-            return False
-
-    if not _running():
+    if not jp.running():
         return
     print("🛑 检测到剪映正在运行：为避免草稿被其内存旧副本回写覆盖（封面/字幕丢失），先关闭剪映")
-    _sp.run(["taskkill", "/IM", "JianyingPro.exe", "/T"], capture_output=True,
-            creationflags=NO_WINDOW)  # 优雅退出（含子进程）
+    if jp.stop_jianying(grace_s=grace_s, force=False,
+                        log_fn=lambda m: print(f"  {m}")):  # 优雅关闭（含子进程）
+        return
     t0 = time.time()
     while time.time() - t0 < grace_s:
-        if not _running():
+        if not jp.running():
             print("  ✅ 剪映已退出")
             return
         time.sleep(1)
     print("  ⚠️ 剪映未在时限内退出，强制结束")
-    _sp.run(["taskkill", "/F", "/IM", "JianyingPro.exe", "/T"], capture_output=True,
-            creationflags=NO_WINDOW)
+    jp.stop_jianying(force=True, log_fn=lambda m: print(f"  {m}"))
     time.sleep(2)
+
+
+def _close_jianying_after_batch(reason="批量导出结束"):
+    """批内复用收尾：统一走 jianying_proc 的 WM_CLOSE（异常路径由 finally 保证调用）。"""
+    import jianying_proc as jp
+
+    if not jp.running():
+        return
+    print(f"🛑 {reason}：WM_CLOSE 关闭复用的剪映实例")
+    if not jp.stop_jianying(grace_s=20.0, force=False,
+                            log_fn=lambda m: print(f"  {m}")):
+        print("  ⚠️ 剪映未在时限内正常退出（不影响已完成成品）")
 
 
 def _ep_number(path, idx):
@@ -203,41 +219,54 @@ def _export_drafts_sequential(drafts, export_root, timeout_min=60.0, verify=True
         "examples", "robust_auto_export.py")
     verify_script = os.path.join(_HERE, "verify_export.py")
     results = {}
-    for i, dn in enumerate(drafts, 1):
-        out_mp4 = export_mp4_path(dn, export_root)
-        fallback = os.path.dirname(os.path.dirname(out_mp4))
-        os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
-        print(f"\n📤 串行导出 {i}/{len(drafts)}: {dn} → {out_mp4}")
-        _toast("📤 导出中", f"{dn}（{i}/{len(drafts)}）")
-        ok = False
-        proc = None
-        try:
-            proc = _sp.Popen(
-                [sys.executable, "-u", exporter, dn, out_mp4, "--move",
-                 "--fallback-dir", fallback],
-                cwd=_PROJECT_ROOT, env=hidden_child_env(),
-                creationflags=NO_WINDOW)
-            proc.wait(timeout=timeout_min * 60)
-            ok = proc.returncode == 0
-        except _sp.TimeoutExpired:
-            print(f"  ⚠️ 导出超时（>{timeout_min}min），终止: {dn}")
-            proc.kill()
-            proc.wait()
-        except Exception as e:
-            print(f"  ❌ 导出异常: {dn}: {e}")
-        results[dn] = ok
-        if ok:
-            pl.clear_export_stale(dn)  # 成品已对应当前草稿内容
-        _toast("✅ 导出完成" if ok else "❌ 导出失败", dn,
-               icon="success" if ok else "error")
-        if ok and verify:
-            if os.path.exists(verify_script):
-                rc = _sp.call([sys.executable, verify_script, dn, out_mp4],
-                              cwd=_HERE, env=hidden_child_env(),
-                              creationflags=NO_WINDOW)
-                _toast("✅ 验证全部通过" if rc == 0 else "❌ 验证未通过", dn)
-            else:
-                print("    verify_export.py 不存在，跳过质检")
+    # 批内复用：第一份负责拉起，之后每份 --keep-open 接在同一实例上；
+    # 批量结束（含异常/中断）由 finally 统一 WM_CLOSE 关闭，绝不把实例留在那儿。
+    try:
+        for i, dn in enumerate(drafts, 1):
+            out_mp4 = export_mp4_path(dn, export_root)
+            fallback = os.path.dirname(os.path.dirname(out_mp4))
+            os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
+            print(f"\n📤 串行导出 {i}/{len(drafts)}: {dn} → {out_mp4}")
+            _toast("📤 导出中", f"{dn}（{i}/{len(drafts)}）")
+            ok = False
+            proc = None
+            try:
+                proc = _sp.Popen(
+                    [sys.executable, "-u", exporter, dn, out_mp4, "--move",
+                     "--fallback-dir", fallback, "--keep-open"],
+                    cwd=_PROJECT_ROOT, env=hidden_child_env(),
+                    creationflags=NO_WINDOW)
+                proc.wait(timeout=timeout_min * 60)
+                ok = proc.returncode == 0
+                # 复用前提：上一份确实导出完成（rc=0 且成品已落盘）才切下一份。
+                if ok and not os.path.isfile(out_mp4):
+                    print(f"  ⚠️ 导出子进程成功但成品未落盘: {out_mp4}")
+                    ok = False
+            except _sp.TimeoutExpired:
+                print(f"  ⚠️ 导出超时（>{timeout_min}min），终止: {dn}")
+                proc.kill()
+                proc.wait()
+            except Exception as e:
+                print(f"  ❌ 导出异常: {dn}: {e}")
+            results[dn] = ok
+            if ok:
+                pl.clear_export_stale(dn)  # 成品已对应当前草稿内容
+                _record_export_freshness(dn, out_mp4)
+            _toast("✅ 导出完成" if ok else "❌ 导出失败", dn,
+                   icon="success" if ok else "error")
+            if ok and verify:
+                if os.path.exists(verify_script):
+                    rc = _sp.call([sys.executable, verify_script, dn, out_mp4],
+                                  cwd=_HERE, env=hidden_child_env(),
+                                  creationflags=NO_WINDOW)
+                    _toast("✅ 验证全部通过" if rc == 0 else "❌ 验证未通过", dn)
+                else:
+                    print("    verify_export.py 不存在，跳过质检")
+            if not ok:
+                # 半途失败：实例可能停在编辑页/导出视图，先收干净，下一份重新拉起
+                _close_jianying_after_batch(f"{dn} 导出失败，收尾复用实例")
+    finally:
+        _close_jianying_after_batch()
     return results
 
 
@@ -615,6 +644,7 @@ subprocess.Popen(
                                       f"最终 {rec.get('final_mb',0):.0f}MB）")
                                 # 导出成功：清掉草稿的导出失效标记
                                 pl.clear_export_stale(draft_name)
+                                _record_export_freshness(draft_name, out_mp4)
                                 break
                         except Exception:
                             pass

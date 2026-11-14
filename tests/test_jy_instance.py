@@ -16,6 +16,8 @@ import os, sys
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EX = os.path.join(_ROOT, ".trae", "skills", "jianying-editor", "examples")
 sys.path.insert(0, _EX)
+# 假后端也会走 ensure_jianying → 必须关掉台账，否则假记录会写进生产台账。
+os.environ.setdefault('JY_LAUNCH_LEDGER', 'off')
 import jy_instance as ji  # noqa: E402
 
 fails = []
@@ -230,7 +232,8 @@ def _eff9():
     if b9.launch_count == 1:          # 首次：起来了但 5s 后就没了（13:25/13:59 现象）
         b9.running, b9.window, b9.home = True, False, False
         die_at["t"] = clk9.t + 5
-    else:                              # 重试：正常到首页
+    else:                              # 重试：正常到首页（不再复用首试的死亡时刻）
+        die_at["t"] = None
         b9.running, b9.window, b9.home = True, True, True
 
 
@@ -250,7 +253,8 @@ check("结构化字段齐全（pid/started/alive_s/app_log_bytes）",
                           ("pid=", "started=", "alive_s=", "app_log=", "app_log_bytes=")),
       died9[0] if died9 else "")
 check("标记为可重试 retry=1", bool(died9) and "retry=1" in died9[0], died9[0] if died9 else "")
-check("不等满 30s（≈首试5s+静默2s）", 6.9 <= (clk9.t - t9) <= 8.5, clk9.t - t9)
+check("立即重拉、不等满 30s（首试5s + ready 后观察窗8s，SETTLE=0 无静置）",
+      12.5 <= (clk9.t - t9) <= 14.0, clk9.t - t9)
 
 print("\n== ⑩ 重试上限写死 1 次：两次都启动即死 → 失败，不再拉第三次 ==")
 clk10 = FakeClock()
@@ -328,7 +332,9 @@ mgr12 = ji.JyInstance(backend=b12, find_exe=lambda: "fake.exe", time_fn=clk12.ti
 ok12 = mgr12.restart(timeout=30)
 gap12 = marks12[1][1] - marks12[0][1]
 check("重启后到达 home", ok12 is True and mgr12.state == "home", mgr12.state)
-check("kill→launch 间隔在 2–5s", 2.0 <= gap12 <= 5.0, gap12)
+# B4 对照观测（2026-11-14，6 轮）：进程确认消失后立即拉起 6/6 成功，
+# 含残留检测器仍在时的立即重拉 3/3 → 不再留静默期。
+check("kill→launch 无静默期", gap12 == 0.0, gap12)
 
 print("\n== ⑬ kill 后旧进程仍在：返回 False 并记一行 ==")
 clk13 = FakeClock()
@@ -349,8 +355,71 @@ mgr13 = ji.JyInstance(backend=b13, find_exe=lambda: "fake.exe", time_fn=clk13.ti
                       log=logs13.append)
 check("kill() 返回 False", mgr13.kill() is False)
 ok13 = mgr13.restart(timeout=30)
-check("restart 仍按流程拉起并到 home", ok13 is True, mgr13.state)
+# died_late 止血层：旧进程杀不掉时绝不再 spawn 第二个（防双开），只重连/等待；
+# 旧进程从未到 home → restart 失败，且 launch 一次都没发生。
+check("restart 不双开：只重连不 spawn，返回 False", ok13 is False, mgr13.state)
+check("旧进程存活时 launch_count == 0", b13.launch_count == 0, b13.launch_count)
 check("记了『旧进程仍在运行』", any("旧进程仍在运行" in l for l in logs13), logs13)
+
+print("\n== ⑭ _main_window：找不到主窗口返回 None（不再把搜索条件当窗口）==")
+
+
+class _FakeWin:
+    def __init__(self, name, exists, class_name=""):
+        self.Name = name
+        self._exists = exists
+        self.ClassName = class_name
+
+    def Exists(self, timeout=0):
+        return self._exists
+
+    def SetActive(self):
+        pass
+
+    def SetTopmost(self, on):
+        pass
+
+
+class _FakeUia:
+    """最小 UIA 桩：只回答按 Name 的顶层窗口查询。"""
+
+    def __init__(self, windows=None):
+        self.windows = windows or {}
+        self.queries = []
+
+    def WindowControl(self, searchDepth=1, Name=""):
+        self.queries.append(Name)
+        return self.windows.get(Name, _FakeWin(Name, False))
+
+
+def _backend_with(windows):
+    b = ji.UIABackend()
+    b._uia = _FakeUia(windows)
+    b.log = lambda *_a: None
+    return b
+
+
+b14 = _backend_with({})
+check("两个窗口都不存在 → _main_window() is None", b14._main_window() is None)
+check("此时 is_home 为 False（不抛错）", b14.is_home() is False)
+check("此时 is_edit 为 False（不抛错）", b14.is_edit() is False)
+
+b14b = _backend_with({"导出": _FakeWin("导出", True, "ExportWindow")})
+w14b = b14b._main_window()
+check("只有导出弹窗时仍可回退（有意保留）",
+      w14b is not None and w14b.Name == "导出", getattr(w14b, "Name", None))
+
+print("\n== ⑮ rebind_window：拿不到主窗口返回 None 且不覆盖旧绑定 ==")
+b15 = _backend_with({})
+old15 = _FakeWin("旧主窗口", True, "HomePage")
+b15.window = old15
+check("rebind_window() 返回 None", b15.rebind_window() is None)
+check("旧绑定未被覆盖", b15.window is old15)
+
+b15b = _backend_with({"剪映专业版": _FakeWin("剪映专业版", True, "HomePage")})
+w15b = b15b.rebind_window()
+check("主窗口存在时正常绑定", w15b is not None and b15b.window is w15b
+      and w15b.ClassName == "HomePage")
 
 print(f"\n{'='*40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
 sys.exit(1 if fails else 0)
