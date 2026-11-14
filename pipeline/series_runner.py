@@ -14,6 +14,7 @@
     python pipeline\\series_runner.py A B C --mode generate
     python pipeline\\series_runner.py A B --mode export
     python pipeline\\series_runner.py --mode export --all-stream
+    python pipeline\\series_runner.py A --mode export --profile b,tiktok   # 多版本
 
 状态写入 pipeline/_series_queue_state.json，重启自动跳过已完成、续跑半成品。
 """
@@ -133,6 +134,33 @@ def _version_of_draft(draft_name: str, profiles: list[str]) -> str:
     return "a"
 
 
+def _account_draft_name(base_draft: str, prof: str) -> str:
+    """附加版本草稿命名约定（与 preset_ops.clone_draft_with_presets 保持一致）。"""
+    return f"{base_draft}_{prof}"
+
+
+def _resolve_export_profiles(job_dir: str | None, explicit: list[str] | None) -> list[str]:
+    """本轮要导出的版本：显式 --profile > prompts.json 组 > job 声明 > 仅基础版。
+
+    基础版 a 恒在（草稿名就是原串流名，历史行为不变），其余版本按
+    `<基础草稿>_<版本>` 找克隆草稿。
+    """
+    if explicit:
+        procs = list(explicit)
+    elif job_dir:
+        procs = jm.prompt_groups(job_dir)
+        if not procs:
+            try:
+                procs = _declared_profiles(jm.load_job(os.path.join(job_dir, "job.json")))
+            except Exception:
+                procs = []
+    else:
+        procs = []
+    if "a" not in procs:
+        procs.insert(0, "a")
+    return list(dict.fromkeys(procs))
+
+
 def _record_export_freshness(draft_name: str, out_mp4: str) -> None:
     """写 E2 sidecar + `edges.e2.versions[<版本>]`；失败只告警（best-effort）。"""
     try:
@@ -147,7 +175,8 @@ def _record_export_freshness(draft_name: str, out_mp4: str) -> None:
         print(f"  [warn] 记录成品新鲜度失败（忽略）: {e}")
 
 
-def _finalize_export(draft_name: str, out_mp4: str, job_dir: str | None) -> bool:
+def _finalize_export(draft_name: str, out_mp4: str, job_dir: str | None,
+                     profile: str | None = None) -> bool:
     """导出成功后的收尾，顺序固定：台账 → 清 stale → E2。
 
     台账按实际导出的草稿写 `video.outputs[<版本>]`（多版本各记各的）；
@@ -159,7 +188,7 @@ def _finalize_export(draft_name: str, out_mp4: str, job_dir: str | None) -> bool
     if job_dir:
         try:
             job = jm.load_job(os.path.join(job_dir, "job.json"))
-            prof = _version_of_draft(draft_name, _declared_profiles(job))
+            prof = profile or _version_of_draft(draft_name, _declared_profiles(job))
             jm.record_video(job_dir, export_dir=os.path.dirname(out_mp4) or None,
                             export_file=out_mp4, draft_name=draft_name, profile=prof)
             print(f"  🧾 台账已登记: outputs.{prof} ← {os.path.basename(out_mp4)}")
@@ -534,7 +563,22 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=1800, help="导出超时秒数（默认 1800）")
     ap.add_argument("--cold-start", action="store_true",
                     help="导出前强制干净启动剪映（默认由实例管理器判定复用/重启）")
+    ap.add_argument("--profile", action="append", metavar="VERSIONS",
+                    help="额外导出的版本（可重复或逗号分隔，如 --profile b,tiktok）；"
+                         "基础版 a 恒导出，其余版本按 <草稿>_<版本> 找克隆草稿。"
+                         "缺省按 03_prompts/prompts.json 的 items[].group 判定")
     args = ap.parse_args()
+    if args.profile:
+        raw = ",".join(args.profile)
+        procs: list[str] = []
+        for p in (x.strip().lower() for x in raw.split(",")):
+            if not p:
+                continue
+            if not re.fullmatch(r"[a-z][a-z0-9]{0,7}", p):
+                ap.error(f"--profile 版本名不合法: {p}（小写字母开头，仅字母数字，≤8 位）")
+            if p not in procs:
+                procs.append(p)
+        args.profile = procs or None
 
     if args.mode == "export" and args.all_stream:
         targets = _all_stream_drafts()
@@ -583,8 +627,12 @@ def main() -> int:
             st = _state_of(state, target)
 
             if st.get("status") == "done":
-                print(f"⏭️  跳过已完成: {name}")
-                continue
+                # 已完成的剧默认跳过；显式 --profile 追加版本时不能整部跳过
+                done_profs = {p for p, v in (st.get("profiles") or {}).items()
+                              if (v or {}).get("status") == "done"}
+                if not args.profile or set(args.profile) <= done_profs:
+                    print(f"⏭️  跳过已完成: {name}")
+                    continue
 
             # ---- 生成阶段（full/generate，且输入不是现成草稿名时）----
             if args.mode in ("full", "generate") and not is_draft:
@@ -631,12 +679,6 @@ def main() -> int:
                 failed.append(name)
                 continue
             st["draft"] = draft
-            if _output_exists(draft):
-                print(f"⏭️  成品已存在，跳过导出: {draft}")
-                st["status"] = "done"
-                _save_state(state)
-                continue
-            print(f"\n📤 [{i+1}/{len(targets)}] 导出: {draft}")
             job_dir = _job_dir_for(target, is_draft)
             if job_dir:
                 try:
@@ -652,29 +694,65 @@ def main() -> int:
                         subtitle_guard.notify(job_dir)
                     failed.append(name)
                     continue
-            st["status"] = "exporting"
-            _save_state(state)
-            if _run_export(draft, args.timeout, cold_start=args.cold_start or None,
-                           job_dir=job_dir, keep_open=reuse):
-                out_mp4 = export_mp4_path(draft)
-                if _finalize_export(draft, out_mp4, job_dir):
-                    st["status"] = "done"
-                    _save_state(state)
-                    print(f"✅ 完成: {name}")
-                else:
-                    # 成品已落盘但台账没写成：保留 stale 标记，下次重跑而不是让 watcher 判冲突
-                    st["status"] = "export_failed"
-                    _save_state(state)
-                    failed.append(name)
-                    if reuse:
-                        _close_jianying_after_batch(f"{name} 台账登记失败，收尾复用实例")
-            else:
-                st["status"] = "export_failed"
+            # 多版本：基础版 a 用原串流草稿，其余用 `<基础草稿>_<版本>` 克隆草稿。
+            # 版本真源见 lib/job_manifest.prompt_groups（prompts.json items[].group）。
+            profiles = _resolve_export_profiles(job_dir, args.profile)
+            prof_state = st.setdefault("profiles", {})
+            todo: list[tuple[str, str]] = []
+            job_failed = False
+            for prof in profiles:
+                dn = draft if prof == "a" else _account_draft_name(draft, prof)
+                ps = prof_state.setdefault(prof, {})
+                if _output_exists(dn):
+                    print(f"⏭️  成品已存在，跳过导出: {dn}")
+                    ps["status"] = "done"
+                    continue
+                if not os.path.isdir(os.path.join(JY_DRAFT_ROOT, dn)):
+                    msg = f"缺版本草稿: {dn}"
+                    if args.profile:
+                        print(f"✗ {msg}（--profile 显式指定）")
+                        ps.update({"status": "export_failed", "error": msg})
+                        job_failed = True
+                    else:
+                        print(f"⏭️  {msg}（prompts.json 声明但尚未克隆，跳过）")
+                    continue
+                todo.append((prof, dn))
+            if todo:
+                st["status"] = "exporting"
                 _save_state(state)
+            for prof, dn in todo:
+                ps = prof_state.setdefault(prof, {})
+                print(f"\n📤 [{i+1}/{len(targets)}] 导出 {prof}: {dn}")
+                if _run_export(dn, args.timeout, cold_start=args.cold_start or None,
+                               job_dir=job_dir, keep_open=reuse):
+                    out_mp4 = export_mp4_path(dn)
+                    if _finalize_export(dn, out_mp4, job_dir, profile=prof):
+                        ps.update({"status": "done", "output": os.path.basename(out_mp4)})
+                        _save_state(state)
+                        print(f"✅ 完成: {dn}")
+                    else:
+                        # 成品已落盘但台账没写成：保留 stale 标记，下次重跑而不是让 watcher 判冲突
+                        ps["status"] = "export_failed"
+                        job_failed = True
+                        _save_state(state)
+                        if reuse:
+                            _close_jianying_after_batch(f"{name} 台账登记失败，收尾复用实例")
+                else:
+                    ps["status"] = "export_failed"
+                    job_failed = True
+                    _save_state(state)
+                    if reuse:
+                        # 失败后实例可能停在编辑页/导出视图：收干净再开下一部
+                        _close_jianying_after_batch(f"{name} 导出失败，收尾复用实例")
+
+            if job_failed:
+                st["status"] = "export_failed"
                 failed.append(name)
-                if reuse:
-                    # 失败后实例可能停在编辑页/导出视图：收干净再开下一部
-                    _close_jianying_after_batch(f"{name} 导出失败，收尾复用实例")
+            else:
+                st["status"] = "done"
+                if todo:
+                    print(f"✅ 完成: {name}")
+            _save_state(state)
 
             if i < len(targets) - 1 and reset > 0:
                 print(f"😴 休息 {reset:.0f}s 后继续下一部…")

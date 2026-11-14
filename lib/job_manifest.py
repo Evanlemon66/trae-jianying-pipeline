@@ -38,6 +38,25 @@ PUBLISH_DIRS = (
     "06_publish/receipts",
 )
 
+
+def prompt_groups(job_dir: str) -> list[str]:
+    """版本声明的唯一真源：03_prompts/prompts.json 的 items[].group（a 优先排序）。"""
+    pp = os.path.join(job_dir, "03_prompts", "prompts.json")
+    if not os.path.isfile(pp):
+        return []
+    try:
+        with open(pp, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    groups: set[str] = set()
+    for it in (data.get("items") or []):
+        g = str((it or {}).get("group") or "").strip().lower()
+        if re.fullmatch(r"[a-z][a-z0-9]{0,7}", g):
+            groups.add(g)
+    return sorted(groups, key=lambda g: (g != "a", g))
+
+
 # prepare 建剧时预建的完整目录集（含发布阶段占位目录）
 JOB_DIRS = BASE_DIRS + PUBLISH_DIRS
 
