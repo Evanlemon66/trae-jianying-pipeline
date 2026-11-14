@@ -1,8 +1,9 @@
 # Drama Cover Builder 短剧封面生成 Skill 使用手册
 
-> 版本：v1.0 · 2026-10-27  
+> 版本：v1.1 · 2026-11-14  
 > 路径：`<项目根>/.trae/skills/drama-cover-builder/`  
-> 适用：Trae CN / Trae International（项目内 Skill，可被 pipeline / batch_runner / 任意脚本独立消费）
+> 适用：Trae CN / Trae International（项目内 Skill，可被 pipeline / batch_runner / 任意脚本独立消费）  
+> 口径：以 skill 包内实现为准（`SKILL.md`、`references/cover-spec.md`、`references/handoff-contract.md`、`scripts/drama_cover.py`）
 
 ---
 
@@ -53,7 +54,7 @@ Skill 是**三阶段独立模块**：
 |------|------|------|
 | Python | 3.12+ | 任意 |
 | Pillow | 10+ | `pip install pillow` |
-| ffmpeg | 任意 | 三重查找：PATH → `D:\AI_Deps\tools\ffmpeg\bin` → WinGet 路径 |
+| ffmpeg | 任意 | 三重查找：PATH → `<依赖根>\tools\ffmpeg\bin` → WinGet 路径 |
 | 中文字体 | msyhbd | `C:\Windows\Fonts\msyhbd.ttc`（Windows 自带） |
 
 ### 可选
@@ -78,7 +79,9 @@ Skill 是**三阶段独立模块**：
 │       └── pillow_styles.json            ← 阶段 2b：4 样式 + 画布参数
 └── references/
     ├── title-spec.md                     ← 阶段 1：标题生成唯一执行标准（v4）
-    ├── cover-spec.md                     ← 阶段 2：出图硬约束与构图规范
+    ├── cover-spec.md                     ← 阶段 2：出图硬约束与构图规范（含两条 P0）
+    ├── handoff-contract.md               ← job.json / covers_manifest / 版本封面绑定的唯一契约
+    ├── runbook-cover-8p.md               ← 8 步封面生产 runbook（含质检清单）
     ├── scorecard.md                      ← 七维评分与矩阵推荐规则
     ├── failure-cases.md                  ← 翻车案例库 + 已验证标题台账
     ├── platform-rules.md                 ← 审核红线 / 平台规格 / 烧字字数档位
@@ -114,7 +117,7 @@ dc.compose_cover("base.jpg", "out.jpg", title="谁料野猪王竟被他一箭放
 ```
 你：帮我给这段短剧简介生成标题
 简介：知青为了活下去，带着粮肉和一群敢打敢拼的兄弟...
-底图：D:\素材\ganshan_ep01.jpg
+底图：<素材图>
 ```
 
 流程（**阶段 1 → 用户选择 → 阶段 2，中间有强制选择门禁**）：
@@ -137,7 +140,7 @@ dc.compose_cover("base.jpg", "out.jpg", title="谁料野猪王竟被他一箭放
 1. 他拿義兄當親哥，義兄卻反手背叛——...
 2. 當年遭義兄背叛，他連口氣都沒處發——...
 3. 一個趕山的也配號令萬獸？...
-底图：D:\素材\ganshan_ep01.jpg
+底图：<素材图>
 ```
 
 Trae 跳过阶段 1，直接进阶段 2 合成。
@@ -148,7 +151,7 @@ Trae 跳过阶段 1，直接进阶段 2 合成。
 $skill = ".trae\skills\drama-cover-builder\scripts\drama_cover.py"
 
 # Step 1: 从视频抽最佳帧
-python $skill art-from-video --video "D:\短剧\第1集.mp4" --out "best_frame.jpg"
+python $skill art-from-video --video "<剧集根>\第1集.mp4" --out "best_frame.jpg"
 
 # Step 2: 一键出 4 张封面（3 横 + 1 竖，都不带标题）
 python $skill compose-pillow --base "best_frame.jpg" --style all --out "./cover_out"
@@ -156,8 +159,8 @@ python $skill compose-pillow --base "best_frame.jpg" --style all --out "./cover_
 # Step 3: 给横版加标题（单独指定）
 python $skill compose-pillow --base "best_frame.jpg" --title "知青带粮肉闯山野！" --out "./cover_out/hit.jpg" --size horizontal --style classic_red_stroke
 
-# Step 4: 只把竖版写进剪映草稿
-python $skill write-draft --cover "./cover_out/cover_vertical.jpg" --draft-dir "C:\Users\<你>\AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft\80ganshan_ep01"
+# Step 4: 只把竖版写进剪映草稿（草稿根默认是 projects_root，见 presets.json）
+python $skill write-draft --cover "./cover_out/cover_vertical.jpg" --draft-dir "<剪映草稿根>\80ganshan_ep01"
 ```
 
 ### 场景 C：pipeline 自动消费（阶段 3）
@@ -321,6 +324,16 @@ python drama_cover.py full
 
 `--title` 不传时，底图直接覆盖裁切，不画蒙版也不画标题——适合后期叠字或纯视觉封面。
 
+### 竖版元素完整性（P0，整张作废）
+
+竖版与横版是同一套元素要求：人物、动物、关键道具、场景元素必须齐全完整。判定基准是**竖版扣掉顶部标题占位后的安全画面区**。出现以下任一情况即判不合格，**整张作废重出，不进入评分**：
+
+- 横版有、竖版没有的元素（竖幅裁切丢掉关键道具/人物/场景）；
+- 元素被切边、只露局部、外形不可辨认；
+- 顶部标题区压住动物头部或主体。
+
+横版、竖版同标准；动物完整性（不得截断头/四肢/尾）是另一条独立 P0，两条可同时命中。出图后人工/VLM 复核，不引入检测模型。原文见 `references/cover-spec.md` 的两条 P0 否决项。
+
 ---
 
 ## 8. 阶段 3：剪映草稿写入
@@ -333,6 +346,25 @@ python drama_cover.py full
 ```
 
 两个步骤合并在 `set_draft_cover()` + `set_cover_composition()` 里，`write-draft` 子命令自动调用。
+
+### 落盘原语：`draft_io.write_draft_content`
+
+`write-draft` 不再自己 `json.dump`，草稿文件写入统一走 `pipeline/draft_io.py`（全仓唯一写盘点），顺序固定：
+
+1. **不变量校验**：逐段比较 `source` 素材时长与片段目标时长（按帧比较，允许 1 帧取整误差），并递归校验内层草稿；超限抛 `DraftInvariantError`；
+2. **备份**：默认写 `<draft_content.json>.coverbak_<ts>`；
+3. **原子替换**：先写临时文件再 `os.replace`，不会出现写一半的 JSON；
+4. **新鲜度留痕**：可选写 sidecar。
+
+校验不过就**拒绝落盘**并打印原因，旧草稿保持可用，不会留半成品。skill 包外运行时若找不到 `pipeline/draft_io.py`，`save_draft()` 直接报错，不会退回裸 `json.dump`。
+
+### 版本封面绑定（B/C 组）
+
+多版本时每份草稿的 `draft_cover.jpg` 必须取**本组**竖版图（基础版 `04_covers/cover_04_vertical.*`，扩展版 `04_covers/<组>/cover_04_vertical_<组>.*`），统一由 `job_manifest.resolve_profile_cover()` 解析：
+
+- 本组有竖版图 → 用它；
+- 本组缺图 → **不回退 A 组封面**，改用本剧视频抽帧兜底，台账记 `cover.source=frame`；
+- 连可抽帧的视频都没有 → **硬失败**，报出缺图的组与张数，不进入导出。
 
 ### ffmpeg 抽帧（art-from-video / set_draft_cover）
 
@@ -383,7 +415,36 @@ found = _dc.detect_cover_from_dir(series_dir)
 3) ffmpeg 抽帧 →  skill 的 set_draft_cover(extract_from_video=...)
 ```
 
-pipeline 只管消费，不关心来源。
+pipeline 只管消费，不关心来源。多版本时以 `covers_manifest` 与本组竖版图为准，见下面三节。
+
+### cover_job 封面台账（`04_covers/covers_manifest.json`）
+
+走完整链路（`cover_job` + `ingest`）时，封面不是散图，而是登记进台账。每条只认这些字段：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `group` | 是 | 组名 `a` / `b` / `c`…，与版本名一致 |
+| `slot` | 是 | `1` / `2` / `3` / `vertical` |
+| `file` | 是 | 相对 job 目录的路径 |
+| `sha256` | 是 | 以磁盘实算为准；台账里已写的值与磁盘不一致即报错 |
+| `bytes` | 是 | 文件字节数 |
+| `variant_of` | 扩展组必填 | 指向真实存在的 A 组同槽源图；基础版必须为空 |
+| `variant_of_sha256` | 扩展组必填 | 源图 sha256，必须与磁盘一致 |
+
+`size` / `title_id` / `crop` 可选。台账由 `ingest`（`job_manifest.sync_covers_manifest`）按磁盘实图重建，不要手写。扩展组源图缺失、sha 不匹配、基础版写了 `variant_of` 都算错误：2026-11-14 之后创建的 job 直接阻断 ingest；存量 job 只告警，可用 `--strict-manifest` / `--lenient-manifest` 覆盖。
+
+### 版本判定：组数即版本数
+
+先读 `job.json` 已声明的组（`titles.selected_groups[].group` → `prompts.items[].group` → `workflow.preset_profile`）；job 缺失或不完整才回落到 `03_prompts/prompts.json` 的 `items[].group`。判定来源（`job` / `job+prompts` / `prompts` / `default`）会写进计划与 watcher 日志。
+
+组按 A/B/C… 排序，组序即版本序（A→`presets_a`、B→`presets_b`），**组数即版本数**。某组缺 `presets_<组>` 只把该组标 blocked，基础版照常导出。
+
+### 导出闸门
+
+导出前两道硬闸，任一不过都不导出：
+
+1. **剪辑闸门**：最近一次 edit 失败且未修复（`failed` / `paused` / 退避中 / 退避窗口已到但尚未重跑成功）一律不进导出；窗口已过且已有草稿时，本轮改为**重跑剪辑**，不拿旧草稿导出。
+2. **产物闸门**：导出进程返回成功，但三件套（`.mp4` / `-封面.jpg` / `.mp4.progress.json`）缺任一件，或质检不过，整单判失败（`failure_class=verify_failed`），不写 `video.outputs`、不算已导出。
 
 ---
 
@@ -391,6 +452,12 @@ pipeline 只管消费，不关心来源。
 
 ### Q: 为什么有两个 gen_uuid？
 pipeline.py 里的 `gen_uuid()` 被创建草稿、轨道 ID、片段 ID、demucs 路径生成等 28+ 处非封面代码调用，不能删。skill 里自己定义一份独立版本，两者互不依赖。
+
+### Q: `covers_manifest.json` 报 sha256 / bytes 不一致怎么办？
+别手改台账。台账按磁盘实图重建：确认 `04_covers/` 下的图没被替换或删掉，然后重跑 `ingest`（必要时加 `--strict-manifest` 定位到具体 group/slot）。扩展组还要确认 `variant_of` 指向的 A 组源图仍在、sha 未变。
+
+### Q: B/C 版为什么没有沿用 A 版封面？
+契约要求版本封面各用各的。本组缺竖版图时改为视频抽帧兜底（台账 `cover.source=frame`），不再回退 A 组；连可抽帧的视频都没有就直接失败，避免张冠李戴。
 
 ### Q: write-draft 为什么要写原生 composition？
 **只覆盖 draft_cover.jpg 不够**——剪映 5.9 打开草稿时若顶层 `cover` 字段为 None，会用视频第一帧覆盖掉 draft_cover.jpg。必须同时建 composition 材质并挂到 `materials.drafts` + 设置顶层 `cover` 字段。
@@ -405,7 +472,7 @@ pipeline.py 里的 `gen_uuid()` 被创建草稿、轨道 ID、片段 ID、demucs
 默认 `msyhbd.ttc`（微软雅黑粗体），候选列表：msyhbd → msyh → simhei → simsun，都找不到回退 DejaVuSans（全英文）。
 
 ### Q: ffmpeg 路径？
-三重查找：PATH `which ffmpeg` → `D:\AI_Deps\tools\ffmpeg\bin` → WinGet 路径。
+三重查找：PATH `which ffmpeg` → `<依赖根>\tools\ffmpeg\bin` → WinGet 路径。
 
 ---
 
@@ -413,5 +480,6 @@ pipeline.py 里的 `gen_uuid()` 被创建草稿、轨道 ID、片段 ID、demucs
 
 | 日期 | 版本 | 改动 |
 |------|------|------|
+| 2026-11-14 | v1.1 | 对齐 skill 当前实现：新增竖版元素完整性 P0、`covers_manifest` 字段收紧（group/slot/file/sha256/bytes + `variant_of`）、B/C 缺竖版改抽帧兜底（`cover.source=frame`）、版本判定 job 优先/prompts 兜底、`draft_io.write_draft_content` 落盘顺序、导出双闸门；本机路径改占位符 |
 | 2026-10-27 | v1.0 | 按最新架构重写：skill 作为三阶段独立模块、标题规范换成 v3（版1 爽文①/版2 爽文②/版3 传奇版狠反问）、Pillow 新增横版 2848×1600 尺寸族、write-draft 改为原生 composition 正确做法、pipeline.py / batch_runner.py 已接入 skill |
 | 2026-10-22 | Phase 2 最终版 | 旧版（仅为设计蓝图，脚本本体从未落地） |
