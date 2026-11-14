@@ -2,7 +2,7 @@
 
 > 盘点范围：`lib/`、`pipeline/`、`pipeline_ui/`、`scripts/`、`.trae/skills/jianying-editor/` 及 `specs/`。
 > 生成时间：2026-11-14。基于当前工作区（含未提交改动）。
-> 本次仅做只读核查：未修改代码、未启停剪映或 watcher、未运行导出、未触碰 `D:\短剧` 下 job 数据。盘点时 B 版导出正在进行。
+> 本次仅做只读核查：未修改代码、未启停剪映或 watcher、未运行导出、未触碰 `<剧集根>` 下 job 数据。盘点时 B 版导出正在进行。
 >
 > 排序原则：按“会不会静默产出错误成品”从高到低，不按改动成本排序。
 > 证据不足的条目已显式标注“未验证”，不写成结论。
@@ -309,7 +309,7 @@
 ## 附：核查方法与边界
 
 - **已核查**：`lib/freshness.py`、`lib/cover_watch.py`、`lib/export_state.py`、`lib/jianying_launch.py`、`lib/failure_class.py`、`pipeline/pipeline.py`、`pipeline/series_runner.py`、`pipeline/prune_workdirs.py`、`pipeline/archive_job.py`、`pipeline/stream_manifest.py`、`scripts/freshness_baseline.py`、`pipeline_ui/jianying_ui.py`、`.trae/skills/jianying-editor/examples/robust_auto_export.py`、`tests/test_export_targets_profile.py`。
-- **未执行**：未改代码、未改 `D:\短剧` job 数据、未启停剪映/watcher、未跑导出、未重跑测试。
+- **未执行**：未改代码、未改 `<剧集根>` job 数据、未启停剪映/watcher、未跑导出、未重跑测试。
 - **未验证清单**：
   - 剪映 UI“恢复备份”的实际取文件规则（R04）。
   - 146 集草稿 293 素材 / 292 缺失的现场数据（R05）。

@@ -70,7 +70,7 @@ description: 中文短剧封面全链路——生成 T/N 标题候选池（24 �
 Stage 0 的建目录入口已从脚本迁到 **Trae 侧库函数** `lib/job_manifest.py::create_job()`（没有 CLI 子命令；`scripts/drama_cover.py` 已移除 `prepare`）：
 
 ```powershell
-python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.create_job(series_dir=r'D:\短剧\重生八零，打猎卖货养妻女')"
+python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.create_job(series_dir=r'<剧集根>\重生八零，打猎卖货养妻女')"
 ```
 
 - 返回 `{job_dir, job_path, job, reference, synopsis, video}`；`job.json` 已存在时抛 `FileExistsError`，需要 `force=True` 重建（对应历史 `history` 事件仍记 `prepare`）。
@@ -118,7 +118,7 @@ python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.c
 
 **回 Trae（本地执行段）**
 
-8. 用户回到 Trae 说“封面已就位”，Trae 依次：`validate --fix`（补算全部 hash 并校验）→ `ingest`（登记+规范化+改名+推进 stage）→ `record-video`（登记 pipeline 导出目录）→ 草稿封面（`scripts/drama_cover.py write-draft`）/ 发布 / 清理；或一条 `python lib/cover_watch.py --root "D:/短剧"` 全自动跑完（含串流导出 mp4 与 Toast 通知）。豆包侧至此交付完毕。
+8. 用户回到 Trae 说“封面已就位”，Trae 依次：`validate --fix`（补算全部 hash 并校验）→ `ingest`（登记+规范化+改名+推进 stage）→ `record-video`（登记 pipeline 导出目录）→ 草稿封面（`scripts/drama_cover.py write-draft`）/ 发布 / 清理；或一条 `python lib/cover_watch.py --root "<剧集根>"` 全自动跑完（含串流导出 mp4 与 Toast 通知）。豆包侧至此交付完毕。
 
 唯一规则：**不在对话里手写 job.json**（它是 Trae 侧 CLI 的收口产物），也绝不编造 hash；只交内容产物，文件内容必须完整可复制，不给“略”。
 
@@ -323,7 +323,7 @@ python scripts/drama_cover.py full --video "<mp4>" --title "<标题>" --out "<�
 
 ```powershell
 python lib/cover_watch.py                        # 读 pipeline/presets.json 的 watch 段：roots 自动发现
-python lib/cover_watch.py plan --root "D:/短剧"  # 只查看：各剧阶段/意图来源/下一步/被挡原因
+python lib/cover_watch.py plan --root "<剧集根>"  # 只查看：各剧阶段/意图来源/下一步/被挡原因
 python lib/cover_watch.py --hold --once          # 只列计划不执行（先核对 job.json 再放行）
 python lib/cover_watch.py --phase export --once  # 单轮强制只推进导出（配合 export_policy=manual）
 python lib/cover_watch.py status --job "<cover_job>"
@@ -333,11 +333,11 @@ python lib/cover_watch.py inspect --job "<cover_job>"   # 只读聚合：intent 
 归档（把整剧搬到独立归档池，watcher 永久不再调度；先 `--dry-run` 核对）：
 
 ```powershell
-python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档" --dry-run
-python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档"
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>" --dry-run
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>"
 ```
 
-配置 `<repo>/pipeline/presets.json` 的 `watch` 段（从 `presets.example.json` 复制起步），每轮热加载、改完不用重启：`{"watch":{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":[],"export_policy":"immediate","hold":false}}`。`roots` 下的 `<剧集>/cover_job` 自动发现，无需登记。归档池根目录另行配置 `watch.archive_root`（仅 `pipeline/archive_job.py` 使用，必须在 `roots` 之外；`roots` 为空时归档脚本拒绝执行）。
+配置 `<repo>/pipeline/presets.json` 的 `watch` 段（从 `presets.example.json` 复制起步），每轮热加载、改完不用重启：`{"watch":{"roots":["<剧集根>"],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":[],"export_policy":"immediate","hold":false}}`。`roots` 下的 `<剧集>/cover_job` 自动发现，无需登记。归档池根目录另行配置 `watch.archive_root`（仅 `pipeline/archive_job.py` 使用，必须在 `roots` 之外；`roots` 为空时归档脚本拒绝执行）。
 
 **两阶段**：无串流草稿 → **edit**（validate --fix → ingest 归并 dispatch → batch_runner --no-export 生成草稿+帧对齐）；有草稿 + `workflow.mode=full` + 策略放行 → **export**（导出 mp4 → verify 质检 → record-video → derive），但**最近一次 edit 失败/退避/暂停未修复时一律不许进导出**（`build_plan` 每轮无条件读 `.edit_state.json`）。`mode=edit_only` 永远停在草稿，等人工把 `workflow.mode` 改为 `full` 并 `intent_revision` +1。**export_policy**：`immediate`（默认，剪完即导）/ `after_edit_queue_drained`（全部剧剪完才开始导出）/ `manual`（等 `--phase export`）。**意图**：运行期只读 `job.json.workflow`；`dispatch.json` 仅在 `intent_revision==0` 时归并，人工 +1 后 job.json 永远优先（冲突记日志+桌面通知）。旧版 `export_config.json` 仍兼容。多 job 单 watcher 串行；跨进程由 `.export.lock` 互斥。进度看 Toast / `watcher.log` / `06_publish/pipeline.log` / `plan` / `status`。**多版本**：版本判定 job 优先、prompts 兜底（`job.json` 的 `titles.selected_groups` → `prompts.items` → `workflow.preset_profile`，job 没有或不完整才回落 `03_prompts/prompts.json`），派生的 `_<版本>` 草稿由 watcher 按组补克隆，克隆时同步写入该组竖版封面（见 §6.3）；缺 `presets_<组>` 的组标 blocked（写进 `video.outputs.<组>`）不阻断其余版本；清理/归档只删成品与中间产物，`04_covers/` 各组封面始终保留。
 

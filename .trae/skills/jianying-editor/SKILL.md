@@ -88,14 +88,14 @@ Read the individual rule files for specific tasks and constraints:
 
 - `job.json.stage=archived` 是合法 stage，含义是「该剧已归档、不再参与调度」；由归档脚本写入，watcher 的触发判定对它**硬拦**，`--phase` / `--once` / `--job` 都绕不过去（硬拦发生在阶段/单剧过滤之前）。
 - 准入（默认需同时满足，`--force` 可跳过）：① `publish.status=published` 或 `video.export_state=cleaned`；② **所有声明版本都已完成**——`video.outputs` 里每个版本的 `state` ∈ `exported` / `cleaned`，任一版本未导出则跳过归档。首次归档时 `.watcher.lock` 的 pid 存活（活锁）或 `.export_state.json` `status=exporting` 会拒绝（续做只校验位置与目标）。
-- 归档池位置：`archive_root` 不能等于或位于 `watch.roots` 之下；`watch.roots` 为空时脚本直接拒绝执行（fail-closed）。建议与 roots 同盘、独立根（如 `D:/短剧_存档`）。
+- 归档池位置：`archive_root` 不能等于或位于 `watch.roots` 之下；`watch.roots` 为空时脚本直接拒绝执行（fail-closed）。建议与 roots 同盘、独立根（如 `<归档根>`）。
 - 断点可重入：`stage` 已 archived、源目录仍在而目标不存在时，重跑同一命令即续做移动；先写 stage 再搬目录，因此移动失败也不会再被调度。
 - 归档会同步改写 `pipeline/_stream_manifests/*.json` 的 `paths.source_dir`；不改写会导致后续 `stream_manifest.py clean` 按旧路径找不到源。
 - `publish.status` 当前只有手工 `python lib/job_manifest.py publish-record ...` 会写 `published`，自动发布链没有写入路径（暂未实现）；不要依据它判断「已发布」。
 
 ```powershell
-python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档" --dry-run
-python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档"
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>" --dry-run
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>"
 ```
 
 完整契约见 `drama-cover-builder/references/handoff-contract.md` §7.4。
@@ -151,6 +151,16 @@ Use these templates and scripts for complex tasks:
   ```bash
   python <SKILL_ROOT>/scripts/api_validator.py
   ```
+
+## 🩺 环境自检（仓库根）
+
+新机器 / 新路径先跑一条只读自检：
+
+```bash
+python pipeline/doctor.py
+```
+
+逐项报告仓库布局、Python 依赖、ffmpeg/ffprobe、剪映安装与版本、剪映进程/桌面会话、各配置路径、草稿根索引。每项给出「通过 / 缺什么 / 怎么补」；`[缺失]` 时退出码 1。不会启停剪映或 watcher，也不会跑导出。
 
 ## 🚀 快速开始示例
 

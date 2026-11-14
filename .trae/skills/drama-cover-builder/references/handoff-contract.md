@@ -9,7 +9,7 @@
 给定一个剧集目录后，默认在**其下**建一个任务目录 `cover_job/`，不污染原始素材，重跑或清理只动这一个目录。
 
 ```
-D:\短剧\<剧名>\
+<剧集根>\<剧名>\
 ├── 封面.png / 简介.txt / 第N集.mp4     # 原始素材，只读
 └── cover_job\                          # 唯一写入区
     ├── job.json
@@ -373,10 +373,10 @@ python lib/job_manifest.py publish-record --job "<cover_job>" `
 
 ```powershell
 # 建目录（Trae 侧 Python API；原 scripts/drama_cover.py prepare 已移除）
-python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.create_job(series_dir=r'D:\短剧\重生八零，打猎卖货养妻女')"
+python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.create_job(series_dir=r'<剧集根>\重生八零，打猎卖货养妻女')"
 
 # 登记 Stage 1 结果（标题、初始提示词）
-python lib/job_manifest.py record-titles --job "D:\短剧\重生八零，打猎卖货养妻女\cover_job" `
+python lib/job_manifest.py record-titles --job "<剧集根>\重生八零，打猎卖货养妻女\cover_job" `
   --titles "02_titles\titles.json" --prompt "02_titles\prompt.txt"
 
 # 人工门禁：依次为封面1/2/3 给 3 个编号
@@ -391,7 +391,7 @@ python lib/job_manifest.py resolve --job "<cover_job>" --no-auto    # 严格门�
 # 登记 pipeline 导出目录（自动探测 stream manifest，只记录不复制 mp4）
 python lib/job_manifest.py record-video --job "<cover_job>"
 python lib/job_manifest.py record-video --job "<cover_job>" --draft-name "<串流草稿名>"
-python lib/job_manifest.py record-video --job "<cover_job>" --export-dir "D:\油管打猎\L\<目录>"  # 手工指定优先于自动探测
+python lib/job_manifest.py record-video --job "<cover_job>" --export-dir "<导出根>\<目录>"  # 手工指定优先于自动探测
 python lib/job_manifest.py record-video --job "<cover_job>" --dry-run
 
 # 指定/清除导出裁剪秒数（写 video.cut_s，默认 null 不裁剪；watcher 读到非 null 会传 --cut）
@@ -413,8 +413,8 @@ python scripts/drama_cover.py full --video "<mp4>" --title "<标题>" --out "<�
 # 落盘两阶段调度（监听 cover_job，产物齐自动跑；串行、每轮只推进一部）
 #   edit 阶段：validate --fix → ingest（含 dispatch 归并）→ batch_runner --no-export（生成串流草稿+帧对齐）
 #   export 阶段：导出 mp4 → verify 质检 → record-video → derive → Toast
-python lib/cover_watch.py --root "D:/短剧"                 # 扫盘自动发现 <剧集>/cover_job（推荐）
-python lib/cover_watch.py plan --root "D:/短剧"            # 只查看：各剧阶段/意图来源/rev/下一步/被挡原因
+python lib/cover_watch.py --root "<剧集根>"                 # 扫盘自动发现 <剧集>/cover_job（推荐）
+python lib/cover_watch.py plan --root "<剧集根>"            # 只查看：各剧阶段/意图来源/rev/下一步/被挡原因
 python lib/cover_watch.py --hold --once                    # 只列计划不执行（先核对 job.json 再放行）
 python lib/cover_watch.py --phase export --once            # 单轮强制只推进导出阶段（配合 export_policy=manual）
 python lib/cover_watch.py status --job "<cover_job>"
@@ -422,12 +422,12 @@ python lib/cover_watch.py inspect --job "<cover_job>"      # 只读聚合：inte
 python lib/cover_watch.py          # 无参：读 <repo>/pipeline/presets.json 的 watch 段（每轮热加载）
 
 # 归档：置 stage=archived 并搬入独立归档池（硬拦 watcher；先 --dry-run 核对计划）
-python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档" --dry-run
-python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档"
-# watch 段：{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>" --dry-run
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>"
+# watch 段：{"roots":["<剧集根>"],"jobs":[],"exclude":[],"settle":30,"interval":5,
 #            "derive":[],"export_policy":"immediate","hold":false,
 #            "cold_start":true,"export_stall_timeout":1800,"retry_pause_after":5,
-#            "archive_root":"D:/短剧_存档"}
+#            "archive_root":"<归档根>"}
 #   export_policy: immediate（剪完即导，默认）/ after_edit_queue_drained（全部剪完才导出）/ manual（等 --phase export）
 #   archive_root: 归档池根目录，仅 pipeline/archive_job.py 使用；必须位于 roots 之外（见 §7.4）
 #   derive: 全局派生平台列表，默认 []（不派生）；剧级声明优先走 dispatch.json
@@ -571,7 +571,7 @@ edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读�
   2. **所有声明版本都已完成**——`video.outputs` 里每个版本的 `state` ∈ `exported` / `cleaned`；任一版本未导出则跳过归档。
 - **拒绝/跳过**（首次归档）：`.watcher.lock` 的 pid 仍存活（活锁）；`.export_state.json` `status=exporting`（导出进行中）；归档目标已存在（不覆盖，需人工处理）；`archive_root` 等于或位于任一 `watch.roots` 之下（按规范化真实路径比较）；`watch.roots` 未配置时 **fail-closed 直接拒绝**（无法校验归档池位置）。续做（已 archived）只重复位置与目标校验，不再查活锁/导出中。
 - **断点可重入**：`stage` 已 `archived` 且源目录仍在、目标不存在 → 继续移动；源已不在且目标存在 → 跳过（视为完成）；两者都不存在 → 报错。因为 `stage` 先写、目录后搬，移动失败也不会再被 scheduler 选中，修复占用/空间后重跑同一命令即可续做。
-- **归档池位置**：`--archive-root` 优先，未传时读 `watch.archive_root`；建议与 `watch.roots` 同盘、独立根（如 `D:/短剧_存档`），不要放在 roots 内。
+- **归档池位置**：`--archive-root` 优先，未传时读 `watch.archive_root`；建议与 `watch.roots` 同盘、独立根（如 `<归档根>`），不要放在 roots 内。
 - **必须同步 manifest**：`_stream_manifests` 里的 `paths.source_dir` 是后续 `stream_manifest.py clean` / 回执定位的入口；不改写会出现「剧已搬走、清理仍按旧路径找源」的空转。脚本已自动改，手工搬目录时必须照做。
 - **回迁**：目录移回 roots 后不会自动恢复调度，仍需人工把 `job.json.stage` 改回 `video_ready`（或其他待办阶段）。
 - **`publish.status` 现状**：只有手工 `python lib/job_manifest.py publish-record ...` 会写 `published`；自动发布链**没有写入路径（暂未实现）**。因此不要依据 `publish.status` 判断「已发布」，归档准入实际以 `video.export_state=="cleaned"` 为准，或显式 `--force`。
