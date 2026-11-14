@@ -106,8 +106,8 @@ python -c "import sys; sys.path.insert(0,'lib'); import job_manifest as jm; jm.c
 **Stage 2（即梦出图）**
 
 5. 读 `references/cover-spec.md` 与 `references/prompt-spec.md`，按门禁结果为**每组各 4 张图**反推提示词：3 张横版分别使用该组选中的 3 条标题，竖版使用该组总分最高的一条；五段结构中构图由封面位决定（1 爆点仰拍 / 2 冷暖对比 / 3 守护挡身；竖版胸像逆光）。第二组必须使用第二组标题，不得复用第一组；只有跨组选中相同标题时才追加视觉加码。提示词写入 `03_prompts/prompts.json` 与 `prompts.md` 全文输出给用户保存（`channel` 按 `references/channels.md` 填写，`group` 按 A/B/C… 标记）。**不需要输出 job.json**——`prompts` 登记由 Trae 侧 `ingest` 从 prompts.json 重建。
-6. 调用即梦：每张上传 `01_input` 里的参考图作身份锚点 + 对应提示词，逐张生成；按 cover-spec 四项硬约束（无文字/无武器/无血腥/无儿童）自检，不合格重做该张。
-7. **每组 4 张图**按组存入 `04_covers/`：A 组在根目录，B 组在 `b_group/`，更多组按契约账号目录扩展。**文件名可任意**（`cover_01_hit` / `封面图1` / `T2 封面` / `竖版` 都行，png/jpg/jpeg/webp）——Trae 侧 `ingest` 会按组、竖版宽高比与编号自动识别并改名到契约名。**不需要输出 job.json**——`cover_map` 登记与 hash 由 `ingest` 重建。
+6. 调用即梦：每张上传 `01_input` 里的参考图作身份锚点 + 对应提示词，逐张生成；按 cover-spec §一 硬约束逐条自检（无文字/无武器/无血腥/无儿童/动物完整/竖版元素完整），不合格重做该张。
+7. **每组 4 张图**按组存入 `04_covers/`：A 组在根目录，B 组在 `b_group/`，更多组按契约账号目录扩展。**文件名可任意**（`cover_01_hit` / `封面图1` / `T2 封面` / `竖版` 都行，png/jpg/jpeg/webp）——Trae 侧 `ingest` 会按组、竖版宽高比与编号自动识别并改名到契约名。**不需要输出 job.json**——`cover_map` 登记与 hash 由 `ingest` 重建。**版本判定 job 优先、prompts 兜底**：先读 `job.json` 的 `titles.selected_groups` / `prompts.items` / `workflow.preset_profile`，job 没有或不完整才回落 `03_prompts/prompts.json` 的标题组；job 声明了 B 就一定会出第二版本，`b_group/` 有图但 job/prompts 都没有第二组时才是单版本。**某组缺 `presets_<组>` 只把该组标 blocked（写进 `video.outputs.<组>`），A 照常生成导出**，不静默降级、也不伪装成功。
 7.5. 若用户在发起任务时指定了**裁剪秒数 / 派生平台 / 只剪辑不导出**，再输出 `dispatch.json` 全文让用户存入 `cover_job/`（无需指定则不输出，缺省=不裁剪、不派生、先剪辑再导出）：
 
 ```json
@@ -237,7 +237,7 @@ Pillow 路线出的是文字压图封面，与 Stage 2 的 AI 重绘图是两条
 
 ### 6.3 多版本（A/B/C…）交付约定
 
-组名 `A/B/C…`（门禁段数决定）与预设版本 `a/b/c…` 按序一一对应，**可声明 3 个以上版本**（`workflow.preset_profile="a,b,c"`，也接受 `"a，b"` / `["a","b"]` / `"presets_a,presets_b"`）。
+组名 `A/B/C…`（`03_prompts/prompts.json` 的 `items[].group`）与预设版本 `a/b/c…` 按序一一对应。**版本判定 job 优先、prompts 兜底**：先读 `job.json` 的 `titles.selected_groups[].group` / `prompts.items[].group` / `workflow.preset_profile`，job 没有或不完整才回落 `prompts.json`；判定来源写进计划与日志。默认版 A 用 `04_covers` 根目录 4 张 + `presets_a`；扩展版 B/C 用 `04_covers/<组>_group/` 4 张 + `presets_<组>`。**某组缺 `presets_<组>` 只把该组标 blocked（写进 `video.outputs.<组>`），不阻断 A 的生成/导出**，计划与日志必须显示该组缺失；各版本导出流程与产物文件集合完全一致，只多一个草稿后缀。
 
 | 项 | 规则 |
 | --- | --- |
@@ -245,7 +245,7 @@ Pillow 路线出的是文字压图封面，与 Stage 2 的 AI 重绘图是两条
 | 扩展版 | **一版一后缀**：`<基础草稿>_<版本>`，版本名 `[a-z][a-z0-9]{0,7}`（`b`/`c`/`b2`），成品同名 |
 | 同版本重跑 | 旧成品改名保留 `.v<n>` 三件套（mp4 / `-封面.jpg` / `.progress.json`），任一失败整组回滚硬失败 |
 | 台账 | 每个版本落 `job.json.video.outputs.<版本>`，独立判断「导过就不再导」 |
-| **版本封面** | **一版一封面**：A 版用 `04_covers/cover_04_vertical.*`，B/C 版用 `04_covers/<组>/cover_04_vertical_<组>.*`；克隆/重建必须把该组竖版图写入草稿 `cover` + `draft_cover.jpg`，**禁止沿用源草稿封面**（`draft_cover.jpg` 是目录级文件，直接复制会与 A 版同图） |
+| **版本封面** | **一版一封面**：A 版用 `04_covers/cover_04_vertical.*`，B/C 版用 `04_covers/<组>/cover_04_vertical_<组>.*`；克隆/重建必须把该组竖版图写入草稿 `cover` + `draft_cover.jpg`，**禁止沿用源草稿封面**（`draft_cover.jpg` 是目录级文件，直接复制会与 A 版同图）。竖版本身还须满足 `cover-spec.md` §一第 8 条：人物/动物/关键道具/场景元素齐全完整，不得因竖幅裁切缺失元素或只露局部，缺元素整张作废、不能用裁切版充数 |
 
 换预设补出某个版本（复制已剪草稿，不动时间线）：
 
@@ -253,7 +253,7 @@ Pillow 路线出的是文字压图封面，与 Stage 2 的 AI 重绘图是两条
 python pipeline/rebase_presets.py "<基础草稿名>" --profile b --job-dir "<cover_job>"
 ```
 
-`--job-dir` 不传时从草稿视频路径反推 `cover_job`；解析规则与 `ingest` 共用（`job_manifest.resolve_profile_cover`），B/C 组缺竖版图时只告警、不回落 A。
+`--job-dir` 不传时从草稿视频路径反推 `cover_job`；解析规则与 `ingest` 共用（`job_manifest.resolve_profile_cover`），B/C 组缺竖版图绝不沿用 A 版封面：先用本片视频抽帧兜底（台账记 `cover.source=frame`），无法抽帧则硬失败并报出缺的组与张数。
 
 完整命名、反查与清理规则见 `references/handoff-contract.md` §2.1 与 §6。
 
@@ -339,8 +339,8 @@ python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存
 
 配置 `<repo>/pipeline/presets.json` 的 `watch` 段（从 `presets.example.json` 复制起步），每轮热加载、改完不用重启：`{"watch":{"roots":["D:/短剧"],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":[],"export_policy":"immediate","hold":false}}`。`roots` 下的 `<剧集>/cover_job` 自动发现，无需登记。归档池根目录另行配置 `watch.archive_root`（仅 `pipeline/archive_job.py` 使用，必须在 `roots` 之外；`roots` 为空时归档脚本拒绝执行）。
 
-**两阶段**：无串流草稿 → **edit**（validate --fix → ingest 归并 dispatch → batch_runner --no-export 生成草稿+帧对齐）；有草稿 + `workflow.mode=full` + 策略放行 → **export**（导出 mp4 → verify 质检 → record-video → derive）。`mode=edit_only` 永远停在草稿，等人工把 `workflow.mode` 改为 `full` 并 `intent_revision` +1。**export_policy**：`immediate`（默认，剪完即导）/ `after_edit_queue_drained`（全部剧剪完才开始导出）/ `manual`（等 `--phase export`）。**意图**：运行期只读 `job.json.workflow`；`dispatch.json` 仅在 `intent_revision==0` 时归并，人工 +1 后 job.json 永远优先（冲突记日志+桌面通知）。旧版 `export_config.json` 仍兼容。多 job 单 watcher 串行；跨进程由 `.export.lock` 互斥。进度看 Toast / `watcher.log` / `06_publish/pipeline.log` / `plan` / `status`。**多版本**：派生的 `_<版本>` 草稿由 watcher 按 `preset_profile` 补克隆，克隆时同步写入该组竖版封面（见 §6.3）；清理/归档只删成品与中间产物，`04_covers/` 各组封面始终保留。
+**两阶段**：无串流草稿 → **edit**（validate --fix → ingest 归并 dispatch → batch_runner --no-export 生成草稿+帧对齐）；有草稿 + `workflow.mode=full` + 策略放行 → **export**（导出 mp4 → verify 质检 → record-video → derive），但**最近一次 edit 失败/退避/暂停未修复时一律不许进导出**（`build_plan` 每轮无条件读 `.edit_state.json`）。`mode=edit_only` 永远停在草稿，等人工把 `workflow.mode` 改为 `full` 并 `intent_revision` +1。**export_policy**：`immediate`（默认，剪完即导）/ `after_edit_queue_drained`（全部剧剪完才开始导出）/ `manual`（等 `--phase export`）。**意图**：运行期只读 `job.json.workflow`；`dispatch.json` 仅在 `intent_revision==0` 时归并，人工 +1 后 job.json 永远优先（冲突记日志+桌面通知）。旧版 `export_config.json` 仍兼容。多 job 单 watcher 串行；跨进程由 `.export.lock` 互斥。进度看 Toast / `watcher.log` / `06_publish/pipeline.log` / `plan` / `status`。**多版本**：版本判定 job 优先、prompts 兜底（`job.json` 的 `titles.selected_groups` → `prompts.items` → `workflow.preset_profile`，job 没有或不完整才回落 `03_prompts/prompts.json`），派生的 `_<版本>` 草稿由 watcher 按组补克隆，克隆时同步写入该组竖版封面（见 §6.3）；缺 `presets_<组>` 的组标 blocked（写进 `video.outputs.<组>`）不阻断其余版本；清理/归档只删成品与中间产物，`04_covers/` 各组封面始终保留。
 
-触发条件（全满足）：4 张图齐（文件名可任意，`ingest` 自动识别改名）、prompts.json 存在、job.json 可解析、`titles.gate="done"`、`stage ∈ {titles_selected, prompts_ready, covers_ready}`（`covers_done` 等别名自动映射）、video 未导出、无活锁、静默 30s（防抖）。`stage=archived` 一律不触发（硬拦发生在阶段/单剧过滤之前，`--phase` / `--once` / `--job` 都绕不过）。封面自动吃基础版 `cover_04_vertical`，多版本克隆吃各组 `cover_04_vertical_<组>`；导出后自动质检 `verify_export.py`（`--no-verify` 可关）。
+触发条件（全满足）：4 张图齐（文件名可任意，`ingest` 自动识别改名）、prompts.json 存在、job.json 可解析、`titles.gate="done"`、`stage ∈ {titles_selected, prompts_ready, covers_ready}`（`covers_done` 等别名自动映射）、video 未导出、无活锁、静默 30s（防抖）。`stage=archived` 一律不触发（硬拦发生在阶段/单剧过滤之前，`--phase` / `--once` / `--job` 都绕不过）。封面自动吃基础版 `cover_04_vertical`，多版本克隆吃各组 `cover_04_vertical_<组>`；导出后自动质检 `verify_export.py`（`--no-verify` 可关），**质检不过（如帧级漂移）该版本即判失败：不写 `video.outputs`、不算已导出**；产物三件套（mp4 / `-封面.jpg` / `.mp4.progress.json`）缺任一件同样判失败，均由状态机退避重试。
 
 **导出状态与自愈（Trae 侧自动，豆包侧无需写任何新东西）**：导出状态收敛在 `cover_job/.export_state.json` 单一真源（`cover_watch` 自动写，契约 §7.1）。导出失败按 1/2/4/8/16/30 分钟**退避重试**；连续失败达到 `watch.retry_pause_after`（默认 5）**暂停该剧并桌面通知**，需人工排查后 `--phase export` 放行（放行不清零计数）。**素材缺失 / 磁盘不足**属硬失败，**不重试、不计数**，直接置终态并通知，避免空转。导出前默认冷启动剪映（`watch.cold_start`，默认 true）。豆包侧照旧只交 Stage 0/1/2 内容产物，不需要感知或写这些运行态字段。
