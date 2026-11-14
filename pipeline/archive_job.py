@@ -14,6 +14,8 @@ video.status=done 挡住已导出剧，但剧目录仍留在公共 roots；本�
 其余情况跳过；确需归档用 --force。
 拒绝条件：.watcher.lock 的 pid 仍存活；.export_state.json status=exporting；
 成品三件套校验未通过（exported 版本缺 mp4 / progress.done / 封面，或封面非竖版 9:16）；
+新鲜度判定 stale/evidence_missing（已 clean 的版本除外：export_state=cleaned 或
+outputs[*].state=cleaned 视作合法已清理状态，不参与阻断）；
 归档目标已存在；archive_root 等于或位于任一 watch.roots 之下（规范化真实路径比较）；
 watch.roots 未配置（fail-closed，无法校验位置时拒绝执行）；
 job_dir 不是 <剧名>/cover_job；剧集目录是盘符根；剧集目录不是 watch.roots 的直接子级。
@@ -388,6 +390,9 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
 
     # 新鲜度默认阻断：stale / evidence_missing 的成品不能静默搬进归档池。
     # 人工确认后必须用 --allow-stale "<理由>" 放行，理由会写进归档快照。
+    # 例外：clean 已删成品的版本（outputs[*].state=cleaned / export_state=cleaned）
+    # 在磁盘上必然查不到 mp4，freshness 会判 output_missing；这是合法收尾，
+    # 不能反过来把"已经清理干净"的剧挡在归档之外（clean → archive 死锁）。
     allow_stale_reason = (allow_stale_reason or "").strip() or None
     stale_hit: list[str] = []
     if not archived:
@@ -400,6 +405,18 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
         except Exception as e:
             # 判定本身不可用时沿用原 best-effort 语义，但必须显式提示
             print(f"  [warn] 归档前新鲜度判定失败，按原行为继续: {e}")
+        video = job.get("video") or {}
+        outputs = video.get("outputs") if isinstance(video.get("outputs"), dict) else {}
+        cleaned_versions = {str(p) for p, v in outputs.items()
+                            if str((v or {}).get("state") or "").lower() == "cleaned"}
+        job_cleaned = str(video.get("export_state") or "").lower() == "cleaned"
+        skipped_cleaned = [v for v in stale_hit
+                           if job_cleaned or v in cleaned_versions]
+        if skipped_cleaned:
+            print("  [cleaned] 版本 " + "、".join(skipped_cleaned)
+                  + " 已 clean（成品已删），视作合法已清理状态，不参与 stale 阻断")
+        stale_hit = [v for v in stale_hit
+                     if not job_cleaned and v not in cleaned_versions]
         if stale_hit and not allow_stale_reason:
             print("  [blocked] 新鲜度判定为 stale/evidence_missing: "
                   + "、".join(stale_hit))
