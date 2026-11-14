@@ -630,31 +630,40 @@ def find_stream_draft(series_name: str) -> Optional[str]:
 
 
 def _draft_exported(draft_name: str) -> bool:
-    """该草稿是否已有完成导出的成品（mp4 存在 + progress 标记 done）。
+    """该草稿是否已有完成导出的成品（fail-closed：证据不足一律判「未导出」）。
 
     草稿目录带 _export_stale.json（重新构建/克隆发布后写入）时一律视为未导出：
     否则改完预设重建同名草稿，旧 mp4 会被当成新成品跳过，静默发布旧视频。
+
+    正向证据只认三种，拿不到就判未导出（宁可重导一次，也不把来路不明的旧 mp4
+    当成新成品跳过）：
+      ① freshness=valid / manual_confirmed —— sidecar 或人工确认，明确新鲜；
+      ② freshness=legacy —— 命中 data/freshness_legacy_baseline.json 冻结基线，
+         sidecar 上线前导出的历史产物，无 sidecar 属正常（白名单只读、不自动扩充）；
+      ③ 成品旁 progress.json 的 done 为真 —— 导出脚本写的完成标记。
+    旧版成品若连 progress 都没有，不再按「有 mp4 即完成」放行。
     """
     if jp.export_is_stale(os.path.join(_draft_root(), draft_name)):
         return False
     out = pc.export_mp4_path(draft_name)
+    if not os.path.isfile(out):
+        return False
     try:
         import freshness
         jd = freshness.job_dir_for_draft(draft_name)
-        if jd and os.path.isfile(out):
+        if jd:
             ver = freshness.version_for_draft(jd, draft_name)
-            if freshness.freshness_of(jd, ver, consumer="scheduler").get("state") == "valid":
+            state = freshness.freshness_of(jd, ver, consumer="scheduler").get("state")
+            if state in ("valid", "manual_confirmed", "legacy"):
                 return True
     except Exception:
         pass
-    if not os.path.isfile(out):
-        return False
     pj = out + ".progress.json"
     try:
         with open(pj, encoding="utf-8") as f:
-            return bool(json.load(f).get("done"))
+            return json.load(f).get("done") is True
     except Exception:
-        return True  # 旧版无 progress：有成品即视为已完成
+        return False  # fail-closed：无 progress 证据不再视为已完成
 
 
 def _account_draft_name(base_draft: str, prof: str) -> str:
