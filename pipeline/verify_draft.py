@@ -31,6 +31,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
+import draft_io  # noqa: E402  草稿写盘唯一原语
 import repair_translation as rp  # noqa: E402  复用字幕轨/集范围/材质读写工具
 import split_long_subtitles as sl  # noqa: E402
 from no_window import NO_WINDOW  # noqa: E402
@@ -138,12 +139,10 @@ def load_draft(src):
         return json.load(f), path
 
 
-def save_draft(draft, path):
-    bak = path + f".verifybak_{int(time.time())}"
-    shutil.copy2(path, bak)
-    with io.open(path, "w", encoding="utf-8") as f:
-        json.dump(draft, f, ensure_ascii=False)
-    return bak
+def save_draft(draft, path, writer=None):
+    """写回草稿（备份 .verifybak_<ts>；校验/原子写/留痕由 draft_io 统一处理）。"""
+    return draft_io.write_draft_content(
+        draft, path, backup_suffix=".verifybak_{ts}", writer=writer)
 
 
 # ────────────────────────── 体检 ──────────────────────────
@@ -505,7 +504,7 @@ def main():
     print(format_report(rep))
     changed = sum(sum(h["actions"].values()) for h in history)
     if changed and not args.dry_run:
-        bak = save_draft(draft, path)
+        bak = save_draft(draft, path, writer="verify_fix")
         print(f"\n💾 已写回（修复 {changed} 处，备份: {os.path.basename(bak)}）")
     elif changed:
         print(f"\n[dry-run] 预计修复 {changed} 处，未写回")

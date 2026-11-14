@@ -7,6 +7,13 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "lib"))
 sys.path.insert(0, _HERE)
 
+import draft_io  # noqa: E402  唯一草稿写盘原语
+from draft_io import (  # noqa: E402
+    DraftInvariantError, assert_draft_invariants,
+    ceil_to_frame_us as _ceil_to_frame_us,
+    material_durations as _material_durations,
+)
+
 from jy_cover import set_draft_cover, set_cover_composition
 
 from export_config import get_deps_root, get_font_path, preset_profile_name
@@ -199,20 +206,103 @@ def register_draft_in_root_meta(draft_name, draft_id, duration_us=0):
         return False
 
 
+def _cleanup_removed_leftovers(draft_name, before_ts):
+    """清理 <draft_name>.removed_<ts> 残留（只清本名 + 目标目录已存在 + 早于本次操作）。
+
+    残留目录里的 draft_meta_info.json 仍写着原 draft_name，剪映会把它当同名草稿渲染，
+    首页可能多出一张同名卡片；按 UIA Name 严格匹配时会命中废弃的那张。
+    目标目录不存在（正处于回滚窗口）时不清理，留给回滚使用。
+    """
+    target = os.path.join(DRAFT_ROOT, draft_name)
+    if not os.path.exists(target):
+        return []
+    prefix = draft_name + ".removed_"
+    removed = []
+    try:
+        names = os.listdir(DRAFT_ROOT)
+    except OSError:
+        return []
+    for n in names:
+        if not n.startswith(prefix):
+            continue
+        p = os.path.join(DRAFT_ROOT, n)
+        try:
+            if not os.path.isdir(p) or os.path.getmtime(p) >= before_ts:
+                continue
+            shutil.rmtree(p, ignore_errors=True)
+            removed.append(p)
+        except OSError:
+            continue
+    if removed:
+        print(f"  🧹 清理同名残留目录 {len(removed)} 个")
+    return removed
+
+
+def cleanup_draft_temp_files(draft_dir):
+    """清理草稿目录里的临时/备份文件（template*.tmp、draft_content.json.bak 等）。
+
+    这些文件是建稿保存与剪映打开过程中的中间产物；异常退出后残留会让剪映下次
+    打开时判定"上次未正常结束"并弹恢复提示。只清本目录顶层，不递归。
+    .locked 是剪映自己的锁文件，正常关闭时会自行删除 —— 这里不碰。
+    """
+    if not os.path.isdir(draft_dir):
+        return []
+    baks = ('draft_content.json.bak', 'draft_meta_info.json.bak')
+    removed = []
+    try:
+        names = os.listdir(draft_dir)
+    except OSError:
+        return []
+    for n in names:
+        low = n.lower()
+        if not (low.endswith('.tmp') or any(low.startswith(b) for b in baks)):
+            continue
+        p = os.path.join(draft_dir, n)
+        if not os.path.isfile(p):
+            continue
+        try:
+            os.remove(p)
+            removed.append(p)
+        except OSError:
+            continue
+    return removed
+
+
 def publish_staged_draft(stage_dir, draft_name, duration_us=0):
     """把暂存区构建好的草稿整体搬进剪映草稿目录（原子发布）。
 
     剪映只扫描 DRAFT_ROOT，构建期间看不到半成品，避免「构建中被打开 → 缓存空模板 →
-    后几集空白」的问题。同名草稿已存在时先改名移走，再放入新目录。
+    后几集空白」的问题。同名草稿已存在时先改名移走，再放入新目录；move 失败时把旧目录
+    改名还原（避免目标凭空消失），成功后清理本名历史残留。
     """
     target = os.path.join(DRAFT_ROOT, draft_name)
+    started_at = time.time()
+    # 发布前最后一道门禁：暂存区内容不合规就直接失败，不搬进剪映目录
+    _stage_json = os.path.join(stage_dir, "draft_content.json")
+    if os.path.isfile(_stage_json):
+        with open(_stage_json, "r", encoding="utf-8") as _sf:
+            assert_draft_invariants(json.load(_sf), where=_stage_json)
+    _cleanup_removed_leftovers(draft_name, started_at)
     trash = None
     if os.path.exists(target):
         trash = target + f".removed_{time.strftime('%Y%m%d_%H%M%S')}"
         os.rename(target, trash)
     if not os.path.isdir(os.path.dirname(target)):
         os.makedirs(os.path.dirname(target), exist_ok=True)
-    shutil.move(stage_dir, target)
+    try:
+        shutil.move(stage_dir, target)
+    except Exception:
+        if trash and os.path.isdir(trash) and not os.path.exists(target):
+            try:
+                os.rename(trash, target)
+                print(f"  [warn] 发布失败，已回滚旧草稿: {target}")
+            except Exception as re_err:
+                print(f"  [warn] 发布失败且回滚失败: {re_err}（旧目录: {trash}）")
+        raise
+
+    cleaned = cleanup_draft_temp_files(target)
+    if cleaned:
+        print(f"  🧹 清理草稿临时文件 {len(cleaned)} 个")
 
     content_path = os.path.join(target, "draft_content.json")
     draft = {}
@@ -221,8 +311,7 @@ def publish_staged_draft(stage_dir, draft_name, duration_us=0):
             draft = json.load(f)
         draft["name"] = draft_name
         draft["update_time"] = int(time.time() * 1_000_000)
-        with open(content_path, "w", encoding="utf-8") as f:
-            json.dump(draft, f, ensure_ascii=False)
+        draft_io.write_draft_content(draft, content_path)
     except Exception as e:
         print(f"  [warn] 发布时更新 draft_content 失败: {e}")
 
@@ -255,6 +344,9 @@ def publish_staged_draft(stage_dir, draft_name, duration_us=0):
     mark_export_stale(target, "publish")
     if trash:
         shutil.rmtree(trash, ignore_errors=True)
+    # 成功后再扫一次本名残留（入口时目标不存在会跳过清理，发布后才具备清理条件）；
+    # before_ts 仍用本次操作开始时刻，绝不误删并发/本次新产生的目录
+    _cleanup_removed_leftovers(draft_name, started_at)
     # 发布成功后清理暂存区空壳（move 已搬走本体，残留的是封面/配置等小文件壳目录）
     if os.path.isdir(stage_dir):
         shutil.rmtree(stage_dir, ignore_errors=True)
@@ -294,9 +386,36 @@ def load_draft(name_or_path):
         return json.load(f), jp
 
 
-def save_draft(draft, path):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(draft, f, ensure_ascii=False, indent=2)
+def _freshness_mod():
+    """产物新鲜度模块（best-effort；缺失不影响主流程）。"""
+    try:
+        import freshness
+        return freshness
+    except Exception:
+        return None
+
+
+def _record_draft_freshness(job_dir, draft_path, writer):
+    """写时确权（best-effort；与写盘原语共用同一实现，失败不外抛）。"""
+    draft_io._record_freshness(job_dir, draft_path, writer)
+
+
+def save_draft(draft, path, job_dir=None, writer=None):
+    """写 draft_content.json（本函数只是原语的薄封装，保持既有调用签名）。"""
+    draft_io.write_draft_content(draft, path, job_dir=job_dir, writer=writer,
+                                 indent=2)
+
+
+def _record_cover_freshness(job_dir, draft_dir, cover_image):
+    """封面落盘后写 E3 记录；失败只告警。"""
+    fr = _freshness_mod()
+    if not fr or not job_dir or not draft_dir:
+        return
+    try:
+        ver = fr.version_for_draft(job_dir, os.path.basename(os.path.normpath(draft_dir)))
+        fr.record_cover(job_dir, ver, draft_dir, cover_image)
+    except Exception as e:
+        print(f"  [warn] 记录封面新鲜度失败（不影响主流程）: {e}")
 
 
 def backup_draft(path):
@@ -522,7 +641,30 @@ def _has_text_track(inner):
     return False
 
 
-def _process_flat_track(itrack, id_map, offset_us, stretch_to_duration_us, clip_alpha):
+def _composite_wrapper_materials(preset, combination_id):
+    """找出顶层轨道上引用该组合片段（combination_id）的包装视频材质。
+
+    预设在剪映里的结构：顶层 video 轨段 material_id → materials.videos 里的
+    复合片段材质（extra_type_option=2，带 duration），extra_material_refs 里才是
+    materials.drafts 的组合包装。剪映按这个 videos.duration 夹回 source。
+    """
+    if not combination_id:
+        return []
+    videos = {m.get("id"): m for m in preset.get("materials", {}).get("videos", [])
+              if isinstance(m, dict)}
+    out = []
+    for track in preset.get("tracks", []) or []:
+        for seg in track.get("segments", []) or []:
+            if combination_id not in (seg.get("extra_material_refs") or []):
+                continue
+            mat = videos.get(seg.get("material_id"))
+            if mat is not None and mat not in out:
+                out.append(mat)
+    return out
+
+
+def _process_flat_track(itrack, id_map, offset_us, stretch_to_duration_us, clip_alpha,
+                        material_durations=None):
     new_track = deepcopy(itrack)
     old_track_id = new_track.get("id")
     new_track_id = gen_uuid()
@@ -556,9 +698,18 @@ def _process_flat_track(itrack, id_map, offset_us, stretch_to_duration_us, clip_
                 src_start = src.get("start", 0)
                 if src_cur > 0:
                     src_ratio = new_dur / src_cur
+                    new_src_dur = int(src_cur * src_ratio)
+                    # 夹紧到被引用素材的真实时长：超长 source 会被剪映按素材时长
+                    # 截断，导致 target 与 source 帧数不一致（时间线漂移/尾帧黑屏）。
+                    limit = (material_durations or {}).get(seg.get("material_id"))
+                    if limit and new_src_dur > limit:
+                        print(f"  [warn] 预设段 source 拉伸到 {new_src_dur/1e6:.2f}s，"
+                              f"超过素材真实时长 {limit/1e6:.2f}s，已夹紧 "
+                              f"(material_id={seg.get('material_id')})")
+                        new_src_dur = limit
                     seg["source_timerange"] = {
                         "start": src_start,
-                        "duration": int(src_cur * src_ratio),
+                        "duration": new_src_dur,
                     }
 
             for sid_field in ("id", "material_id"):
@@ -646,6 +797,13 @@ def merge_preset_into_draft(draft, preset_path, offset_us=0, stretch_to_duration
     """
     with open(preset_path, "r", encoding="utf-8") as f:
         preset = json.load(f)
+    # 预设源文件进合并前先过同一套按帧不变量（容差同 _FRAME_SLACK=1 帧）：
+    # 坏预设在这里就报出「哪个预设 / 哪一段 / 差多少帧」，而不是等到成品落盘才炸。
+    _preset_dir = os.path.dirname(os.path.abspath(preset_path))
+    if os.path.basename(_preset_dir) == "preset_draft":
+        _preset_dir = os.path.dirname(_preset_dir)
+    assert_draft_invariants(
+        preset, where=f"预设源文件「{os.path.basename(_preset_dir)}」({preset_path})")
 
     id_map = {}
     new_flat_tracks = []
@@ -709,6 +867,28 @@ def merge_preset_into_draft(draft, preset_path, offset_us=0, stretch_to_duration
                                 "duration": int(src_cur * src_ratio),
                             }
 
+            # 拉伸后必须同步内层草稿与包装材质的 duration：剪映加载组合片段时按
+            # 包装 material.duration 把 source 夹回原时长，内层 duration 不涨会让
+            # source/target 帧数对不上（logo_b 事故：52.3s 内层 + 8.5s source 漂移）。
+            span_us = 0
+            for itrack in inner_draft_obj.get("tracks", []):
+                for seg in itrack.get("segments", []):
+                    tgt = seg.get("target_timerange") or {}
+                    src = seg.get("source_timerange") or {}
+                    span_us = max(
+                        span_us,
+                        int(tgt.get("start", 0) or 0) + int(tgt.get("duration", 0) or 0),
+                        int(src.get("start", 0) or 0) + int(src.get("duration", 0) or 0),
+                    )
+            need_us = max(int(inner_draft_obj.get("duration") or 0),
+                          _ceil_to_frame_us(span_us, draft.get("fps")
+                                            or inner_draft_obj.get("fps") or 30.0))
+            inner_draft_obj["duration"] = need_us
+            if isinstance(new_inner.get("duration"), (int, float)):
+                new_inner["duration"] = max(int(new_inner["duration"]), need_us)
+            for wrap_mat in _composite_wrapper_materials(preset, inner.get("id")):
+                wrap_mat["duration"] = max(int(wrap_mat.get("duration") or 0), need_us)
+
             new_nested_drafts.append(new_inner)
             continue
 
@@ -729,7 +909,8 @@ def merge_preset_into_draft(draft, preset_path, offset_us=0, stretch_to_duration
                     seen_sticker_material_ids.add(seg_mid)
 
                 new_track = _process_flat_track(
-                    itrack, id_map, offset_us, stretch_to_duration_us, clip_alpha
+                    itrack, id_map, offset_us, stretch_to_duration_us, clip_alpha,
+                    material_durations=_material_durations(inner_draft),
                 )
                 new_flat_tracks.append(new_track)
                 any_sticker_kept = True
@@ -749,7 +930,8 @@ def merge_preset_into_draft(draft, preset_path, offset_us=0, stretch_to_duration
                     continue
                 seen_track_keys.add(key)
                 new_track = _process_flat_track(
-                    itrack, id_map, offset_us, stretch_to_duration_us, clip_alpha
+                    itrack, id_map, offset_us, stretch_to_duration_us, clip_alpha,
+                    material_durations=_material_durations(inner_draft),
                 )
                 new_flat_tracks.append(new_track)
                 _collect_inner_materials(inner_draft, new_materials, id_map)
@@ -760,7 +942,8 @@ def merge_preset_into_draft(draft, preset_path, offset_us=0, stretch_to_duration
             if not pt.get("segments", []):
                 continue
             new_track = _process_flat_track(
-                pt, id_map, offset_us, stretch_to_duration_us, clip_alpha
+                pt, id_map, offset_us, stretch_to_duration_us, clip_alpha,
+                material_durations=_material_durations(preset),
             )
             new_flat_tracks.append(new_track)
 
@@ -2627,13 +2810,29 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             warn_missing_presets(presets)
     PRESETS = presets
     # 重建某个账号版本（B/C…）时，封面必须取该组的竖版图；A 组/未指定组保持调用方传参
-    # 或抽帧行为不变。
-    if not cover_image and job_dir:
-        _ver = preset_profile_name(preset_profile)
-        if _ver and _ver not in ("a", "base"):
-            cover_image = jm.resolve_profile_cover(job_dir, _ver)
-            if cover_image:
-                print(f"  🖼️ 版本封面（{_ver}）: {os.path.basename(cover_image)}")
+    # 或抽帧行为不变。组封面缺失时绝不沿用源草稿封面：先用本组成片抽帧兜底，没有
+    # 可抽帧的视频就硬失败（见 references/cover-spec.md「版本封面绑定」）。
+    cover_meta = None
+    _ver = preset_profile_name(preset_profile)
+    if not cover_image and _ver and _ver.lower() not in ("a", "base"):
+        cover_image = jm.resolve_profile_cover(job_dir, _ver) if job_dir else None
+        if cover_image:
+            print(f"  🖼️ 版本封面（{_ver}）: {os.path.basename(cover_image)}")
+            cover_meta = {"source": "group", "group": _ver, "file": cover_image}
+        else:
+            _src = cover_extract_from_video
+            if not (isinstance(_src, str) and os.path.isfile(_src)):
+                _src = next((p for p in (video_paths or [])
+                             if isinstance(p, str) and os.path.isfile(p)), None)
+            if not _src:
+                raise RuntimeError(
+                    f"预设组 {_ver} 缺竖版封面，且没有可用于抽帧的视频：绝不沿用 A 版封面。"
+                    f"请补齐 04_covers/<组>/cover_04_vertical_<组>.* 后重试")
+            cover_extract_from_video = _src
+            cover_meta = {"source": "frame", "group": _ver,
+                          "file": "draft_cover.jpg", "extracted_from": _src}
+            print(f"  ⚠️ 预设组 {_ver} 缺竖版封面：从 {os.path.basename(_src)} 抽帧兜底"
+                  "（cover.source=frame）")
     # 预设层清单：记录本次合并出的轨道/素材，克隆换预设时据此精确剥离
     preset_manifest = {
         "profile": preset_profile,
@@ -2642,6 +2841,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         "materials": {},
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if cover_meta:
+        preset_manifest["cover"] = cover_meta
 
     print(f"\n{'='*60}")
     print(f"  🎬 JianYing Full-Local Pipeline")
@@ -3148,12 +3349,15 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         print(f"  draft_path={draft_path}")
         return None
     bak = backup_draft(draft_path)
+    _fresh_jd = _resolve_pipeline_job_dir(job_dir, video_paths)
     with timed_step("保存发布"):
         save_draft(draft, draft_path)
         if staged:
             dp_root, draft_path = publish_staged_draft(
                 dp_root, draft_name_or_path, draft.get("duration", 0))
         _write_pipeline_backup(draft_path, draft)
+        # 发布后的草稿文件才是最终产物：在最终路径上记一次写时确权
+        _record_draft_freshness(_fresh_jd, draft_path, "pipeline_publish")
         write_preset_manifest(draft_path, preset_manifest)
         # 记录串流产物清单（供 stream_manifest.py 一键清理）
         try:
@@ -3242,6 +3446,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             video_start_s=(_cover_start_for_cut(cover_extract_from_video, cut_us)
                            if cover_extract_from_video else 0.0),
         )
+        _record_draft_freshness(_fresh_jd, draft_path, "pipeline_cover")
+        _record_cover_freshness(_fresh_jd, dp_root, cover_image)
 
     print()
 

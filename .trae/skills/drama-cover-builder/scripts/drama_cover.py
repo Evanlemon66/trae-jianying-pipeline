@@ -376,10 +376,32 @@ def _cover_start_for_cut(video_path, cut_us):
     return cut_s
 
 
+def _draft_io():
+    """定位并导入全仓唯一的草稿写盘原语 pipeline/draft_io.py。
+
+    本脚本与 pipeline 同仓部署（_presets_deps_root 也按同样方式向上找
+    pipeline/），因此这里只做向上探测、不做兜底写盘：找不到就明确报错，
+    避免悄悄退回「直接 json.dump」的老路。
+    """
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(6):
+        d = os.path.dirname(d)
+        if not d:
+            break
+        pipeline_dir = os.path.join(d, "pipeline")
+        if os.path.isfile(os.path.join(pipeline_dir, "draft_io.py")):
+            if pipeline_dir not in sys.path:
+                sys.path.insert(0, pipeline_dir)
+            import draft_io
+            return draft_io
+    raise RuntimeError(
+        "找不到 pipeline/draft_io.py：草稿写盘统一走该原语，write-draft 需在仓库内运行")
+
+
 def save_draft(draft, path):
-    """把 draft dict 写回 JSON。"""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(draft, f, ensure_ascii=False, indent=2)
+    """把 draft dict 写回 JSON：校验不变量→备份→原子替换→记新鲜度，全部走原语。"""
+    return _draft_io().write_draft_content(
+        draft, path, backup_suffix=".coverbak_{ts}", writer="drama_cover", indent=2)
 
 
 def load_draft(path):
@@ -715,8 +737,14 @@ def _cmd_write_draft(args):
     set_draft_cover(args.draft_dir, cover_image=args.cover)
     # Step 2: 原生 composition
     set_cover_composition(draft, args.draft_dir, args.cover)
-    # Step 3: 写回
-    save_draft(draft, draft_path)
+    # Step 3: 原子写回（不变量校验不过则拒绝落盘，草稿一个字节都不动）
+    draft_io = _draft_io()
+    try:
+        save_draft(draft, draft_path)
+    except draft_io.DraftInvariantError as e:
+        print(f"✗ {e}")
+        print("✗ 已拒绝写入，draft_content.json 保持原样")
+        return 1
     print(f"✅ 已写入草稿: {args.draft_dir}")
     return 0
 

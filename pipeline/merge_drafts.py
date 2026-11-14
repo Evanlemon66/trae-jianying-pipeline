@@ -29,6 +29,8 @@ import uuid as _uuid
 
 sys.stdout.reconfigure(encoding="utf-8")
 _HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+import draft_io  # noqa: E402  草稿写盘唯一原语
 _DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                            "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
 # 合并暂存区：放在剪映草稿目录之外（同盘），合并完再整体搬进去。
@@ -457,8 +459,13 @@ def merge(src_dirs, out_name, force=False, transition="none", transition_duratio
     new_draft_id = gen_uuid()
     base["id"] = new_draft_id
     base["name"] = out_name
-    with open(base_path, "w", encoding="utf-8") as f:
-        json.dump(base, f, ensure_ascii=False, indent=1)
+    try:
+        draft_io.write_draft_content(base, base_path, indent=1)
+    except draft_io.DraftInvariantError as e:
+        # 与上面 _validate 失败同语义：拒写 = 磁盘不留残骸（源草稿只读，不受影响）
+        print(f"✗ 不变量校验失败，已清理暂存目录：\n{e}")
+        shutil.rmtree(out_dir, ignore_errors=True)
+        sys.exit(1)
 
     meta_path = os.path.join(out_dir, "draft_meta_info.json")
     if os.path.exists(meta_path):

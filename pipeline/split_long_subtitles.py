@@ -30,8 +30,13 @@ import uuid
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+import draft_io  # noqa: E402  草稿写盘唯一原语
+
 DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                           "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+
 
 # 优先句末，其次分号/冒号，再退到逗号
 _CUT_PATTERNS = [
@@ -229,10 +234,8 @@ def main():
         print("无需拆分")
         return
 
-    bak = path + f".splitbak_{int(time.time())}"
-    shutil.copy2(path, bak)
-    with io.open(path, "w", encoding="utf-8") as f:
-        json.dump(draft, f, ensure_ascii=False)
+    bak = draft_io.write_draft_content(
+        draft, path, backup_suffix=".splitbak_{ts}", writer="split_subtitles")
     print(f"\n💾 已写回（备份: {os.path.basename(bak)}），净增 {total_new} 条字幕")
 
 

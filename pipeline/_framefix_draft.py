@@ -21,6 +21,9 @@ from no_window import NO_WINDOW
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import draft_io  # noqa: E402  草稿写盘唯一原语
+
 
 def _ffprobe_path():
     p = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.2-full_build\bin\ffprobe.EXE")
@@ -335,11 +338,10 @@ def fix_draft(draft_name, draft_root=None, run_tests=True):
         p = os.path.join(draft_dir, f)
         if not os.path.exists(p):
             continue
-        bak = p + ".pre_framefix.json"
-        if not os.path.exists(bak):
-            shutil.copy2(p, bak)
-        with open(p, "w", encoding="utf-8") as fh:
-            json.dump(d, fh, ensure_ascii=False)
+        draft_io.write_draft_content(
+            d, p,
+            writer="framefix" if f == "draft_content.json" else None,
+            backup_suffix=".pre_framefix.json", keep_existing_backup=True)
 
     print("\n✅ 已写回 draft_content.json / _pipeline_backup.json")
     print(f"   总长 {old_total:.3f}s → {new_total:.3f}s")
@@ -441,11 +443,10 @@ def fix_overlay_tail(draft_name, draft_root=None):
             p = os.path.join(draft_dir, fn)
             if not os.path.exists(p):
                 continue
-            bak = p + ".pre_tailfix.json"
-            if not os.path.exists(bak):
-                shutil.copy2(p, bak)
-            with open(p, "w", encoding="utf-8") as fh:
-                json.dump(d, fh, ensure_ascii=False)
+            draft_io.write_draft_content(
+                d, p,
+                writer="framefix_tail" if fn == "draft_content.json" else None,
+                backup_suffix=".pre_tailfix.json", keep_existing_backup=True)
 
     print(f"{draft_name}: 主轨 {vid_end_us/1e6:.3f}s | 修复前末位 {old_max_end/1e6:.3f}s "
           f"| 叠加 {n_overlay} / 字幕 {n_text_clamp} | {'已写回' if changed else '无需修复'}")
