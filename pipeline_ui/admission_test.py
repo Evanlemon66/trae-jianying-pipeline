@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -228,6 +229,57 @@ def _admission_draft_dir(cfg):
     return os.path.join(DRAFT_ROOT, cfg['draft_name'])
 
 
+SNAPSHOT_DIR = os.path.join(OUT_DIR, '_draft_snapshots')
+
+
+def _snapshot_draft(draft_dir):
+    """本轮准入开始前给 draft_content.json 存快照（失败退出时自动回滚用）。
+
+    快照点在「草稿已按三层判据就绪、任何点击/按键之前」，即本轮唯一的可信起点。
+    存到 pipeline_ui/_draft_snapshots（独立目录，剪映不会读写这里）。
+    返回快照路径；存不了返回 None（不阻塞准入，失败时退化为不回滚）。
+    """
+    src = os.path.join(draft_dir, 'draft_content.json')
+    if not os.path.isfile(src):
+        dprint('  ⚠️ 草稿快照跳过：draft_content.json 不存在')
+        return None
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        name = os.path.basename(os.path.normpath(draft_dir))
+        dst = os.path.join(SNAPSHOT_DIR,
+                           f'{name}_{time.strftime("%Y%m%d_%H%M%S")}.json')
+        shutil.copy2(src, dst)
+        dprint(f'  📸 本轮草稿快照: {dst}')
+        return dst
+    except Exception as e:
+        dprint(f'  ⚠️ 草稿快照失败（继续准入，失败时无法自动回滚）: {e}')
+        return None
+
+
+def _rollback_draft(snapshot, draft_dir):
+    """失败退出时用本轮起点快照覆盖 draft_content.json，避免把跑脏的草稿留给用户。
+
+    必须在剪映关闭之后调用（_finalize_jianying 之后），否则内存态会在退出时覆盖。
+    """
+    if not snapshot or not draft_dir or not os.path.isfile(snapshot):
+        dprint('  ⚠️ 无本轮草稿快照，跳过自动回滚')
+        return False
+    dst = os.path.join(draft_dir, 'draft_content.json')
+    try:
+        shutil.copy2(snapshot, dst)
+        dprint(f'  ↩️ 已把草稿回滚到本轮起点快照: {dst}')
+    except Exception as e:
+        dprint(f'  ❌ 草稿自动回滚失败: {e}')
+        return False
+    try:
+        out = os.popen('tasklist /FI "IMAGENAME eq JianyingPro.exe" /NH').read()
+        if 'JianyingPro.exe' in out:
+            dprint('  ⚠️ 剪映仍在运行：回滚可能被其内存态覆盖，请关闭草稿后确认磁盘版本')
+    except Exception:
+        pass
+    return True
+
+
 def _resolve_preset_plan(cfg):
     """解析本轮预设组 → (presets, 来源, 预期轨道数)。
 
@@ -401,6 +453,9 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
     }
     # 三层判据 → 复用/打开/重建（可能要冷启动重开剪映）
     _ensure_draft(_adm_cfg, _presets)
+    # 本轮起点快照：必须在任何点击/按键之前，失败退出时据此自动回滚
+    _RUN_STATE['draft_dir'] = _admission_draft_dir(_adm_cfg)
+    _RUN_STATE['draft_snapshot'] = _snapshot_draft(_RUN_STATE['draft_dir'])
     # 可能刚冷启动重开过，旧 win 句柄已失效：重新取当前编辑页窗口后再算 env
     win, _pt = connect_jianying(retry=False)
     if not win:
@@ -918,3 +973,8 @@ if __name__ == '__main__':
                          final=True, error=_RUN_STATE.get('error') or '准入未跑完')
         _finalize_jianying(stop_after=args.stop_after, completed=completed,
                            keep_window=args.keep_window, close_window=args.close_window)
+        if not completed:
+            # 失败/中断：剪映已按收尾策略处理完，再用本轮起点快照回滚草稿，
+            # 不把跑脏的草稿留在磁盘上等人工还原
+            _rollback_draft(_RUN_STATE.get('draft_snapshot'),
+                            _RUN_STATE.get('draft_dir'))
