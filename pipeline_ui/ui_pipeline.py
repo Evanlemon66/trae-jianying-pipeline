@@ -183,16 +183,22 @@ def _step_timeout(step_key, duration_s):
 
 def _draft_duration_s():
     """当前打开草稿的时长（秒），失败返回 None。
-    候选名依次尝试：活动草稿名（可能陈旧，如 default）→ init_draft 默认草稿名；
-    取第一个「文件夹存在且时长>0」的结果；duration 字段缺失时按主轨片段求和。"""
+    候选名依次尝试：活动草稿名（可能陈旧，如 default）→ presets.json 的
+    admission.draft_name（取不到就跳过该候选）；取第一个「文件夹存在且时长>0」的结果；
+    duration 字段缺失时按主轨片段求和。"""
     try:
         from ui_recognize_translate import DRAFT_ROOT, _active_draft_name
         try:
             candidates = [_active_draft_name()]
         except Exception:
             candidates = []
-        from init_draft import DRAFT_NAME
-        candidates.append(DRAFT_NAME)
+        try:
+            from export_config import get_admission_config
+            _cfg_name = str((get_admission_config() or {}).get('draft_name') or '').strip()
+        except Exception:
+            _cfg_name = ''
+        if _cfg_name:
+            candidates.append(_cfg_name)
         for name in filter(None, candidates):
             try:
                 with open(os.path.join(DRAFT_ROOT, name, 'draft_content.json'), encoding='utf-8') as f:
@@ -229,7 +235,7 @@ def step_precheck(workdir):
     if calib is None:
         dprint(f"  ❌ 未找到匹配 calibration ({info})")
         if str(info).startswith('no_calibration'):
-            dprint("  👉 请先跑准入: py -3.12 pipeline_ui\\admission_test.py --init "
+            dprint("  👉 请先跑准入: py -3.12 pipeline_ui\\admission_test.py "
                    "--stop-after export --vocal-mode vocal")
         else:
             # env_mismatch：有文件但环境读数对不上——先查窗口放置/环境变化，不引导重跑准入
@@ -250,7 +256,7 @@ def step_precheck(workdir):
                 'inputs': {'warnings': r['warnings'], 'calib_path': info}}
     for e in r['errors']:
         dprint(f"  ❌ {e}")
-    dprint("  👉 请重跑准入: py -3.12 pipeline_ui\\admission_test.py --init "
+    dprint("  👉 请重跑准入: py -3.12 pipeline_ui\\admission_test.py "
            "--stop-after export --vocal-mode vocal")
     return {'ok': False, 'duration_s': round(time.time() - t0, 1),
             'error': '；'.join(r['errors']), 'inputs': {'errors': r['errors']}}

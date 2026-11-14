@@ -186,7 +186,6 @@ def run_extract_audio(workdir: str = ".", timeout_sec: int = 30) -> dict:
     if not main0:
         return {'ok': False, 'duration_s': round(time.time() - t0, 1),
                 'error': '未定位主轨（无 video 行）'}
-    n0 = len(rows0)
     select_main_track()
 
     # --- Step 3: Ctrl+Shift+S 分离音频 ---
@@ -197,20 +196,29 @@ def run_extract_audio(workdir: str = ".", timeout_sec: int = 30) -> dict:
     time.sleep(1)
 
     # --- Step 4: 轮询验证：主轨下方多出一条音频轨 ---
-    dprint(f"\n[4/6] 等待新音频轨出现（主轨 ymid={main0['ymid'] if main0 else '?'}，超时 {timeout_sec}s）")
+    dprint(f"\n[4/6] 等待新音频轨出现（分离前主轨 ymid={main0['ymid']}，超时 {timeout_sec}s）")
     audio_row = None
-    hint = None          # [4/6] 最后一次扫描结果，供 [5/6] 复用（省 ~8-17s UIA 枚举）
+    hint = None          # 成功时的扫描结果，供 [5/6] 复用（省 ~8-17s UIA 枚举）
     t_deadline = time.time() + timeout_sec
     while time.time() < t_deadline:
         time.sleep(2)
         rows1, img1, WL1, WT1, WW1, eye_x1, win = _safe_scan(win)
-        if len(rows1) > n0 and main0:
-            below = [r for r in rows1 if r['ymid'] > main0['ymid']]
-            if below:
-                audio_row = below[-1]   # 最底的新行 = 分离出的音频轨
-                hint = (rows1, img1, WL1, WT1, WW1, eye_x1)
-                dprint(f"  ✅ 主轨下方出现新轨道: ymid={audio_row['ymid']} type={audio_row['type']}")
-                break
+        if not rows1:
+            continue
+        # 不能拿分离前抓到的 main0['ymid'] 当参照：插入新轨后剪映会纵向自动滚动，
+        # 整摞轨道上移（实测主轨 1282 → 1030），此时新音频轨的 ymid 反而小于旧主轨 ymid，
+        # "ymid > main0" 会永远为空。也不能用「总行数增加」判定：滚动后视口外的轨道扫不到，
+        # 行数可能不增反减。因此每帧重新定位当前主轨，只看它下方有没有行。
+        main_now, _ = find_main_track(win, rows1, img1)
+        if not main_now:
+            continue
+        below = [r for r in rows1 if r['ymid'] > main_now['ymid']]
+        if below:
+            audio_row = below[-1]   # 最底的新行 = 分离出的音频轨（主轨原为最底行）
+            hint = (rows1, img1, WL1, WT1, WW1, eye_x1)
+            dprint(f"  ✅ 主轨下方出现新轨道: ymid={audio_row['ymid']} "
+                   f"type={audio_row['type']}（当前主轨 ymid={main_now['ymid']}）")
+            break
     if not audio_row:
         elapsed = time.time() - t0
         dprint("  ❌ 超时未检测到新音频轨")

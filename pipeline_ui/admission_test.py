@@ -2,7 +2,21 @@
 """
 准入测试（分阶段版：先走通 pipeline 全流程，全绿后才允许跑正式 pipeline）
 =====================================================================
-前提：剪映已启动并打开含主视频轨的草稿、处于编辑页（或加 --init 自动重建草稿）。
+前提：presets.json 的 admission 段已配置。准入会按三层判据（文件层/UI层/baseline）自动
+确保草稿存在：缺失或跑脏时复用 ui_pipeline 的建稿链路新建（默认 ui_pipeline_ac），并自动
+拉起剪映；不再要求先手动启动剪映并打开草稿。
+
+预设与轨道口径：本轮预设组由 admission.preset_profile 指定，留空则回落 presets.json 的
+default_preset_profile；预期轨道数 = 主轨 1 + 该组实际预设条数，用于 tracks 校验，
+不再使用写死的轨道数。initial_layout 里 visible_row_count（记录时可见行）与
+expected_track_count（应校验的轨道总数）分开命名，两者不是同一口径。
+
+进程归属：准入只接管"本轮由自己拉起/重启"的剪映。收尾窗口策略：
+  1) --keep-window / --close-window（互斥）显式覆盖一切；
+  2) 未跑完全部阶段（--stop-after 中途停或失败）默认保留窗口——这种停点就是给人肉眼确认的，
+     不关闭、不清理临时文件；
+  3) 整轮跑完才看 admission.open.close_on_exit（true=正常关闭并清理临时文件，false=保留）。
+收尾日志会明确打印本次是"中途停点保留窗口"还是"跑完按配置关闭/保留"。
 
 阶段（--stop-after，默认 locate）：
   fullscreen  Ctrl+F 进全屏基准态 → 记录 fullscreen_rect + 四象限
@@ -12,7 +26,7 @@
   select      Home 回首帧 → 重扫定位主轨（隐藏后行上移）→ 点主轨 → Ctrl+A
   audio_tab   Q2 OCR 点「音频」Tab → 滚面板到底 → 切「基础」子Tab → Q4 校验面板
   locate      Q4 OCR 找「人声分离」文字 → 对勾坐标 → 截图+标记
-              【默认到此停止，轨道/面板状态保持原样等肉眼确认】
+              【常用停点：截图留证；中途停点默认保留窗口，方便开窗肉眼确认】
   enable      点对勾 + 蓝像素验证 → 立即选下拉模式（--vocal-mode）
   wait        End 跳末帧 → 等分离完成（= pipeline [3]）
               ⚠️ stop_after=wait 时收尾恢复所有轨道；后续还有阶段则保持预设隐藏
@@ -34,6 +48,17 @@ _PYLIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pylibs')
 if _PYLIB_DIR not in sys.path:
     sys.path.insert(0, _PYLIB_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# presets.json / export_config / init_draft 在 ..\pipeline
+_PIPELINE_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'pipeline'))
+if _PIPELINE_DIR not in sys.path:
+    sys.path.insert(0, _PIPELINE_DIR)
+
+from admission_draft import (active_draft_name, baseline_mismatch, decide_action,
+                             decide_window_action, draft_fs_state, expected_track_count,
+                             normalize_config, read_baseline, read_draft_structure,
+                             resolve_series_dir, write_baseline)
+from export_config import get_admission_config, get_watch_config
 
 import pyautogui
 pyautogui.FAILSAFE = False
@@ -54,6 +79,8 @@ REPORT_PATH = os.path.join(OUT_DIR, '_admission_report.json')
 # S3-A3 保护：过程打点写 partial，只有整轮跑完才覆盖正式报告 —— 失败/中断不再污染
 # _admission_ratios() 读取的基线（A3 失败时正式报告被写成半截数据）
 REPORT_PARTIAL_PATH = os.path.join(OUT_DIR, '_admission_report.partial.json')
+# 准入草稿的结构基线：建稿成功后写入；复用前比对，判定草稿是否已被上一轮跑脏
+BASELINE_PATH = os.path.join(OUT_DIR, '_admission_draft_baseline.json')
 STAGES = ['fullscreen', 'tracks', 'select', 'audio_tab', 'locate', 'enable', 'wait',
           'recognize', 'extract', 'export']
 
@@ -142,6 +169,142 @@ def _click_panel_tab_by_desc(win, tab_name):
     return False
 
 
+def _load_admission_cfg():
+    """读 presets.json 的 admission 段并校验；draft_name 缺失/非法直接退出。"""
+    try:
+        raw = get_admission_config()
+    except Exception as e:
+        raise SystemExit(f'❌ 读取 presets.json 的 admission 段失败: {e}')
+    try:
+        return normalize_config(raw)
+    except ValueError as e:
+        raise SystemExit(f'❌ admission 配置不可用: {e}')
+
+
+def _admission_draft_dir(cfg):
+    from pipeline import DRAFT_ROOT
+    return os.path.join(DRAFT_ROOT, cfg['draft_name'])
+
+
+def _resolve_preset_plan(cfg):
+    """解析本轮预设组 → (presets, 来源, 预期轨道数)。
+
+    预设组来源：admission.preset_profile；为空时回落到 presets.json 的
+    default_preset_profile（由 resolve_presets 内部处理）。解析不到或该组为空
+    直接报错，不使用任何写死的轨道数兜底。
+    """
+    from pipeline import resolve_presets
+    try:
+        presets, src = resolve_presets(cfg['preset_profile'])
+    except RuntimeError as e:
+        raise SystemExit(f'❌ 预设组解析失败（admission.preset_profile / '
+                         f'default_preset_profile）: {e}')
+    try:
+        expected = expected_track_count(presets)
+    except ValueError as e:
+        raise SystemExit(f'❌ {e}')
+    return presets, src, expected
+
+
+def _build_admission_draft(cfg, presets):
+    """复用 ui_pipeline 建稿链路（init_draft）新建准入草稿，并记录结构基线。
+
+    链路不变：暂存区建骨架 → 注入主轨 → 合并预设 → 构建期校验 → 原子发布覆盖同名目录。
+    模板候选顺序 default → pipeline_test → demo_test 由 create_empty_draft 内部保证。
+    presets 与预期轨道数由同一份解析结果传入，避免记录口径与实际合并不一致。
+    """
+    roots = get_watch_config().get('roots') or []
+    series_dir, hits = resolve_series_dir(cfg['video'], roots)
+    dprint(f"  素材来源: {series_dir}（匹配 {hits} 个视频）")
+    from init_draft import init_draft
+    r = init_draft(draft_name=cfg['draft_name'], video_dir=series_dir,
+                   presets=presets, preset_profile=cfg['preset_profile'],
+                   video_glob=cfg['video']['glob'],
+                   video_limit=cfg['video']['limit'],
+                   video_range=cfg['video']['range'],
+                   cut_s=cfg['cut_s'], normalize=cfg['normalize'], open_after=False)
+    if not r.get('ok'):
+        raise RuntimeError(f"建稿失败（{cfg['draft_name']}）: {r.get('error')}")
+    draft_dir = _admission_draft_dir(cfg)
+    structure = read_draft_structure(draft_dir)
+    if not structure:
+        raise RuntimeError(f'建稿后读不到草稿结构: {draft_dir}')
+    write_baseline(BASELINE_PATH, cfg['draft_name'], structure)
+    dprint(f"  baseline 已记录: 轨道={structure['track_types']} "
+           f"字幕={structure['materials']['texts']} "
+           f"时长={structure['duration_us'] / 1e6:.1f}s")
+    return structure
+
+
+def _open_admission_draft(cfg, after_build=False):
+    """打开准入草稿。刚建完时列表必陈旧 → hot_wait=0 直接冷启动，省掉热等。"""
+    import ui_nav
+    op = cfg['open']
+    ui_nav.open_draft(
+        cfg['draft_name'], timeout=op['edit_timeout'],
+        hot_wait=op['hot_wait_after_build'] if after_build else 30,
+        cold_wait=op['cold_wait'], max_launch=op['max_launch'],
+        allow_cold_restart=op['allow_cold_restart'])
+
+
+def _ensure_draft(cfg, presets):
+    """三层判据（文件层/UI层/baseline）→ 复用/打开/重建；找不到就自己建。
+
+    返回时编辑页就是准入草稿；失败直接抛错（调用方统一回首页兜底）。
+    """
+    import ui_nav
+    name = cfg['draft_name']
+    draft_dir = _admission_draft_dir(cfg)
+    op = cfg['open']
+
+    win, pt = connect_jianying(retry=False)
+    editor_is_target = (bool(win) and pt == 'edit'
+                        and active_draft_name(os.path.dirname(draft_dir)) == name)
+    ui_found = False
+    if not editor_is_target:
+        if win and pt != 'home':
+            ui_nav.switch_to_home(max_wait=30)
+        ui_found = ui_nav._find_draft_ctrl_any(name) is not None
+
+    fs = draft_fs_state(draft_dir)
+    fs_ok = fs['state'] == 'ok'
+    diffs = []
+    if fs_ok:
+        diffs = baseline_mismatch(read_baseline(BASELINE_PATH, name),
+                                  read_draft_structure(draft_dir))
+    dirty = bool(diffs)
+    action = decide_action(editor_is_target, fs_ok, ui_found, dirty)
+    _bl = ('脏（' + '；'.join(diffs) + '）') if dirty else ('干净' if fs_ok else '不可判')
+    dprint(f"  [ensure] 草稿「{name}」: 文件层={fs['state']} "
+           f"UI层={'有卡片' if ui_found else '无卡片'} "
+           f"编辑页={'是' if editor_is_target else '否'} baseline={_bl} → {action}")
+    if not fs_ok:
+        dprint(f"           文件层原因: {fs['detail']}")
+
+    if action == 'reuse':
+        dprint('  ✅ 复用当前编辑页草稿（未重建）')
+        return
+    if action == 'open':
+        _open_admission_draft(cfg)
+        return
+    if action == 'rebuild':
+        if editor_is_target or pt == 'edit':
+            ui_nav.switch_to_home(max_wait=30)
+        dprint('  🏗 重建准入草稿（缺失/损坏/跑脏/列表与磁盘不一致）')
+        _build_admission_draft(cfg, presets)
+        _open_admission_draft(cfg, after_build=True)
+        return
+    # retry_open：文件在但首页无卡片 —— 先热/冷重载尝试打开，仍失败才重建
+    try:
+        _open_admission_draft(cfg)
+    except RuntimeError as e:
+        if not op['allow_cold_restart']:
+            raise RuntimeError(f'草稿存在但当前打不开，且已禁止冷启动: {e}')
+        dprint(f'  ⚠️ 首页无卡片且重载后仍打不开（{e}）→ 重建兜底')
+        _build_admission_draft(cfg, presets)
+        _open_admission_draft(cfg, after_build=True)
+
+
 def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
     assert vocal_mode in ('none', 'vocal', 'background'), \
         f"vocal_mode 必须是 none/vocal/background，Got {vocal_mode!r}"
@@ -174,26 +337,39 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
     dprint(f'[准入测试] 开始  stop_after={stop_after}')
     dprint('=' * 60)
 
-    # ---------- 阶段 fullscreen：全屏基准态（归属阶段 2 UI初始化）----------
+    # ---------- 阶段 fullscreen：确保准入草稿存在（归属阶段 2 UI初始化）----------
     op_stage('2 UI初始化')
-    # S3-A2：准入目标屏（默认 None=主屏，现状）；env 必须在放置之后算（L162 顺序不变）
+    # S3-A2：准入目标屏（默认 None=主屏，现状）；set_screen_policy 必须在任何 connect 之前
     if target_screen:
         from ui_core import set_screen_policy
         set_screen_policy('target', target_screen)
         dprint(f'  目标屏={target_screen}（放置策略=target）')
-    win, _pt = connect_jianying()
+    # 三层判据 → 复用/打开/重建（可能要冷启动重开剪映）
+    _adm_cfg = _load_admission_cfg()
+    _presets, _preset_src, _expected_tracks = _resolve_preset_plan(_adm_cfg)
+    dprint(f'  预设组: {_preset_src}（{len(_presets)} 条）'
+           f'→ 预期轨道 {_expected_tracks} 条（主轨 1 + 预设 {len(_presets)}）')
+    calib['preset_tracks'] = {
+        'source': str(_preset_src),
+        'preset_count': len(_presets),
+        'expected_track_count': _expected_tracks,
+    }
+    # 三层判据 → 复用/打开/重建（可能要冷启动重开剪映）
+    _ensure_draft(_adm_cfg, _presets)
+    # 可能刚冷启动重开过，旧 win 句柄已失效：重新取当前编辑页窗口后再算 env
+    win, _pt = connect_jianying(retry=False)
     if not win:
-        raise RuntimeError('未找到剪映窗口，请先启动剪映并打开草稿')
-    # S1-2：env 统一取窗口所在屏（顺序依赖：connect 内含放置，窗口已在目标屏
-    # ——默认主屏；S3-A2 --target-screen 时为指定屏，env 必须在放置之后计算）
+        raise RuntimeError('准入草稿已定位，但连接不到剪映窗口（可能刚退出/重开中）')
+    # S1-2：env 统一取窗口所在屏。顺序依赖：建稿/打开（可能冷启动）之后才取，
+    # 否则会绑到已被替换的旧窗口；默认主屏，S3-A2 --target-screen 时为指定屏。
     calib['env'] = ui_calibration.env_fingerprint(win)
-    dprint(f"  env 取值（放置后，窗口所在屏）: screen={calib['env']['screen']} "
+    dprint(f"  env 取值（建稿/打开后，窗口所在屏）: screen={calib['env']['screen']} "
            f"dpi={calib['env']['dpi_scale']} jy={calib['env']['jianying_version']}")
     if _pt != 'edit':
         if _pt is None:
             dprint('  ⚠️ 页面类型无法判定（Qt 通用窗口类），假定已在编辑页继续')
         else:
-            raise RuntimeError(f'当前不在编辑页（pt={_pt}），请先手动打开草稿')
+            raise RuntimeError(f'草稿已定位但未进入编辑页（pt={_pt}）')
 
     # ---------- 起点布局快照（任何点击/按键之前，全屏/预设轨处理之前） ----------
     # 供 pipeline「命中即自检」：进入编辑页后立刻对账，确保起点状态与准入一致。
@@ -211,7 +387,10 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         _icon_l, _icon_r = ui_track_ops._icon_offsets()
         calib['initial_layout'] = {
             'recorded_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-            'row_count': len(_rrs0),
+            # 记录点是「进编辑页、轨道行刚可见时的快照」，与 tracks 阶段应校验的
+            # 轨道总数不是同一口径：前者随懒加载/折叠变化，后者由预设组条数推导。
+            'visible_row_count': len(_rrs0),
+            'expected_track_count': _expected_tracks,
             'rows': [{'idx': i, 'type': rr['type'], 'ymid': int(rr['ymid']),
                       'hidden': bool(rr['hidden']),
                       'type_source': rr['type_source'],
@@ -226,7 +405,7 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
             'icon_l_offset': int(ui_track_ops.header_abs_x(_wl0, _icon_l)),
             'icon_r_offset': int(ui_track_ops.header_abs_x(_wl0, _icon_r)),
         }
-        dprint(f"  起点布局: {len(_rrs0)} 行 "
+        dprint(f"  起点布局: 可见 {len(_rrs0)} 行 / 预期 {_expected_tracks} 条轨道 "
                f"rows={[(rr['type'], rr['ymid']) for rr in _rrs0]} "
                f"x=[eye={int(_ex0)} lock={calib['initial_layout']['lock_x']}] "
                f"耗时 {time.time() - _il_t0:.1f}s")
@@ -255,11 +434,16 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         if main is None:
             raise RuntimeError('主轨识别失败（无 video 行）')
         rows_chk, *_ = scan_tracks(win)
-        if len(rows_chk) <= 1:
-            raise RuntimeError(f'轨道数 {len(rows_chk)} <= 1（预设轨未出现/合并失败）')
-        dprint(f"  轨道数校验通过: {len(rows_chk)} 条（>1）")
+        if len(rows_chk) != _expected_tracks:
+            raise RuntimeError(
+                f'轨道数 {len(rows_chk)} != 预期 {_expected_tracks}'
+                f'（主轨 1 + 预设 {len(_presets)} 条的 {_preset_src}；'
+                f'请确认预设组配置与实际合并结果一致）')
+        dprint(f"  轨道数校验通过: {len(rows_chk)} 条（预期 {_expected_tracks}"
+               f" = 主轨 1 + 预设 {len(_presets)}）")
         stage_results['tracks'] = {'ok': True, 'duration_s': None, 'metrics': {
-            'track_count': len(rows_chk), 'main_ymid': int(main['ymid']),
+            'track_count': len(rows_chk), 'expected_track_count': _expected_tracks,
+            'main_ymid': int(main['ymid']),
             'preset_tracks': len(presets)}}
         calib['main_track'] = {
             'method': 'dual',
@@ -599,29 +783,77 @@ def _print_timing(marks):
     dprint('-' * 56)
 
 
+def _finalize_jianying(stop_after='export', completed=False,
+                       keep_window=False, close_window=False):
+    """准入收尾：按「是否跑完全部阶段 + 显式开关 + close_on_exit」决定留窗还是关闭。
+
+    归属口径：只有 ui_nav.JIANYING_LAUNCHED=True（本轮确实拉起过）才默认接管；
+    复用的用户实例不关闭、不清理，除非显式 --close-window。
+    保留窗口：不关闭、不清临时文件（中途停点就是给人肉眼确认的）。
+    关闭窗口：先回首页再正常关闭（避免草稿打开态触发保存弹窗），剪映自删 .locked
+    并落盘 autosave，随后清掉 template*.tmp / draft_content.json.bak 等残留。
+    """
+    import ui_nav
+    launched = getattr(ui_nav, 'JIANYING_LAUNCHED', False)
+    if not launched and not close_window:
+        dprint('[收尾] 窗口策略：保留窗口（本轮未拉起剪映，不接管用户实例）')
+        return
+    close_on_exit = True
+    draft_dir = None
+    try:
+        cfg = _load_admission_cfg()
+        close_on_exit = bool(cfg['open'].get('close_on_exit', True))
+        draft_dir = _admission_draft_dir(cfg)
+    except SystemExit as e:
+        if not close_window:
+            print(f'[warn] 收尾读取 admission 配置失败，跳过关闭/清理: {e}')
+            return
+        print(f'[warn] 收尾读取 admission 配置失败，仅关闭剪映、跳过临时文件清理: {e}')
+
+    completed_all = bool(completed) and stop_after == STAGES[-1]
+    action, reason = decide_window_action(
+        completed_all, stop_after, close_on_exit,
+        keep_window=keep_window, close_window=close_window)
+    if action == 'keep':
+        dprint(f'[收尾] 窗口策略：{reason}；不关闭、不清临时文件')
+        return
+    dprint(f'[收尾] 窗口策略：关闭窗口（{reason}）')
+    # 先退编辑页回首页再关：避免草稿打开态下关闭触发保存/恢复弹窗，也便于剪映自行落盘
+    try:
+        ui_nav.switch_to_home(max_wait=15)
+    except Exception as e:
+        dprint(f'  [warn] 收尾回首页失败（忽略，继续关闭）: {e}')
+    if not ui_nav.close_jianying():
+        dprint('  ⚠️ 剪映未能关闭，跳过草稿临时文件清理')
+        return
+    if not draft_dir:
+        return
+    from pipeline import cleanup_draft_temp_files
+    removed = cleanup_draft_temp_files(draft_dir)
+    dprint(f'  🧹 草稿临时文件清理: {len(removed)} 个')
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='准入测试（分阶段校准）')
-    ap.add_argument('--init', action='store_true',
-                    help='先调用 init_draft 重建测试草稿再校准')
     ap.add_argument('--stop-after', default='export', choices=STAGES,
                     help='跑到哪个阶段停（默认 export：全程跑完含导出）')
     ap.add_argument('--vocal-mode', default='none', choices=['none', 'vocal', 'background'],
                     help='二次分离模式：none=不选下拉（默认），vocal=仅保留人声，background=仅保留背景声')
-    ap.add_argument('--normalize', action='store_true',
-                    help='草稿强制逐集转封装/重编码（默认关闭：直接引用原始视频，与 ui_pipeline 同名参数一致）')
     ap.add_argument('--target-screen', default=None,
                     help='目标屏：primary|secondary|<index>（S3-A2；不给=主屏，现状）')
+    _win_group = ap.add_mutually_exclusive_group()
+    _win_group.add_argument('--keep-window', action='store_true',
+                            help='收尾强制保留剪映窗口（不关闭、不清临时文件；覆盖默认决策）')
+    _win_group.add_argument('--close-window', action='store_true',
+                            help='收尾强制关闭剪映窗口（中途停点也关；覆盖默认决策）')
     args = ap.parse_args()
     from ui_core import install_timestamp_stdout
     install_timestamp_stdout()   # 所有 print（含 init_draft 阶段）统一带墙钟毫秒前缀
-    if args.init:
-        from init_draft import init_draft
-        r = init_draft(normalize=args.normalize)
-        if not r['ok']:
-            raise SystemExit(f"❌ 初始化草稿失败: {r['error']}")
+    completed = False
     try:
         calibrate(stop_after=args.stop_after, vocal_mode=args.vocal_mode,
                   target_screen=args.target_screen)
+        completed = True
     except Exception:
         # 失败兜底：尽量退出编辑页回首页（草稿留在编辑页会阻塞下次热复用，也不便人工检查）
         try:
@@ -633,3 +865,6 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"[warn] 回首页失败（忽略）: {e}")
         raise
+    finally:
+        _finalize_jianying(stop_after=args.stop_after, completed=completed,
+                           keep_window=args.keep_window, close_window=args.close_window)
