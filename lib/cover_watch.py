@@ -21,7 +21,7 @@
 
 用法：
   python lib/cover_watch.py                        # 读 presets.json 的 watch 段
-  python lib/cover_watch.py --root "D:/短剧" --once --dry-run   # 预览计划
+  python lib/cover_watch.py --root "<剧集根>" --once --dry-run   # 预览计划
   python lib/cover_watch.py plan                   # 列表：阶段/意图/下一步/被挡原因
   python lib/cover_watch.py --hold                 # 只列计划不执行（同配置 hold:true）
   python lib/cover_watch.py --phase export --once  # 单轮强制只推进导出阶段
@@ -39,7 +39,8 @@
        "export_policy":"immediate", "hold":false, "derive":[],
        "cold_start":true, "export_stall_timeout":1800, "retry_pause_after":5,
        "edit_stall_timeout_s":900, "new_job_grace_min":10}
-      cold_start：每部剧导出前冷启动剪映（默认 true；手动用剪映时建议设 false）
+      cold_start：显式要求每部剧导出前强制干净启动（默认不设＝交给实例管理器判定；
+                   可交互首页直接复用，UI 假死才重启）
       export_stall_timeout：导出无进展判定卡死的秒数（进度 json 每 30s 刷新一次）
       retry_pause_after：连续失败多少次后暂停该剧（默认 5，退避 1/2/4/8/16/30 分钟）
       edit_stall_timeout_s：edit 阶段心跳超时秒数（默认 900，0 关闭看门狗）
@@ -67,11 +68,13 @@ from datetime import datetime
 from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pipeline"))
 import job_manifest as jm  # noqa: E402
 import export_lock  # noqa: E402
 import export_state as es  # noqa: E402  # 导出状态机单一真源（.export_state.json）
 import edit_state as eds  # noqa: E402  # edit 阶段失败退避/暂停（.edit_state.json）
 import state_io as _sio  # noqa: E402  # 状态文件公共读写（只读查看用）
+from export_config import get_projects_root  # noqa: E402
 import failure_class as fc  # noqa: E402  # 第 3 项：失败分类器 + 自愈策略表
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -599,9 +602,7 @@ def note_export_result(job_dir: str, name: str, ok: bool, *,
 # ── 意图与计划推导 ──────────────────────────────────────────────
 
 def _draft_root() -> str:
-    return (os.environ.get("JY_PROJECTS_ROOT", "").strip()
-            or os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                            "JianyingPro", "User Data", "Projects", "com.lveditor.draft"))
+    return get_projects_root()
 
 
 def _is_stream_draft_name(name: str, series_name: str) -> bool:
@@ -1393,7 +1394,7 @@ def build_plan(job_dir: str, job: dict[str, Any], cfg: dict[str, Any],
         # 与实际执行共用同一份命令拼装（含 --expect-duration），避免 plan 里
         # 展示的命令和真正跑的命令不一致。
         return sr._export_cmd(dn, pc.export_mp4_path(dn),
-                              bool(cfg.get("cold_start", True)), False)
+                              cfg.get("cold_start"), False)
 
     if phase_override == "edit":
         plan.update(action="edit", reason="--phase edit 强制", cmd=_edit_cmd())
@@ -2393,7 +2394,7 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
             export_started = time.time()
             ok = sr._run_export(dn,
                                 timeout=float(cfg.get("export_stall_timeout", 1800)),
-                                cold_start=bool(cfg.get("cold_start", True)),
+                                cold_start=cfg.get("cold_start"),
                                 job_dir=job_dir)
             _log(job_dir, f"export {'ok' if ok else '失败'} {idx}/{len(targets)}: {dn}")
             if not ok:

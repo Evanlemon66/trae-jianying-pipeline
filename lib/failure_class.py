@@ -28,6 +28,8 @@ from typing import Optional
 
 # ── 类别 ─────────────────────────────────────────────────────────
 UI_HANG = "ui_hang"              # 窗口存在但无响应 / 就绪或打开草稿超时
+WINDOW_MISSING = "window_missing"  # 未找到剪映窗口（含拉起后窗口始终没出现）
+WINDOW_ACTIVATE_TIMEOUT = "window_activate_timeout"  # 找到窗口但激活失败（不可交互）
 LAUNCH_FAILED = "launch_failed"  # 拉起剪映失败（早退重试后仍 died / 启动超时）
 ASSET_MISSING = "asset_missing"  # 草稿或素材不存在/损坏
 DISK_FULL = "disk_full"          # 目标盘余量不足
@@ -35,10 +37,12 @@ EXPORT_TIMEOUT = "export_timeout"  # 导出无进展超时（看门狗卡死）
 VERSION_DIALOG = "version_dialog"  # 版本更新/公告弹窗挡路
 ARTIFACTS_INCOMPLETE = "artifacts_incomplete"  # 导出返回成功但 mp4/封面/progress 不全
 VERIFY_FAILED = "verify_failed"    # 导出后质检（帧对齐）未通过
+VERSION_UNSUPPORTED = "version_unsupported"  # 剪映版本不在支持范围（预检拒绝）
 UNKNOWN = "unknown"
 
-CATEGORIES = (UI_HANG, LAUNCH_FAILED, ASSET_MISSING, DISK_FULL, EXPORT_TIMEOUT,
-              VERSION_DIALOG, ARTIFACTS_INCOMPLETE, VERIFY_FAILED, UNKNOWN)
+CATEGORIES = (UI_HANG, WINDOW_MISSING, WINDOW_ACTIVATE_TIMEOUT, LAUNCH_FAILED,
+              ASSET_MISSING, DISK_FULL, EXPORT_TIMEOUT, VERSION_DIALOG,
+              ARTIFACTS_INCOMPLETE, VERIFY_FAILED, VERSION_UNSUPPORTED, UNKNOWN)
 
 # 跨轮重拉只对"拉起本身失败"生效：这类失败与草稿/素材无关，重新拉起有实质意义。
 # 由 robust_auto_export 在实例管理器 launch() 返回 died/timeout 时打 `[launch_failed:`
@@ -57,6 +61,10 @@ REFUSE_LAUNCH = "refuse_launch"
 # 不可重试类（asset_missing/disk_full）counts=False，直接置终态 failed。
 STRATEGY = {
     UI_HANG:        {"retryable": True,  "action": RESTART,       "counts": True},
+    # 窗口没出现 ≠ UI 假死：重启一次通常能带回窗口；日志里能与 ui_hang 一眼区分。
+    WINDOW_MISSING: {"retryable": True,  "action": RESTART,       "counts": True},
+    # 找到窗口但激活超时 = 窗口在却不可交互（常是假死）：杀进程重建，别在旧实例上重试。
+    WINDOW_ACTIVATE_TIMEOUT: {"retryable": True, "action": KILL_RETRY, "counts": True},
     # 拉起失败：本轮不追加同轮重试（EARLY_DEATH_RETRIES=1 不动），交给 cover_watch
     # 的跨轮兜底——下一轮扫描优先重拉，连续多轮失败由 RELAUNCH_MAX_ROUNDS 截断。
     LAUNCH_FAILED:  {"retryable": True,  "action": RESTART,       "counts": True},
@@ -67,6 +75,8 @@ STRATEGY = {
     # 导出成功但产物不全 / 质检（帧对齐）不过：可重试，按退避重导；连续失败会暂停
     ARTIFACTS_INCOMPLETE: {"retryable": True, "action": RESTART, "counts": True},
     VERIFY_FAILED: {"retryable": True, "action": RESTART, "counts": True},
+    # 版本不符是环境问题：重试不会改变版本，直接拒绝并提示支持版本
+    VERSION_UNSUPPORTED: {"retryable": False, "action": REFUSE_LAUNCH, "counts": False},
     UNKNOWN:        {"retryable": True,  "action": RESTART,       "counts": True},
 }
 
@@ -91,6 +101,17 @@ def classify(error: Optional[str], phase: Optional[str] = None) -> tuple[str, st
     #    因为它的文案里同样含"无法自动启动"，不能混进普通 UI 假死。
     if "[launch_failed:" in e or e.startswith("launch_failed"):
         return LAUNCH_FAILED, STRATEGY[LAUNCH_FAILED]["action"]
+
+    # 0.2 窗口级失败：窗口没出现 / 找到但激活超时，各自独立上报，不再统一报 ui_hang。
+    if "[window_activate_timeout]" in e or _has(e, "窗口激活失败", "窗口激活超时"):
+        return WINDOW_ACTIVATE_TIMEOUT, STRATEGY[WINDOW_ACTIVATE_TIMEOUT]["action"]
+    if "[window_missing]" in e:
+        return WINDOW_MISSING, STRATEGY[WINDOW_MISSING]["action"]
+
+    # 0.5 剪映版本不在支持范围（预检拒绝）：重试无意义，直接终态并提示支持版本。
+    #     必须先于「未找到 / 超时」等宽泛关键词，否则会被误判成可重试的 ui_hang。
+    if _has(e, "版本预检不通过", "不会静默拉起其它版本", "仅支持剪映"):
+        return VERSION_UNSUPPORTED, STRATEGY[VERSION_UNSUPPORTED]["action"]
 
     # 1. 磁盘不足：不可重试，拒绝启动
     if _has(e, "磁盘空间不足", "磁盘不足", "空间不足", "no space", "ENOSPC"):

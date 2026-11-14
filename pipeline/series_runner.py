@@ -10,7 +10,7 @@
                - --all-stream：草稿库中所有名字含「串流」的草稿全部导出
 
 用法:
-    python pipeline\\series_runner.py "D:\\短剧\\剧A" "D:\\短剧\\剧B"
+    python pipeline\\series_runner.py "<剧集根>\\剧A" "<剧集根>\\剧B"
     python pipeline\\series_runner.py A B C --mode generate
     python pipeline\\series_runner.py A B --mode export
     python pipeline\\series_runner.py --mode export --all-stream
@@ -53,9 +53,7 @@ BATCH_RUNNER = os.path.join(_HERE, "batch_runner.py")
 AUTO_EXPORTER = os.path.join(
     _ROOT, ".trae", "skills", "jianying-editor", "examples", "robust_auto_export.py"
 )
-JY_DRAFT_ROOT = os.path.join(
-    os.environ.get("LOCALAPPDATA", ""), "JianyingPro", "User Data", "Projects", "com.lveditor.draft"
-)
+JY_DRAFT_ROOT = pc.get_projects_root()
 # 各模式部间默认间隔（秒）：generate 不碰剪映零等待；export 留 60s 回首页；full 120s
 _MODE_DEFAULT_RESET = {"full": 120, "generate": 0, "export": 60}
 
@@ -369,7 +367,7 @@ def _draft_duration_s(draft_name: str):
         return None
 
 
-def _export_cmd(draft_name: str, out_mp4: str, cold_start: bool, keep_open: bool):
+def _export_cmd(draft_name: str, out_mp4: str, cold_start: bool | None, keep_open: bool):
     cmd = [sys.executable, "-u", AUTO_EXPORTER, draft_name, out_mp4, "--move",
            "--fallback-dir", get_export_dir()]
     # 首版没有旧成品时，进度百分比只能靠草稿时长估算；watcher 路径也要传，
@@ -377,6 +375,7 @@ def _export_cmd(draft_name: str, out_mp4: str, cold_start: bool, keep_open: bool
     expect_s = _draft_duration_s(draft_name)
     if expect_s:
         cmd += ["--expect-duration", ("%g" % expect_s)]
+    # cold_start 只表达「是否强制干净启动」的意图；None=交给实例管理器判定。
     if cold_start:
         cmd.append("--cold-start")
     if keep_open:
@@ -384,7 +383,7 @@ def _export_cmd(draft_name: str, out_mp4: str, cold_start: bool, keep_open: bool
     return cmd
 
 
-def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = False,
+def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool | None = None,
                 job_dir: str | None = None, keep_open: bool = False) -> bool:
     """导出统一入口：外层持 `.export.lock`，再走 preclean + 子进程 + 归拢。
 
@@ -408,13 +407,15 @@ def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = Fa
             export_lock.release()
 
 
-def _run_export_locked(draft_name: str, timeout: float = 1800, *, cold_start: bool = False,
+def _run_export_locked(draft_name: str, timeout: float = 1800, *,
+                       cold_start: bool | None = None,
                        job_dir: str | None = None, keep_open: bool = False) -> bool:
     """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。
 
     timeout 按「无进展」计：进度 json 每 30s 刷新一次，超过 timeout 秒没有任何刷新
     才判定卡死并杀进程（导出慢但一直在写盘不会被误杀）。
-    cold_start: 导出前冷启动剪映（每部剧一次，规避上一部刚导完时的 UI 假死）。
+    cold_start: 只表达意图——True 强制干净启动，None 交给实例管理器判定
+    （可交互首页可复用，假死实例必须重启）。
     keep_open: 批内复用——导出后把实例留在首页，交给下一份接着用；
     队列结束时由调用方统一 WM_CLOSE 关闭。单份导出保持 False（用完就关）。
     job_dir: 显式 cover_job；为空时按草稿名解析。缺字幕清单非空时直接拦截，
@@ -441,7 +442,8 @@ def _run_export_locked(draft_name: str, timeout: float = 1800, *, cold_start: bo
     print(f"  📝 导出子进程日志: {log_path}")
     with open(log_path, "a", encoding="utf-8", errors="replace") as logf:
         logf.write(f"\n===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动导出子进程 "
-                   f"draft={draft_name} cold_start={int(cold_start)} "
+                   f"draft={draft_name} "
+                   f"cold_start={'auto' if cold_start is None else int(bool(cold_start))} "
                    f"keep_open={int(keep_open)} =====\n")
         logf.write("cmd: " + " ".join(cmd) + "\n")
         logf.write(f"out: {out_mp4}\n")
@@ -496,6 +498,8 @@ def main() -> int:
     ap.add_argument("--stage-gap", type=float, default=45,
                     help="full 模式中「生成→导出」的衔接秒数（默认 45）")
     ap.add_argument("--timeout", type=float, default=1800, help="导出超时秒数（默认 1800）")
+    ap.add_argument("--cold-start", action="store_true",
+                    help="导出前强制干净启动剪映（默认由实例管理器判定复用/重启）")
     args = ap.parse_args()
 
     if args.mode == "export" and args.all_stream:
@@ -616,7 +620,8 @@ def main() -> int:
                     continue
             st["status"] = "exporting"
             _save_state(state)
-            if _run_export(draft, args.timeout, job_dir=job_dir, keep_open=reuse):
+            if _run_export(draft, args.timeout, cold_start=args.cold_start or None,
+                           job_dir=job_dir, keep_open=reuse):
                 out_mp4 = export_mp4_path(draft)
                 if _finalize_export(draft, out_mp4, job_dir):
                     st["status"] = "done"

@@ -44,6 +44,25 @@ import uiautomation as uia
 _HERE_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_HERE_DIR))))
 _LIB_DIR = os.path.join(_REPO_ROOT, "lib")
+_PIPE_DIR = os.path.join(_REPO_ROOT, "pipeline")
+
+
+def _require_repo_layout():
+    """上探仓库依赖层；找不到时给出布局说明，而不是裸 ModuleNotFoundError。"""
+    missing = [rel for rel in ("lib/jianying_launch.py", "lib/jianying_proc.py",
+                               "pipeline/export_config.py", "pipeline/draft_io.py")
+               if not os.path.isfile(os.path.join(_REPO_ROOT, *rel.split("/")))]
+    if missing:
+        raise ImportError(
+            "未找到仓库依赖层，robust_auto_export.py 不能脱离仓库单独使用。\n"
+            "支持的唯一布局：<repo>/.trae/skills/jianying-editor/examples/robust_auto_export.py\n"
+            f"本次按上探推算的仓库根：{_REPO_ROOT}\n"
+            f"缺失：{', '.join(missing)}\n"
+            "请把整个仓库（含 lib/ 与 pipeline/）一起 clone/解压后再运行。"
+        )
+
+
+_require_repo_layout()
 if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 try:
@@ -53,10 +72,11 @@ except Exception:  # 分类器不可用时退回旧逻辑
 
 # ========== 1c. 草稿写盘原语（串流恢复的唯一写回入口）==========
 # 恢复必须走 pipeline/draft_io.write_draft_content：原子写 + 不变量校验 + 写时留痕。
-_PIPE_DIR = os.path.join(_REPO_ROOT, "pipeline")
 if _PIPE_DIR not in sys.path:
     sys.path.insert(0, _PIPE_DIR)
 import draft_io  # noqa: E402
+from export_config import get_projects_root  # noqa: E402
+import jianying_launch as jl  # noqa: E402  版本预检/候选枚举
 
 # ========== 1c. 实例生命周期管理器（第 2 项，同目录 jy_instance.py）==========
 # 四套拉起/回首页逻辑收敛到该管理器；只有它的 kill() 允许 taskkill。
@@ -95,7 +115,7 @@ def _rebind_from_manager(exporter, required=True):
     if w is None:
         msg = "未找到【剪映专业版】主窗口（保留旧绑定，不用搜索条件冒充窗口）"
         if required:
-            raise Exception(f"重绑主窗口失败：{msg}")
+            raise Exception(f"[window_missing] 重绑主窗口失败：{msg}")
         dprint(f"⚠️ {msg}")
         return None
     exporter.window = w
@@ -191,9 +211,7 @@ def _preflight_media(draft_name):
     import json
     import concurrent.futures as futures
 
-    root = os.environ.get("JY_PROJECTS_ROOT", "").strip() or os.path.join(
-        os.environ.get("LOCALAPPDATA", ""), "JianyingPro", "User Data",
-        "Projects", "com.lveditor.draft")
+    root = get_projects_root()
     content = os.path.join(root, draft_name, "draft_content.json")
     if not os.path.isfile(content):
         raise Exception(f"素材预检无法读取内容文件: {content}")
@@ -547,25 +565,40 @@ def _find_export_in_dir(search_dir, safe_name, min_mtime=None):
     return newest
 
 
+# 最近一次探测里被吞掉的异常原因：用于把「激活超时 / 窗口缺失」带到最终报错，
+# 不再让所有打开草稿失败都只剩一句「超时/卡死」。
+_LAST_PROBE_ERROR = [None]
+
+
 def _poll_with_timeout(fn, timeout):
     """在 daemon 线程里执行一次 UI 探测，超时判定为失败。
 
     剪映假死时 UIA 调用会无限阻塞（实测：名义 60s 的等待循环实挂 41 分钟），
     所以每次探测必须有独立的墙钟上限；daemon 线程不阻塞进程退出。
+    探测内抛出的异常记录到 _LAST_PROBE_ERROR，供调用方区分失败原因。
     """
     result = {}
 
     def _runner():
         try:
             result["value"] = fn()
-        except Exception:
-            pass
+        except Exception as e:
+            result["error"] = e
+            # 线程可能在 join 超时后才抛错，这里立刻记下原因，下一次轮询就能看到
+            # （实测：SetActive 的 10s 超时晚于 8s 轮询上限，不在线程内记就丢原因）。
+            _LAST_PROBE_ERROR[0] = str(e) or None
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
     t.join(timeout)
     if t.is_alive() or "value" not in result:
+        err = result.get("error")
+        if err is not None:
+            _LAST_PROBE_ERROR[0] = str(err) or None
+        # 线程还在跑时不抹掉已记录的原因：假死时异常要 10s 才抛出，
+        # 8s 的轮询上限会先到，清掉就丢失"激活超时"这一关键分类。
         return False, None
+    _LAST_PROBE_ERROR[0] = None
     return True, result["value"]
 
 
@@ -593,9 +626,11 @@ def _wait_edit_page(exporter, editor_s, *, alive_fn=None, now_fn=time.time,
     立即抛 [launch_failed:died_during_open]，由 failure_class → watcher 跨轮重拉
     （重拉前 manager.launch 会先枚举进程，存活则只重连，绝不双开）。
 
-    返回进入编辑页的耗时（秒）；进程存活但墙钟耗尽仍抛原“打开草稿超时”。
+    返回进入编辑页的耗时（秒）；进程存活但墙钟耗尽仍抛原“打开草稿超时”，
+    并带上最后一次探测的具体原因（窗口缺失 / 激活超时），不再一律归成 ui_hang。
     """
     alive_fn = alive_fn or (lambda: _proc_alive(exporter))
+    capture_error = poll_fn is None
     if poll_fn is None:
         def _default_poll():
             def _probe():
@@ -605,6 +640,7 @@ def _wait_edit_page(exporter, editor_s, *, alive_fn=None, now_fn=time.time,
         poll_fn = _default_poll
 
     start = now_fn()
+    activate_failures = 0
     while now_fn() - start < editor_s:
         sleep_fn(1)
         if not alive_fn():
@@ -614,31 +650,19 @@ def _wait_edit_page(exporter, editor_s, *, alive_fn=None, now_fn=time.time,
             elapsed = now_fn() - start
             sleep_fn(3)  # 额外等待渲染完成
             return elapsed
-    raise Exception("打开草稿超时，未能进入编辑界面。请确认是否手动干预或程序卡死。")
-
-
-def _cold_start_jianying(exporter, wait_home=jy_instance.HOME_READY_TIMEOUT_S):
-    """冷启动剪映（第 2 项：薄封装转调实例管理器 restart，唯一 kill 入口）。
-
-    每部剧导出前执行，避开"上一部刚导完 / 进程刚拉起"时窗口存在但 UI 未就绪
-    （此时 open_draft 会假死在草稿查找或加载阶段）。管理器内部全程墙钟 deadline，
-    杀进程 → 拉起 → 等首页；无法定位安装路径时抛含「冷启动失败」关键词的异常。
-
-    wait_home 默认 180s（第 1 条稳定性修复）：窗口已出现但 HomePage 尚未渲染完时
-    视为"继续等待"，不再按旧默认 90s 提前判失败。
-    """
-    dprint("冷启动剪映：交由实例管理器（杀进程→拉起→等首页，唯一 kill 入口）...")
-    _flow("冷启动剪映：管理器 restart")
-    try:
-        ok = _get_manager(exporter).restart(wait_home)
-    except jy_instance.JyInstanceError as e:
-        raise Exception(f"冷启动失败：{e}")
-    # 未到首页时窗口可能确实还没出现：只告警、保留旧绑定，下面继续走 open_draft 的墙钟。
-    _rebind_from_manager(exporter, required=bool(ok))
-    if ok:
-        dprint("✅ 剪映冷启动完成，已停在首页")
-    else:
-        dprint("⚠️ 冷启动未在限定时间内看到首页，继续尝试打开草稿（open_draft 有墙钟上限）")
+        # 窗口在但连续两次激活超时：继续轮询只会重复同一个 10s 超时。
+        # 只容忍一次，避免把"加载大草稿时短暂无响应"误判成假死。
+        err = _LAST_PROBE_ERROR[0] if capture_error else None
+        if err and "[window_activate_timeout]" in err:
+            activate_failures += 1
+            if activate_failures >= 2:
+                raise Exception(
+                    err + "（打开草稿失败：窗口在但不可交互，疑似 UI 假死）")
+        else:
+            activate_failures = 0
+    detail = _LAST_PROBE_ERROR[0]
+    prefix = f"{detail} " if detail else ""
+    raise Exception(prefix + "打开草稿超时，未能进入编辑界面。请确认是否手动干预或程序卡死。")
 
 
 class ControlFinder:
@@ -742,47 +766,45 @@ class Exporter:
             else:
                 if retry:
                     mgr = _get_manager(self)
-                    if mgr.backend.process_running():
-                        # 防双开：进程还在（通常只是窗口/首页未就绪）→ 只重连，
-                        # 绝不再拉起第二个实例；launch 内部也会再判一次存活。
-                        dprint("检测到剪映进程仍存活：只重连，不再拉起第二个实例")
-                        _rebind_from_manager(self, required=False)
-                        if self.window is not None and self.window.Exists(0):
-                            return
-                    # 第 2 项：启动统一经实例管理器（墙钟 deadline + 探测线程超时）
-                    dprint("未找到【剪映专业版】，交由实例管理器启动...")
+                    # 找窗口/拉起这件事同样只走实例管理器的统一判定：
+                    # 能交互的首页就复用，进程在但假死就重启，不再各自维护默认值。
+                    dprint("未找到【剪映专业版】，交由实例管理器判定（复用/拉起/重启）...")
                     try:
-                        ok = mgr.launch(timeout=60)
+                        ok = mgr.ensure_for_export()
                     except jy_instance.JyInstanceError as e:
-                        raise Exception(f"无法自动启动【剪映专业版】：{e}")
+                        raise Exception(f"[window_missing] 无法自动启动【剪映专业版】：{e}")
                     if ok:
-                        # 拉起成功才重绑；拿不到主窗口在这里就明确失败，
+                        # 就绪才重绑；拿不到主窗口在这里就明确失败，
                         # 不再像旧实现那样先塞一个搜索条件、之后白等 10s。
                         _rebind_from_manager(self)
-                        dprint("程序已启动。")
+                        dprint("程序已就绪。")
                         return
                     # 给上层一个可判别的标记：只有"拉起本身 died/timeout"才进跨轮重拉，
                     # 其余启动失败仍按原 UI 假死退避处理。
-                    out = getattr(_get_manager(self), "last_outcome", None)
+                    out = getattr(mgr, "last_outcome", None)
                     tag = ""
                     if out is not None and getattr(out, "outcome", "") in (
                             "died", "died_late", "died_after_ready", "timeout"):
                         tag = (f"[launch_failed:{out.outcome} alive={out.alive_s:.1f}s "
                                f"attempt={out.attempt} "
                                f"env_check={int(bool(out.env_check_seen))}] ")
-                    raise Exception(tag + "无法自动启动【剪映专业版】，请手动启动后重试。")
+                    raise Exception(tag + "[window_missing] 无法自动启动【剪映专业版】，"
+                                    "请手动启动后重试。")
                 else:
-                    raise Exception("未找到【剪映专业版】窗口，请确保它已启动。")
-        
-        # 2. 激活窗口
+                    raise Exception("[window_missing] 未找到【剪映专业版】窗口，请确保它已启动。")
+
+        # 2. 激活窗口：激活失败不是"警告"，而是"窗口在但不可交互"的明确信号。
+        #    旧实现把它降级成 warning 继续跑，后续所有失败都被误报成 ui_hang，
+        #    这也是本次排查被误导的直接原因。这里按独立类别上报。
         try:
-            if self.window.Exists(0):
-                self.window.SetActive()
-                self.window.SetTopmost(True) # 临时置顶确保不被遮挡
-                time.sleep(0.2)
-                self.window.SetTopmost(False)
+            self.window.SetActive()
+            self.window.SetTopmost(True) # 临时置顶确保不被遮挡
+            time.sleep(0.2)
+            self.window.SetTopmost(False)
         except Exception as e:
-            dprint(f"窗口激活警告: {e}")
+            raise Exception(
+                f"[window_activate_timeout] 已找到【剪映专业版】窗口但激活失败"
+                f"（窗口在但不可交互，疑似 UI 假死）：{e}")
 
     def dismiss_blocking_dialogs(self):
         """尝试关闭可能阻挡界面的弹窗 (如环境检测、媒体丢失、版本更新等)"""
@@ -811,9 +833,13 @@ class Exporter:
             except: pass
 
     def is_home_page(self):
-        """是否在首页。窗口缺失/解析异常一律 False，不裸等 10s 搜索超时。"""
+        """首页是否「真能用」：与实例管理器同一判据（ClassName + 可交互控件）。
+
+        旧实现只看 ClassName：UI 假死时类名仍是 HomePage_QMLTYPE_*，自愈据此
+        判定"已在首页，无需软关"而 skip 掉重启，三次重试都在复用卡死实例。
+        """
         try:
-            return "HomePage" in (self.window.ClassName or "")
+            return bool(_get_manager(self).backend.is_home())
         except Exception:
             return False
 
@@ -1351,7 +1377,9 @@ def _do_recovery(action, exporter=None):
     实际动作写入 _TASK["recovery_action"] → progress sidecar + 日志行，供追溯/统计。
     """
     try:
-        exporter = exporter or Exporter()
+        # auto_connect=False：自愈本身就是要处理"窗口/UI 有问题"的状态，构造时再
+        # connect() 会先把激活超时抛出来，导致自愈根本没机会重启卡死实例。
+        exporter = exporter or Exporter(auto_connect=False)
     except Exception as e:
         dprint(f"⚠️ 自愈实例创建失败（仍将继续重试）: {e}")
         _TASK["recovery_action"] = "none"
@@ -1385,7 +1413,9 @@ def _do_recovery(action, exporter=None):
             # restart / unknown：先判窗口类，再决定软关还是强杀（第 2 条稳定性修复）
             kind = _window_kind(exporter)
             if kind == "home":
-                dprint("自愈动作：skip（已在首页，无需软关）")
+                # is_home_page 已含交互性校验：能走到这里说明首页真能用，
+                # 不是"ClassName=HomePage 的假死壳"。
+                dprint("自愈动作：skip（首页可交互，无需软关/重启）")
                 executed = "none"
             elif kind == "edit":
                 dprint("自愈动作：soft_home（当前在编辑页，点关闭按钮回首页）")
@@ -1660,10 +1690,8 @@ def _restart_jianying_to_home(exporter):
 
 
 def _find_draft_dir(draft_name):
-    """定位剪映草稿目录（JY_PROJECTS_ROOT 优先，其次 %LOCALAPPDATA% 默认位置）。"""
-    root = os.environ.get("JY_PROJECTS_ROOT", "").strip() or os.path.join(
-        os.environ.get("LOCALAPPDATA", ""),
-        "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+    """定位剪映草稿目录（统一草稿根解析：环境变量 > presets.json > 自动探测 > 默认）。"""
+    root = get_projects_root()
     candidate = os.path.join(root, draft_name)
     if os.path.isdir(candidate):
         return candidate
@@ -1824,9 +1852,21 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
     _flow(f"任务启动：导出【{draft_name}】→ {output_path}（搬运={'开' if move_output else '关'}，"
           f"最多 {_TASK['attempts_max']} 次尝试）")
 
-    # 1. 素材预检：源文件逐个 ffprobe，坏素材在启动剪映之前就报出来（不进重试）
+    # 1. 预检：先卡剪映版本，再验素材；两者都在启动剪映之前，不进重试。
+    #    只有两项都通过才置 _PREFLIGHT_DONE——预检失败时下一轮会重跑预检，
+    #    不会因为提前置位而跳过检查直接启剪映。
     if not _PREFLIGHT_DONE[0]:
-        _PREFLIGHT_DONE[0] = True
+        _TASK["stage"] = "环境预检"
+        try:
+            _jy_exe = jl.resolve_jianying_exe(log_fn=dprint)
+        except jl.JianyingLaunchError as exc:
+            msg = f"剪映版本预检不通过（仅支持 {jl.REQUIRED_JY_VERSION}）：{exc}"
+            _TASK["errors"].append(msg)
+            _TASK["stage"] = "环境预检失败"
+            _flow(msg)
+            raise Exception(msg)
+        dprint(f"✅ 剪映版本预检通过: {_jy_exe}")
+
         _TASK["stage"] = "素材预检"
         ok_n, problems = _preflight_media(draft_name)
         if problems:
@@ -1841,26 +1881,22 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
             raise Exception(f"素材预检不通过：{len(problems)} 个源文件损坏或缺失（{brief}{tail}）")
         dprint(f"✅ 素材预检通过: {ok_n} 个源文件（缺失/损坏=0）")
         _flow(f"素材预检通过：{ok_n} 个源文件通过校验")
+        _PREFLIGHT_DONE[0] = True
 
-    # 2. 确保在首页：--cold-start 时先判后拉（每部剧一次，避开"刚导完上一部"的
-    #    窗口存在但未就绪状态）；否则按原逻辑连接/切回首页。
-    #    两条链的启动序列现在一致：先决定要不要冷启动，再拉起，不存在抢跑。
+    # 2. 确保实例可用：三个入口（watcher / series_runner / 直调本脚本）都只表达
+    #    意图，是否复用、是否干净重启由实例管理器的唯一口径判定；复用前提是
+    #    "首页真能用"（能枚举到可交互控件），假死实例一律重启，不再带病复用。
     _TASK["phase"] = "cold_start"
-    if cold_start:
-        exporter = Exporter(auto_connect=False)
-        _cold_start_jianying(exporter)
-        try:
-            exporter.connect(retry=False)
-        except Exception as e:
-            dprint(f"⚠️ 冷启动后绑定窗口失败（open_draft 会再尝试）: {e}")
-    else:
-        exporter = Exporter()
-        # 批内复用：上一份正常结束时实例停在首页；若上一份异常退出仍停在编辑页/
-        # 导出视图，必须先回首页把上一份草稿关掉再打开新草稿——否则剪映会拿着
-        # 上一份的内存状态回写 draft_content.json。
-        if not exporter.is_home_page():
-            dprint("检测到不在首页（上一份草稿/导出视图未关），先切回首页")
-            exporter.switch_to_home()
+    exporter = Exporter(auto_connect=False)
+    try:
+        ok = _get_manager(exporter).ensure_for_export(force_clean=cold_start)
+    except jy_instance.JyInstanceError as e:
+        raise Exception(f"冷启动失败：{e}")
+    if not ok:
+        raise Exception("冷启动失败：剪映未能停在可交互首页")
+    _rebind_from_manager(exporter)
+    dprint("✅ 实例就绪（可交互首页），开始导出流程")
+    _flow("实例就绪：可交互首页（复用/重启由管理器判定）")
 
     # 3. 导出前修复：剪映可能在 pipeline 发布后打开过草稿，
     # 自动合并串流 video segments 导致 crop 元数据丢失 → 音画不同步
@@ -1979,7 +2015,8 @@ if __name__ == "__main__":
     parser.add_argument("--retries", type=int, default=2,
                         help="UI 类失败重试次数（默认 2，即共 3 次尝试；非 UI 错误不重试）")
     parser.add_argument("--cold-start", action="store_true",
-                        help="导出前冷启动剪映（杀进程→拉起→等首页），避免上一部刚导完时 UI 假死")
+                        help="显式强制干净启动（杀进程→拉起→等可交互首页）；"
+                             "默认由实例管理器判定复用还是重启")
     parser.add_argument("--resolution", default=None, choices=["480P", "720P", "1080P", "2K", "4K"],
                         help="导出分辨率（默认 None=沿用剪映当前值）")
 
