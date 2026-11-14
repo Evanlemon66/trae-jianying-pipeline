@@ -1,7 +1,7 @@
 """剧集批量流水线：整季视频 → 跑 pipeline（剪映云ASR + 翻译 + 人声分离 + 草稿）。
 
 用法:
-  python batch_runner.py "D:\\短剧\\10-六零糙汉：我靠打猎养全家"              # 整季（默认单草稿串流）
+  python batch_runner.py "<剧集根>\\10-六零糙汉：我靠打猎养全家"              # 整季（默认单草稿串流）
   python batch_runner.py <剧集目录> --per-episode                            # 逐集独立草稿（需多草稿并合并时才用）
   python batch_runner.py <剧集目录> --pattern "__jycache__\\*.mp4"           # 指定匹配
   python batch_runner.py <剧集目录> --only 3 --only 7                        # 只跑第3、7集
@@ -243,7 +243,7 @@ def _export_drafts_sequential(drafts, export_root, timeout_min=60.0, verify=True
                     print(f"  ⚠️ 导出子进程成功但成品未落盘: {out_mp4}")
                     ok = False
             except _sp.TimeoutExpired:
-                print(f"  ⚠️ 导出超时（>{timeout_min}min），终止: {dn}")
+                print(f"  ⚠️ 导出超时（>{timeout_min}min），已终止本次导出: {dn}")
                 proc.kill()
                 proc.wait()
             except Exception as e:

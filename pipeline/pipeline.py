@@ -17,13 +17,13 @@ from restore_backups import prune_restore_backups  # noqa: E402  恢复备份源
 
 from jy_cover import set_draft_cover, set_cover_composition
 
-from export_config import get_deps_root, get_font_path, preset_profile_name
+from export_config import (get_deps_root, get_font_path, get_presets_root,
+                           get_projects_root, preset_profile_name)
 import job_manifest as jm
 from no_window import NO_WINDOW, install_default_hidden, hidden_child_env
 install_default_hidden()  # 无控制台托管时兜底隐藏所有子进程窗口（有控制台不生效）
 
 from utils.formatters import (
-    get_default_drafts_root as _upstream_get_default_drafts_root,
     get_all_drafts as _upstream_get_all_drafts,
     get_duration_ffprobe_cached as _upstream_get_duration,
 )
@@ -81,7 +81,7 @@ def _timing_summary(workdir, tag=""):
 
 
 def _find_ffmpeg():
-    """定位 ffmpeg.exe：优先 D:/AI_Deps（统一依赖目录）→ WinGet → PATH。"""
+    """定位 ffmpeg.exe：优先统一依赖根（get_deps_root）→ WinGet → PATH。"""
     if shutil.which("ffmpeg"):
         return shutil.which("ffmpeg")
     import glob as _g
@@ -131,11 +131,11 @@ def _load_env_profile():
 
 _ENV_PROFILE = _load_env_profile()
 
-DRAFT_ROOT = _upstream_get_default_drafts_root()
+DRAFT_ROOT = get_projects_root()
 # 草稿构建暂存区：放在剪映草稿目录之外（同盘），构建完成后整体搬到 DRAFT_ROOT。
 # 剪映只扫描 DRAFT_ROOT，因此构建中的半成品永远不会被剪映看到/缓存。
 _STAGING_ROOT = os.path.join(os.path.dirname(DRAFT_ROOT), "__jybuild__")
-PRESET_ROOT = os.path.join(os.environ["LOCALAPPDATA"], "JianyingPro", "User Data", "Presets", "Combination", "Presets")
+PRESET_ROOT = get_presets_root()
 
 SEG_KEYS_WITH_ID = {"material_id", "group_id", "raw_segment_id", "render_index", "id"}
 TRACK_KEYS_WITH_ID = {"id"}
@@ -2868,7 +2868,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             # 避免剪映在构建过程中打开草稿、缓存空模板导致后几集空白。
             dp_root, jp, _ = create_empty_draft(draft_name_or_path, staging=True, register=False)
             if dp_root is None:
-                print("✗ 创建空白草稿失败 (找不到模板)")
+                print("✗ 创建空白草稿失败：找不到模板草稿。请在剪映里新建一个空草稿并命名为 "
+                      "default（模板查找顺序：default → pipeline_test → demo_test）")
                 return None
             staged = True
             print(f"✅ 已创建空白草稿(暂存区): {draft_name_or_path}")
@@ -3484,8 +3485,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
     return draft
 
 
-_JIANYING_DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                                    "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+_JIANYING_DRAFT_ROOT = DRAFT_ROOT
 
 
 def _media_key(path):
@@ -3652,7 +3652,8 @@ if __name__ == "__main__":
     parser.add_argument("--presets", default=None, metavar="'名1,名2:0.03'",
                         help="显式指定预设(逗号分隔, 名字后可带:滤镜透明度); 优先级高于 --profile 与 presets.json")
     parser.add_argument("--profile", default=None, metavar="a",
-                        help="预设组名（配置里写 presets_a；这里写 a 或 presets_a 均可），多账号各用各的预设")
+                        help="预设组名（配置里写 presets_a；这里写 a 或 presets_a 均可），"
+                             "单组：逗号不拆分，多组请用 batch_runner.py --profile a,b")
     parser.add_argument("--list-presets", action="store_true",
                         help="列出本机剪映预设库及当前生效来源后退出")
     parser.add_argument("--no-asr", action="store_true", help="跳过字幕识别")
