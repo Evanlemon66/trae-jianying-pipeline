@@ -609,6 +609,8 @@ freshness_of(job_dir, version, consumer="scheduler")
 
 ### 12.7 与 `audit_exemption.json` 的关系
 
+> 状态：2026-11-14 已下线，改为各命令 `--force` 显式放行并写 `06_publish/audit_forced.log`；原豁免文件不再读取。
+
 - 本轮**不动** `audit_exemption.json` 及其读写。
 - 功能重叠但维度不同：它放行的是「成品三件套缺件」，本系统标注的是「新鲜度证据缺失/不合法」。
 - 退役与否待定；本轮不删除、不迁移、不合并，仅在此记录。

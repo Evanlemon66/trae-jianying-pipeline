@@ -40,7 +40,7 @@ MANIFEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_stream
 _LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
-from export_bundle import audit_bundle, log_exemption_use  # noqa: E402  # 成品三件套校验（与导出侧同口径）
+from export_bundle import audit_bundle, log_forced_use  # noqa: E402  # 成品三件套校验（与导出侧同口径）
 
 
 def _manifest_path(draft_name):
@@ -561,46 +561,30 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
             work.append((name, p, {"__output__": out}))
             print(f"  [台账] {name}: manifest 无记录，按 job.json.video.outputs.{p} 纳入清理")
     # 产物校验（与导出口径一致）：mp4 / progress.done / 封面三件套缺一即中止，
-    # --force 才放行；实时扫盘，手工补封面后重跑自动通过。
-    if not intermediates_only and not force:
-        conflicts = []
+    # --force 才放行；放行了什么必须留痕（06_publish/audit_forced.log）。
+    # 实时扫盘，手工补封面后重跑自动通过。
+    if not intermediates_only:
         job_dir = os.path.join(source_dir, "cover_job")
-        for n, tprof, paths in work:
-            out = paths.get("__output__") or {}
-            state = str(out.get("state") or "").lower()
-            if not state:
-                # manifest 来源的版本也要看台账：单版本已清过的，文件本就不在
-                state = str((outputs.get(tprof) or {}).get("state") or "").lower()
-            if not state and tprof == "a":
-                state = str(video.get("export_state") or "").lower()
-            if state == "cleaned":
-                continue  # 已清版本文件本就不在，不参与校验
-            ef = paths.get("export_file") or out.get("export_file")
-            if not ef:
-                continue  # 无成品路径的版本由下面的 [错误]/[warn] 分支处理
-            res = audit_bundle(n, ef, out.get("export_dir") or "",
-                               job_dir=job_dir, profile=tprof)
-            if res.get("exempted"):
-                log_exemption_use(job_dir, n, tprof, res, write=not dry_run)
-            if not res["ok"]:
-                conflicts.append((n, res["missing"]))
-        if conflicts:
+        conflicts = _audit_conflicts(work, outputs, video)
+        if conflicts and force:
+            log_forced_use(job_dir, "clean", conflicts, dry_run=dry_run)
+        if conflicts and not force:
             if dry_run:
                 print("  [告警] 成品产物校验未通过（dry-run 仅提示，计划照常输出）：")
-                for n, missing in conflicts:
+                for n, _p, missing in conflicts:
                     for m in missing:
                         print(f"    - {n}: {m}")
             elif receipts_ok:
                 print("  [冲突] 台账与磁盘不一致：回执证明已发布，但本地成品三件套不全"
                       "（mp4 / progress.done / 封面），可能已被移动或删除。已中止 clean:")
-                for n, missing in conflicts:
+                for n, _p, missing in conflicts:
                     for m in missing:
                         print(f"    - {n}: {m}")
                 print("  核对 06_publish/receipts 与导出目录；补齐缺件后重跑即可自动通过")
                 return 1
             else:
                 print("  [冲突] 成品产物校验未通过（mp4 / progress.done / 封面三件套），已中止 clean:")
-                for n, missing in conflicts:
+                for n, _p, missing in conflicts:
                     for m in missing:
                         print(f"    - {n}: {m}")
                 print("  补齐缺件后重跑即可自动通过（无需额外登记）；确需强推加 --force")
@@ -736,6 +720,31 @@ def _parse_clean_args(args):
             opt["job"] = a
         i += 1
     return opt
+
+
+def _audit_conflicts(work, outputs, video):
+    """clean 前的成品三件套校验：返回 [(草稿名, 版本, [缺件...]), ...]。
+
+    只校验「有成品路径且未被清理」的版本；缺件由调用方决定中止还是 --force 放行留痕。
+    """
+    conflicts = []
+    for n, tprof, paths in work:
+        out = paths.get("__output__") or {}
+        state = str(out.get("state") or "").lower()
+        if not state:
+            # manifest 来源的版本也要看台账：单版本已清过的，文件本就不在
+            state = str((outputs.get(tprof) or {}).get("state") or "").lower()
+        if not state and tprof == "a":
+            state = str(video.get("export_state") or "").lower()
+        if state == "cleaned":
+            continue  # 已清版本文件本就不在，不参与校验
+        ef = paths.get("export_file") or out.get("export_file")
+        if not ef:
+            continue  # 无成品路径的版本由下面的 [错误]/[warn] 分支处理
+        res = audit_bundle(n, ef, out.get("export_dir") or "")
+        if not res["ok"]:
+            conflicts.append((n, tprof, res["missing"]))
+    return conflicts
 
 
 def main():

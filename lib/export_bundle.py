@@ -6,17 +6,22 @@
   3. `<草稿名>-封面.jpg` 存在（兼容 `_封面` / 任意含「封面」的图片名），且为竖版 9:16
 
 设计约束：
-  - 纯只读：不写、不删、不改任何文件；每次调用重新扫描磁盘，
+  - 校验纯只读：不写、不删、不改任何文件；每次调用重新扫描磁盘，
     因此用户手工补一张 `-封面.jpg` 后重新执行即可自动通过，无需额外登记。
+  - 唯一写入点是 log_forced_use：命令带 --force 显式放行时，把被放过的缺件
+    追加到 06_publish/audit_forced.log（谁/何时/放过什么/哪条命令）。
   - 不依赖 Pillow：PNG 读 IHDR、JPEG 扫 SOF 段取宽高，避免运行环境缺库导致误拦。
 """
 
 from __future__ import annotations
 
+import getpass
 import glob
 import json
 import os
+import socket
 import struct
+import sys
 import time
 
 # 竖版封面基准：1080x1920（剪映导出草稿封面尺寸），允许 2% 比例误差
@@ -25,42 +30,39 @@ COVER_RATIO_TOL = 0.02
 COVER_MIN_SHORT_SIDE = 720
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
-# 人工豁免：只存在于单个 cover_job 目录内，按 draft+profile 精确匹配
-EXEMPTION_FILE = "audit_exemption.json"
-EXEMPTION_SCOPE = "manual_exemption"
-EXEMPTION_REQUIRED = ("draft", "profile", "reason", "who", "at", "scope")
+FORCED_LOG = "06_publish/audit_forced.log"
 
 
-def _load_exemptions(job_dir):
-    """读 <cover_job>/audit_exemption.json；字段不全的条目视为无效（不放行）。"""
-    path = os.path.join(job_dir or "", EXEMPTION_FILE)
+def log_forced_use(job_dir, op, conflicts, *, dry_run=False):
+    """把「--force 放过了哪些缺件」追加到 06_publish/audit_forced.log。
+
+    op: clean | archive。conflicts: [(draft, profile, [missing...]), ...]。
+    dry-run 只打印不落盘；留痕字段固定为 谁/何时/放过什么/哪条命令。
+    """
+    if not conflicts:
+        return
+    user = (f"{os.environ.get('USERNAME') or getpass.getuser()}@"
+            f"{os.environ.get('COMPUTERNAME') or socket.gethostname()}")
+    cmd = " ".join(sys.argv)
+    path = os.path.join(job_dir, FORCED_LOG)
+    lines = []
+    for draft, profile, missing in conflicts:
+        lines.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] forced  op={op}  user={user}  "
+                     f"draft={draft}  profile={profile}  missing={' | '.join(missing)}  "
+                     f"cmd={cmd}")
+    for ln in lines:
+        print(f"  [forced] {ln}")
+    if dry_run:
+        print(f"  [forced] dry-run 不写日志（{FORCED_LOG}）")
+        return
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return []
-    items = data.get("exemptions") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return []
-    out = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        if any(not str(it.get(k) or "").strip() for k in EXEMPTION_REQUIRED):
-            continue
-        if it.get("scope") != EXEMPTION_SCOPE:
-            continue
-        out.append(it)
-    return out
-
-
-def find_exemption(job_dir, draft_name, profile):
-    """按草稿名 + 版本号精确命中豁免；不做前缀/模糊匹配，避免误放行别的版本。"""
-    for it in _load_exemptions(job_dir):
-        if str(it.get("draft")) == str(draft_name) and str(it.get("profile")) == str(profile):
-            return it
-    return None
-
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"  [forced] 已留痕: {path}")
+    except OSError as e:
+        # 留痕失败不阻断放行，但必须显式告警，不能静默
+        print(f"  [warn] 写 {FORCED_LOG} 失败（不影响本次 --force 放行）: {e}")
 
 
 def _image_size(path):
@@ -134,13 +136,11 @@ def _resolve_mp4(export_file, export_dir, draft_name):
     return export_file or None
 
 
-def audit_bundle(draft_name, export_file=None, export_dir=None,
-                 job_dir=None, profile=None):
-    """校验单版本成品三件套。
+def audit_bundle(draft_name, export_file=None, export_dir=None):
+    """校验单版本成品三件套（严格判定；缺件即失败）。
 
-    job_dir + profile 给定时，缺件若命中该剧 `audit_exemption.json` 的精确条目，
-    返回 ok=True 且 exempted=True，并保留 original_missing 供调用方留痕；
-    未给 job_dir 或未命中时保持严格判定。
+    缺件不再有任何"登记后自动放行"的旁路：clean / archive 的人工放行统一走
+    命令的 --force，并由 export_bundle.log_forced_use 写 06_publish/audit_forced.log。
 
     返回 {"ok": bool, "mp4"/"progress"/"cover": 路径|None, "missing": [str, ...]}
     missing 里每项都是可直接打印的「缺什么 + 期望路径」。
@@ -201,36 +201,5 @@ def audit_bundle(draft_name, export_file=None, export_dir=None,
                     f"封面尺寸过小: {os.path.basename(cover)} {w}x{h}"
                     f"（短边需 ≥ {COVER_MIN_SHORT_SIDE}）")
 
-    res = {"ok": not missing, "mp4": mp4, "progress": progress,
-           "cover": cover, "missing": missing}
-    if missing and job_dir:
-        ex = find_exemption(job_dir, draft_name, profile)
-        if ex:
-            res.update(ok=True, exempted=True, exemption=ex,
-                       original_missing=list(missing))
-    return res
-
-
-def log_exemption_use(job_dir, draft_name, profile, res, write=True):
-    """把「本次用了人工豁免」追加到 06_publish/audit_exemption.log（可追溯）。
-
-    dry-run 传 write=False：只打印不落盘。
-    """
-    ex = res.get("exemption") or {}
-    line = (f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] exemption used  "
-            f"draft={draft_name}  profile={profile}  who={ex.get('who')}  "
-            f"at={ex.get('at')}  reason={ex.get('reason')}  "
-            f"original={' | '.join(res.get('original_missing') or [])}")
-    print(f"  [exempt] 版本 {profile}：人工豁免（who={ex.get('who')} at={ex.get('at')}）"
-          f"原始缺件：{' | '.join(res.get('original_missing') or [])}")
-    if not write:
-        print("  [exempt] dry-run 不写日志")
-        return
-    path = os.path.join(job_dir, "06_publish", "audit_exemption.log")
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        print(f"  [exempt] 已留痕: {path}")
-    except OSError as e:
-        print(f"  [warn] 写豁免日志失败（不影响放行）: {e}")
+    return {"ok": not missing, "mp4": mp4, "progress": progress,
+            "cover": cover, "missing": missing}

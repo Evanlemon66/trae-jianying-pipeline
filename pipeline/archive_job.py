@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.join(_REPO, "pipeline"))
 
 import job_manifest as jm  # noqa: E402
 import export_config as pc  # noqa: E402
-from export_bundle import audit_bundle, log_exemption_use  # noqa: E402
+from export_bundle import audit_bundle, log_forced_use  # noqa: E402
 from no_window import NO_WINDOW  # noqa: E402
 
 LOCK_NAME = ".watcher.lock"
@@ -219,11 +219,8 @@ def _blocked_versions(job: dict) -> list[dict]:
     return sorted(out, key=lambda x: (x["profile"] != "a", x["profile"]))
 
 
-def _audit_outputs(job: dict, job_dir: str, dry_run: bool = False) -> list[tuple[str, list[str]]]:
-    """按导出侧同口径校验每个 exported 版本的成品三件套。
-
-    命中该剧 audit_exemption.json 的精确条目时放行并留痕（who/at/原始原因）。
-    """
+def _audit_outputs(job: dict, job_dir: str) -> list[tuple[str, list[str]]]:
+    """按导出侧同口径校验每个 exported 版本的成品三件套。严格判定，缺件即冲突。"""
     outputs = (job.get("video") or {}).get("outputs")
     outputs = outputs if isinstance(outputs, dict) else {}
     bad = []
@@ -232,10 +229,7 @@ def _audit_outputs(job: dict, job_dir: str, dry_run: bool = False) -> list[tuple
         if str(v.get("state") or "").lower() != "exported":
             continue
         draft = str(v.get("draft") or p)
-        res = audit_bundle(draft, v.get("export_file"), v.get("export_dir"),
-                           job_dir=job_dir, profile=p)
-        if res.get("exempted"):
-            log_exemption_use(job_dir, draft, p, res, write=not dry_run)
+        res = audit_bundle(draft, v.get("export_file"), v.get("export_dir"))
         if not res["ok"]:
             bad.append((p, res["missing"]))
     return bad
@@ -349,13 +343,19 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
             for b in blocked:
                 print(f"    - 版本 {b['profile']}：缺 {b['missing']}"
                       f"（reason={b['reason']}）")
-        # 成品缺件先展示，避免被"未满足准入"这类理由遮住（A 版只缺封面的场景）
-        conflicts = [] if force else _audit_outputs(job, job_dir, dry_run=dry_run)
+        # 成品缺件先展示，避免被"未满足准入"这类理由遮住（A 版只缺封面的场景）。
+        # --force 也先算一遍：放过了什么必须留痕，不能凭开关直接跳过校验。
+        conflicts = _audit_outputs(job, job_dir)
         if conflicts:
             print("  [conflict] 成品产物校验未通过（mp4 / progress.done / 封面三件套）:")
             for p, missing in conflicts:
                 for m in missing:
                     print(f"    - 版本 {p}: {m}")
+        if force and conflicts:
+            outs = (job.get("video") or {}).get("outputs") or {}
+            log_forced_use(job_dir, "archive",
+                           [(str((outs.get(p) or {}).get("draft") or p), p, ms)
+                            for p, ms in conflicts], dry_run=dry_run)
         if not force and not _eligible(job):
             if blocked or conflicts:
                 _log_block(job_dir, name, blocked, conflicts, dry_run=dry_run)
@@ -380,7 +380,7 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
         if os.path.exists(target):
             print(f"  [skip] 归档目标已存在: {target}")
             return 1
-        if conflicts:
+        if conflicts and not force:
             _log_block(job_dir, name, blocked, conflicts, dry_run=dry_run)
             print("  已拒绝归档；补齐缺件后重跑即可自动通过（无需额外登记）；"
                   "确需强推加 --force")
