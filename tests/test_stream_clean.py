@@ -8,6 +8,7 @@
   ④ --dry-run：零删除，清单与合计正确
   ⑤ 保护区断言：源目录 / _broken / cover_job 路径被跳过并告警
   ⑥ --intermediates-only：只清中间产物，成品与草稿都不动（成品存在/不存在两态）
+  ⑦ 三件套不全：dry-run 降级告警不中止；有回执时按台账与磁盘不一致中止
 
 运行：python tests\\test_stream_clean.py
 """
@@ -15,7 +16,9 @@ import contextlib, io, json, os, shutil, sys, tempfile
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "pipeline"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import stream_manifest as sm  # noqa: E402
+from bundle_fixture import make_bundle  # noqa: E402
 
 fails = []
 
@@ -52,13 +55,7 @@ def make_series(name, *, with_receipt=False):
     with open(os.path.join(work, "b.bin"), "wb") as f:
         f.write(b"y" * 8192)
     bundle = os.path.join(TMP, "L", name)
-    os.makedirs(bundle, exist_ok=True)
-    with open(os.path.join(bundle, f"{name}.mp4"), "wb") as f:
-        f.write(b"m" * 10240)
-    with open(os.path.join(bundle, f"{name}-封面.jpg"), "wb") as f:
-        f.write(b"c" * 1024)
-    with open(os.path.join(bundle, f"{name}.mp4.progress.json"), "w", encoding="utf-8") as f:
-        json.dump({"progress": 100}, f)
+    make_bundle(bundle, name)
     draft = os.path.join(TMP, "drafts", name)
     os.makedirs(draft, exist_ok=True)
     with open(os.path.join(draft, "draft_content.json"), "wb") as f:
@@ -122,9 +119,8 @@ print("\n== ⑤ 保护区断言 ==")
 src = os.path.join(TMP, "showF", "系列源目录")
 os.makedirs(os.path.join(src, "cover_job", "06_publish", "receipts"), exist_ok=True)
 broken = os.path.join(TMP, "_broken")
-os.makedirs(broken, exist_ok=True)
-with open(os.path.join(broken, "bad.mp4"), "wb") as f:
-    f.write(b"b" * 1024)
+# 保护区判定的前提是成品本身合法：三件套齐全，走到路径保护分支而不是先被校验拦下
+make_bundle(broken, "bad", mp4_bytes=1024)
 inside_job = os.path.join(src, "cover_job", "__jycache__")
 os.makedirs(inside_job, exist_ok=True)
 sm.record("showF", source_dir=src, workdir=src,
@@ -182,13 +178,7 @@ def make_multi(name, *, with_job=False):
     for suffix in ("", "_b"):
         dn = name + suffix
         bundle = os.path.join(TMP, "L", dn)
-        os.makedirs(bundle, exist_ok=True)
-        with open(os.path.join(bundle, f"{dn}.mp4"), "wb") as f:
-            f.write(b"m" * 10240)
-        with open(os.path.join(bundle, f"{dn}-封面.jpg"), "wb") as f:
-            f.write(b"c" * 1024)
-        with open(os.path.join(bundle, f"{dn}.mp4.progress.json"), "w", encoding="utf-8") as f:
-            json.dump({"progress": 100}, f)
+        make_bundle(bundle, dn)
         draft = os.path.join(TMP, "drafts", dn)
         os.makedirs(draft, exist_ok=True)
         sm.record(dn, source_dir=src, jycache_dir=jy, workdir=work,
@@ -285,6 +275,137 @@ check("整剧清后 export_state=cleaned", job["video"].get("export_state") == "
 check("整剧清后两版本都 cleaned",
       {v["state"] for v in job["video"]["outputs"].values()} == {"cleaned"},
       job["video"]["outputs"])
+
+def _bundle(path, name):
+    make_bundle(path, name)
+    return path
+
+
+def _seed_outputs(src, name, outputs):
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import job_manifest as jm
+    jd = os.path.join(src, "cover_job")
+    for rel in jm.JOB_DIRS:
+        os.makedirs(os.path.join(jd, *rel.split("/")), exist_ok=True)
+    with open(os.path.join(jd, "01_input", "synopsis.txt"), "w", encoding="utf-8") as f:
+        f.write("测试简介")
+    jm.save_job(jm.build_job(name), jd)
+    jm.update_job(jd, {"video": {"export_state": "exported", "outputs": outputs}},
+                  event="test_seed", detail="seed outputs")
+
+
+def make_outputs_only(name, b_with_path=True, extra_c=False):
+    """只有 A 有 manifest；B（可选 C）只存在于 job.json.video.outputs。"""
+    src = os.path.join(TMP, name, "系列源目录")
+    os.makedirs(os.path.join(src, "cover_job"), exist_ok=True)
+    jy = os.path.join(src, "__jycache__")
+    os.makedirs(jy, exist_ok=True)
+    with open(os.path.join(jy, "a.bin"), "wb") as f:
+        f.write(b"x" * 4096)
+    work = os.path.join(TMP, f"pipeline/_work_{name}_deadbeef")
+    os.makedirs(work, exist_ok=True)
+    a_bundle = _bundle(os.path.join(TMP, "L", name), name)
+    a_draft = os.path.join(TMP, "drafts", name)
+    os.makedirs(a_draft, exist_ok=True)
+    sm.record(name, source_dir=src, jycache_dir=jy, workdir=work,
+              export_file=os.path.join(a_bundle, f"{name}.mp4"), draft_dir=a_draft)
+    bname = name + "_b"
+    b_bundle = _bundle(os.path.join(TMP, "L", bname), bname)
+    b_draft = os.path.join(TMP, "drafts", bname)
+    os.makedirs(b_draft, exist_ok=True)
+    a_out = {"state": "exported", "draft": name, "export_dir": a_bundle,
+             "export_file": os.path.join(a_bundle, f"{name}.mp4")}
+    b_out = {"state": "exported", "draft": bname}
+    if b_with_path:
+        b_out.update({"export_dir": b_bundle, "export_file": os.path.join(b_bundle, f"{bname}.mp4")})
+    outputs = {"a": a_out, "b": b_out}
+    if extra_c:
+        outputs["c"] = {"state": "exported"}
+    _seed_outputs(src, name, outputs)
+    return {"src": src, "jy": jy, "work": work,
+            "bundles": {"a": a_bundle, "b": b_bundle}, "drafts": {"a": a_draft, "b": b_draft}}
+
+
+print("\n== ⑬ 只有 A 有 manifest、B 只在 outputs：整剧清必须删 B ==")
+p = make_outputs_only("outA")
+rc, out = run_clean("outA")
+job = json.load(open(os.path.join(p["src"], "cover_job", "job.json"), encoding="utf-8"))
+check("返回 0", rc == 0, rc)
+check("A 成品已删", not os.path.exists(p["bundles"]["a"]))
+check("B 成品已删（台账 outputs 兜底）", not os.path.exists(p["bundles"]["b"]), out)
+check("计划含 2 个 export_bundle", out.count("export_bundle") >= 2, out)
+check("B 标注台账来源", "job.json.video.outputs.b" in out, out)
+check("outputs.a/b 都 cleaned",
+      {job["video"]["outputs"][k]["state"] for k in ("a", "b")} == {"cleaned"},
+      job["video"]["outputs"])
+check("顶层 export_state=cleaned", job["video"].get("export_state") == "cleaned",
+      job["video"].get("export_state"))
+check("没有写入 None 版本", "None" not in job["video"]["outputs"], job["video"]["outputs"])
+
+print("\n== ⑭ B 只在 outputs 但缺 export_file：不删、不误标 cleaned ==")
+p = make_outputs_only("outB", b_with_path=False)
+rc, out = run_clean("outB")
+job = json.load(open(os.path.join(p["src"], "cover_job", "job.json"), encoding="utf-8"))
+check("返回 0", rc == 0, rc)
+check("A 成品已删", not os.path.exists(p["bundles"]["a"]))
+check("B 成品保留", os.path.exists(p["bundles"]["b"]), out)
+check("outputs.b.state 仍 exported", job["video"]["outputs"]["b"]["state"] == "exported",
+      job["video"]["outputs"])
+check("顶层 export_state 仍 exported", job["video"].get("export_state") == "exported",
+      job["video"].get("export_state"))
+
+print("\n== ⑮ a/b 都在 outputs 且 future c 无路径：逐版本回写 ==")
+p = make_outputs_only("outC", extra_c=True)
+rc, out = run_clean("outC")
+job = json.load(open(os.path.join(p["src"], "cover_job", "job.json"), encoding="utf-8"))
+check("返回 0", rc == 0, rc)
+check("A/B 成品都已删", not os.path.exists(p["bundles"]["a"])
+      and not os.path.exists(p["bundles"]["b"]), out)
+check("a/b 标 cleaned", job["video"]["outputs"]["a"]["state"] == "cleaned"
+      and job["video"]["outputs"]["b"]["state"] == "cleaned", job["video"]["outputs"])
+check("c 未被误标 cleaned", job["video"]["outputs"]["c"]["state"] == "exported",
+      job["video"]["outputs"])
+check("顶层仍 exported（c 未清）", job["video"].get("export_state") == "exported",
+      job["video"].get("export_state"))
+
+print("\n== ⑯ 真实场景：只有 A manifest + outputs a/b，无任何 B manifest ==")
+p = make_outputs_only("outD")
+mans = sorted(f for f in os.listdir(sm.MANIFEST_DIR) if f.startswith("outD"))
+check("只有 A 一条 manifest", mans == ["outD.json"], mans)
+rc, out = run_clean("outD", dry_run=True)
+check("dry-run 返回 0", rc == 0, rc)
+check("dry-run 计划含 2 个 export_bundle", out.count("[计划] export_bundle") == 2, out)
+check("计划含 jycache_dir", "[计划] jycache_dir" in out, out)
+check("计划含 workdir", "[计划] workdir" in out, out)
+check("B 由台账 outputs 纳入", "video.outputs.b 纳入清理" in out, out)
+check("dry-run 未删 A", os.path.exists(p["bundles"]["a"]))
+check("dry-run 未删 B", os.path.exists(p["bundles"]["b"]))
+rc, out = run_clean("outD")
+job = json.load(open(os.path.join(p["src"], "cover_job", "job.json"), encoding="utf-8"))
+check("真删返回 0", rc == 0, rc)
+check("A/B 成品都已删", not os.path.exists(p["bundles"]["a"])
+      and not os.path.exists(p["bundles"]["b"]), out)
+check("outputs.a/b 均 cleaned",
+      {job["video"]["outputs"][k]["state"] for k in ("a", "b")} == {"cleaned"},
+      job["video"]["outputs"])
+check("顶层 export_state=cleaned", job["video"].get("export_state") == "cleaned",
+      job["video"].get("export_state"))
+
+print("\n== ⑰ 三件套不全时的 dry-run / 严格回执语义 ==")
+p = make_series("showJ")
+os.remove(os.path.join(p["bundle"], "showJ-封面.jpg"))
+rc, out = run_clean("showJ", dry_run=True)
+check("dry-run 缺件不中止（rc=0）", rc == 0, rc)
+check("dry-run 校验降级为告警", "[告警] 成品产物校验未通过" in out, out)
+check("dry-run 计划照常输出", "[计划] export_bundle" in out, out)
+check("dry-run 成品仍在", os.path.exists(p["bundle"]))
+
+p = make_series("showK", with_receipt=True)
+os.remove(os.path.join(p["bundle"], "showK-封面.jpg"))
+rc, out = run_clean("showK", require_receipts=True)
+check("回执在但产物缺 → 中止（rc=1）", rc == 1, rc)
+check("失败分类为台账与磁盘不一致", "台账与磁盘不一致" in out, out)
+check("成品未删", os.path.exists(p["bundle"]))
 
 print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
 sys.exit(1 if fails else 0)

@@ -13,6 +13,7 @@ video.status=done 挡住已导出剧，但剧目录仍留在公共 roots；本�
   - video.export_state == "cleaned"（成品已清理，视为发布后的收尾）
 其余情况跳过；确需归档用 --force。
 拒绝条件：.watcher.lock 的 pid 仍存活；.export_state.json status=exporting；
+成品三件套校验未通过（exported 版本缺 mp4 / progress.done / 封面，或封面非竖版 9:16）；
 归档目标已存在；archive_root 等于或位于任一 watch.roots 之下（规范化真实路径比较）；
 watch.roots 未配置（fail-closed，无法校验位置时拒绝执行）；
 job_dir 不是 <剧名>/cover_job；剧集目录是盘符根；剧集目录不是 watch.roots 的直接子级。
@@ -31,9 +32,11 @@ archive_root 未传时读 pipeline/presets.json 的 watch.archive_root。
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -43,6 +46,7 @@ sys.path.insert(0, os.path.join(_REPO, "pipeline"))
 
 import job_manifest as jm  # noqa: E402
 import export_config as pc  # noqa: E402
+from export_bundle import audit_bundle, log_exemption_use  # noqa: E402
 from no_window import NO_WINDOW  # noqa: E402
 
 LOCK_NAME = ".watcher.lock"
@@ -141,16 +145,45 @@ def _eligible(job: dict) -> bool:
     return pub == "published" or exp == "cleaned"
 
 
-def _declared_profiles(job: dict) -> list[str]:
-    """job 声明的版本（workflow.preset_profile / 顶层 preset_profile）。"""
-    wf = job.get("workflow") or {}
-    try:
-        return pc.parse_preset_profiles(wf.get("preset_profile") or job.get("preset_profile"))
-    except Exception:
-        return []
+def _declared_profiles(job: dict, job_dir: str | None = None) -> list[str]:
+    """待归档版本：与 watcher 同口径（job 优先、prompts 兜底）。
+
+    1. job.json: titles.selected_groups[].group → prompts.items[].group
+       → workflow.preset_profile / preset_profile
+    2. job 没有或不完整时才回落 03_prompts/prompts.json 的 items[].group
+    """
+    def _norm(values) -> list[str]:
+        out: list[str] = []
+        for v in values or []:
+            g = str(v or "").strip().lower()
+            if g.startswith("presets_"):
+                g = g[len("presets_"):]
+            if re.fullmatch(r"[a-z][a-z0-9]{0,7}", g) and g not in out:
+                out.append(g)
+        return out
+
+    titles = job.get("titles") or {}
+    declared = _norm([(g or {}).get("group") for g in (titles.get("selected_groups") or [])])
+    if not declared:
+        declared = _norm([(it or {}).get("group")
+                          for it in ((job.get("prompts") or {}).get("items") or [])])
+    if not declared:
+        wf = job.get("workflow") or {}
+        declared = _norm(pc.parse_preset_profiles(
+            wf.get("preset_profile") or job.get("preset_profile")))
+    if job_dir and not declared:
+        # 只有 job 完全没有组声明时才回落 prompts.json（严格互斥，不取并集）
+        pp = os.path.join(job_dir, "03_prompts", "prompts.json")
+        try:
+            with open(pp, encoding="utf-8-sig") as f:
+                declared = _norm([(it or {}).get("group")
+                                  for it in (json.load(f).get("items") or [])])
+        except (OSError, ValueError):
+            declared = []
+    return sorted(declared, key=lambda g: (g != "a", g))
 
 
-def _pending_outputs(job: dict) -> list[str]:
+def _pending_outputs(job: dict, job_dir: str | None = None) -> list[str]:
     """所有声明版本里仍未导出的（缺 outputs 条目 / state 不是 exported|cleaned）。
 
     归档会把整剧目录搬出 watch.roots，watcher 再也补不了未导出的版本；
@@ -158,7 +191,7 @@ def _pending_outputs(job: dict) -> list[str]:
     """
     outputs = (job.get("video") or {}).get("outputs")
     outputs = outputs if isinstance(outputs, dict) else {}
-    declared = _declared_profiles(job)
+    declared = _declared_profiles(job, job_dir)
     names = list(dict.fromkeys(declared + list(outputs)))
     pending = []
     for p in names:
@@ -167,6 +200,67 @@ def _pending_outputs(job: dict) -> list[str]:
         if st not in ("exported", "cleaned"):
             pending.append(f"{p}({st or '未导出'})")
     return pending
+
+
+def _blocked_versions(job: dict) -> list[dict]:
+    """blocked 版本单列（仍计为 pending 挡归档，但不再糊成"未完成"）。"""
+    outputs = (job.get("video") or {}).get("outputs")
+    outputs = outputs if isinstance(outputs, dict) else {}
+    out = []
+    for p, v in outputs.items():
+        v = v or {}
+        if str(v.get("state") or "").lower() != "blocked":
+            continue
+        out.append({
+            "profile": p,
+            "missing": str(v.get("missing") or f"presets_{p}"),
+            "reason": str(v.get("reason") or "missing_presets"),
+        })
+    return sorted(out, key=lambda x: (x["profile"] != "a", x["profile"]))
+
+
+def _audit_outputs(job: dict, job_dir: str, dry_run: bool = False) -> list[tuple[str, list[str]]]:
+    """按导出侧同口径校验每个 exported 版本的成品三件套。
+
+    命中该剧 audit_exemption.json 的精确条目时放行并留痕（who/at/原始原因）。
+    """
+    outputs = (job.get("video") or {}).get("outputs")
+    outputs = outputs if isinstance(outputs, dict) else {}
+    bad = []
+    for p, v in outputs.items():
+        v = v or {}
+        if str(v.get("state") or "").lower() != "exported":
+            continue
+        draft = str(v.get("draft") or p)
+        res = audit_bundle(draft, v.get("export_file"), v.get("export_dir"),
+                           job_dir=job_dir, profile=p)
+        if res.get("exempted"):
+            log_exemption_use(job_dir, draft, p, res, write=not dry_run)
+        if not res["ok"]:
+            bad.append((p, res["missing"]))
+    return bad
+
+
+def _log_block(job_dir: str, name: str, blocked: list[dict],
+               conflicts: list[tuple[str, list[str]]], dry_run: bool = False) -> None:
+    """清单落一份日志：06_publish/archive_blocked.log（追加，不覆盖历史）。"""
+    lines = [f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] archive blocked: {name}"]
+    for b in blocked:
+        lines.append(f"  blocked  version={b['profile']}  missing={b['missing']}  reason={b['reason']}")
+    for p, missing in conflicts:
+        for m in missing:
+            lines.append(f"  conflict version={p}  missing={m}")
+    path = os.path.join(job_dir, "06_publish", "archive_blocked.log")
+    if dry_run:
+        print(f"  [日志] dry-run 不写盘（预计追加 {len(lines) - 1} 行 → {path}）")
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"  [日志] {path}")
+    except OSError as e:
+        print(f"  [warn] 写 blocked 日志失败: {e}")
 
 
 def _rewrite_manifests(manifest_dir: str, old_dir: str, new_dir: str,
@@ -248,12 +342,28 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
             return 1
         print("  [resume] 已是 archived，源目录仍在且目标不存在，继续移动")
     else:
+        blocked = _blocked_versions(job)
+        if blocked:
+            print("  [blocked] 以下版本单列（仍挡归档）:")
+            for b in blocked:
+                print(f"    - 版本 {b['profile']}：缺 {b['missing']}"
+                      f"（reason={b['reason']}）")
+        # 成品缺件先展示，避免被"未满足准入"这类理由遮住（A 版只缺封面的场景）
+        conflicts = [] if force else _audit_outputs(job, job_dir, dry_run=dry_run)
+        if conflicts:
+            print("  [conflict] 成品产物校验未通过（mp4 / progress.done / 封面三件套）:")
+            for p, missing in conflicts:
+                for m in missing:
+                    print(f"    - 版本 {p}: {m}")
         if not force and not _eligible(job):
+            if blocked or conflicts:
+                _log_block(job_dir, name, blocked, conflicts, dry_run=dry_run)
             print("  [skip] 未满足准入（publish.status!=published 且 video.export_state!=cleaned）；"
                   "确需归档请加 --force")
             return 1
-        pending = _pending_outputs(job)
+        pending = _pending_outputs(job, job_dir)
         if not force and pending:
+            _log_block(job_dir, name, blocked, conflicts, dry_run=dry_run)
             print("  [skip] 仍有声明版本未完成导出: " + "、".join(pending)
                   + "；归档后 watcher 无法再补，先补齐或加 --force")
             return 1
@@ -268,6 +378,11 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
             return 1
         if os.path.exists(target):
             print(f"  [skip] 归档目标已存在: {target}")
+            return 1
+        if conflicts:
+            _log_block(job_dir, name, blocked, conflicts, dry_run=dry_run)
+            print("  已拒绝归档；补齐缺件后重跑即可自动通过（无需额外登记）；"
+                  "确需强推加 --force")
             return 1
 
     print(f"  剧集目录: {series_dir}")
@@ -288,6 +403,20 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
             print(f"  [FAIL] 置 stage=archived 失败: {e}")
             return 2
     os.makedirs(archive_root, exist_ok=True)
+    # 归档 = 产物连同出身一起搬走：搬之前把各版本的新鲜度判定固化成快照，
+    # 不阻断、不判定（legacy/unknown/stale 都原样记录），供归档后追溯。
+    try:
+        import freshness
+        snap = freshness.archive_snapshot(job_dir, write=True)
+        if snap:
+            brief = ", ".join(f"{k}={v.get('state')}"
+                              for k, v in (snap.get("versions") or {}).items())
+            print(f"  新鲜度快照: 06_publish/freshness_archive_snapshot.json ({brief})")
+            miss = snap.get("evidence_missing") or []
+            if miss:
+                print(f"  [warn] evidence_missing（已登记导出但缺 sidecar）: {', '.join(miss)}")
+    except Exception as e:
+        print(f"  [warn] 新鲜度快照写入失败（不影响归档）: {e}")
     try:
         shutil.move(series_dir, target)
     except OSError as e:
@@ -307,7 +436,8 @@ def main(argv=None) -> int:
     ap.add_argument("--manifest-dir", default=os.path.join(_REPO, "pipeline", "_stream_manifests"),
                     help="串流产物清单位置（默认 pipeline/_stream_manifests）")
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不写盘、不移动")
-    ap.add_argument("--force", action="store_true", help="跳过发布/清理准入校验")
+    ap.add_argument("--force", action="store_true",
+                    help="跳过发布/清理准入与成品三件套校验（路径断言不可跳过）")
     args = ap.parse_args(argv)
 
     root = args.archive_root or (pc.get_watch_config() or {}).get("archive_root")

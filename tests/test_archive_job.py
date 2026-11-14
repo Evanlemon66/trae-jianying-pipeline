@@ -32,9 +32,11 @@ from unittest import mock
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "lib"))
 sys.path.insert(0, os.path.join(_ROOT, "pipeline"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import job_manifest as jm  # noqa: E402
 import archive_job as aj  # noqa: E402
 import cover_watch as cw  # noqa: E402
+from bundle_fixture import make_bundle  # noqa: E402
 
 fails = []
 
@@ -92,6 +94,11 @@ def make_job_at(series, leaf, name, stage="video_ready", export_state="cleaned")
 
 def read_job(jd):
     return jm.load_job(os.path.join(jd, "job.json"))
+
+
+def seed_bundle(dir_path, name):
+    """造一套合法成品（mp4 + progress.done + 竖版封面），返回 mp4 路径。"""
+    return make_bundle(dir_path, name)["mp4"]
 
 
 def write_manifest(name, series):
@@ -297,9 +304,17 @@ check("--force 可绕过未完成检查", rc == 0, rc)
 check("--force 后已移动", os.path.isdir(os.path.join(ARCH, "multiver", "cover_job")))
 
 series2, jd2 = make_job("multiver2", publish_status="published")
+# 归档现在按导出侧口径校验每个 exported 版本的三件套，台账要能指到真实成品
+out_a_dir = os.path.join(TMP, "exports", "multiver2_a")
+out_b_dir = os.path.join(TMP, "exports", "multiver2_b")
+out_a = seed_bundle(out_a_dir, "multiver2_a")
+out_b = seed_bundle(out_b_dir, "multiver2_b")
 jm.update_job(jd2, {"workflow": {"preset_profile": "a,b"},
-                    "video": {"outputs": {"a": {"state": "exported"},
-                                          "b": {"state": "exported"}}}},
+                    "video": {"outputs": {
+                        "a": {"state": "exported", "draft": "multiver2_a",
+                              "export_dir": out_a_dir, "export_file": out_a},
+                        "b": {"state": "exported", "draft": "multiver2_b",
+                              "export_dir": out_b_dir, "export_file": out_b}}}},
               event="test_seed", detail="seed 多版本已完成")
 rc = run(jd2)
 check("声明版本全部完成 → 正常归档", rc == 0, rc)

@@ -20,6 +20,7 @@
   只清某一个版本必须显式 `--profile <p>`：此时只删该版本的成品目录，
   __jycache__ / _work_* / C 盘草稿等共享产物一律保留，并提示仍被多少个版本引用。
   --require-receipts 严格模式：必须有成功回执（06_publish/receipts 或 platform json 标 published+url/id），否则整剧跳过。
+  --force 跳过成品三件套校验（默认缺 mp4 / progress.done / 封面任一即中止 clean）。
   --intermediates-only 只清 ① __jycache__ ② _work_*，成品目录与草稿一律不动（不受 include_drafts 影响）；
   该模式只对整部剧生效，不能与 --profile 同用。
   --dry-run 只打印计划与大小，不做任何删除、不改 manifest。
@@ -35,6 +36,11 @@ import json, os, sys, time, shutil
 sys.stdout.reconfigure(encoding="utf-8")
 
 MANIFEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_stream_manifests")
+
+_LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+from export_bundle import audit_bundle, log_exemption_use  # noqa: E402  # 成品三件套校验（与导出侧同口径）
 
 
 def _manifest_path(draft_name):
@@ -355,12 +361,38 @@ def _plan(paths, draft_name, include_drafts, intermediates_only=False,
     return items
 
 
-def _mark_export_cleaned(source_dir, deleted, profile=None):
+def _output_plan_items(out):
+    """job.json.video.outputs 单条 → 成品删除计划项（与 _plan 的成品部分同构）。"""
+    items = []
+    ef = str(out.get("export_file") or "")
+    draft = str(out.get("draft") or "")
+    bundle = str(out.get("export_dir") or "")
+    if not bundle and ef:
+        parent = os.path.dirname(os.path.abspath(ef))
+        if draft and os.path.basename(parent) == draft:
+            bundle = parent
+    # 只认「目录名 == 草稿名」的成品包，避免把上级目录当成品删
+    if bundle and draft and os.path.basename(os.path.abspath(bundle)) == draft:
+        return [("export_bundle", "export_bundle", os.path.abspath(bundle))]
+    if ef:
+        stem = os.path.splitext(os.path.abspath(ef))[0]
+        items.append(("export_file", "export_file", os.path.abspath(ef)))
+        items.append((f"{os.path.basename(stem)}.progress.json", "export_file",
+                      stem + ".mp4.progress.json"))
+        items.append((f"{os.path.basename(stem)}-封面.jpg", "export_file",
+                      stem + "-封面.jpg"))
+    return items
+
+
+def _mark_export_cleaned(source_dir, deleted, profile=None, profiles=None):
     """成品目录真正删除后回写 job.json（失败只告警）。
 
-    profile=None（整剧清）：video.export_state=cleaned，且所有 outputs 版本置 cleaned。
     profile=<p>（单版本清）：只置 outputs[p].state=cleaned；所有声明版本都清完才
     把顶层 export_state 置 cleaned，否则保持 exported（其余版本仍占盘）。
+    profiles=<set>（整剧清）：只把本次**确实删掉成品**的版本置 cleaned；若仍有
+    声明的版本没删（缺路径证据/删除失败），顶层 export_state 保持 exported，
+    避免"一处 cleaned 把所有版本都标 cleaned"。
+    profile/profiles 都为 None（旧调用）：沿用旧语义，全部置 cleaned。
     """
     if not source_dir:
         print("  [warn] 记录无 source_dir，未回写 job.json")
@@ -374,6 +406,8 @@ def _mark_export_cleaned(source_dir, deleted, profile=None):
              + f"（释放 {_fmt(total)}）"
     if profile:
         detail += f"（单版本 profile={profile}）"
+    elif profiles is not None:
+        detail += f"（版本 {','.join(sorted(profiles)) or '-'}）"
     try:
         lib = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")
         if lib not in sys.path:
@@ -389,13 +423,25 @@ def _mark_export_cleaned(source_dir, deleted, profile=None):
             patch_video["outputs"] = outputs
             if outputs and all((v or {}).get("state") == "cleaned" for v in outputs.values()):
                 patch_video["export_state"] = "cleaned"
+        elif profiles is not None:
+            if not profiles:
+                print("  [warn] 没有任何版本的成品被删，未回写 job.json")
+                return
+            for k in profiles:
+                entry = dict(outputs.get(k) or {})
+                entry["state"] = "cleaned"
+                outputs[k] = entry
+            patch_video["outputs"] = outputs
+            if outputs and all((v or {}).get("state") == "cleaned" for v in outputs.values()):
+                patch_video["export_state"] = "cleaned"
         else:
             for k, v in outputs.items():
                 outputs[k] = dict(v or {}, state="cleaned")
             patch_video = {"export_state": "cleaned", "outputs": outputs}
         job = jm.update_job(job_dir, {"video": patch_video},
                             event="export_cleaned", detail=detail)
-        scope = f"profile={profile}" if profile else "整剧"
+        scope = f"profile={profile}" if profile else (
+            f"版本 {','.join(sorted(profiles))}" if profiles is not None else "整剧")
         print(f"  [回写] job.json export_cleaned（{scope}）revision={job['revision']}")
     except (ValueError, OSError, ImportError) as e:
         print(f"  [warn] 回写 job.json 失败（不影响已完成的删除）: {e}")
@@ -421,14 +467,21 @@ def _norm_profile(value):
 
 
 def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=False,
-          intermediates_only=False, profile=None):
+          intermediates_only=False, profile=None, force=False):
     """清理一部剧的串流残留。默认信任"已发布"，不删草稿（除非 include_drafts）。
 
     默认（profile=None）：清整部剧**所有版本**（基础版 + 各 `_<版本>` 克隆版）。
     profile=<p>：只清该版本的成品目录；__jycache__ / _work_* / C 盘草稿等共享
     产物一律保留，并提示仍被多少个版本引用。与 intermediates_only 互斥。
 
-    返回 0=已执行或计划完成；1=记录不存在/被严格模式跳过/参数冲突；2=路径错误。
+    成品校验：删除前按导出侧同口径校验每个版本的 mp4 / progress.done /
+    封面三件套；缺任何一件默认中止整次 clean（--force 才放行）。
+    校验是实时扫描磁盘的，手工补齐 `-封面.jpg` 后重跑即可自动通过。
+    --dry-run 只输出计划：校验缺件降级为告警，不返回 1。
+    --require-receipts 通过后仍校验；此时缺件按「台账与磁盘不一致」报告
+    （回执证明已发布，本地产物却不全）。
+
+    返回 0=已执行或计划完成；1=记录不存在/被严格模式跳过/参数冲突/产物缺件；2=路径错误。
     """
     manifests = _all_manifests()
     if draft_name not in manifests:
@@ -455,11 +508,13 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
         print(f"清理 [{title}]（只清版本 profile={profile}）:")
     else:
         print(f"清理 [{title}]（整部剧，共 {len(targets)} 个版本）:")
+    receipts_ok = False
     if require_receipts:
         ok, why = receipts_status(source_dir)
         if not ok:
             print(f"  [跳过] 严格模式未通过：{why}")
             return 1
+        receipts_ok = True
         print(f"  [通过] 回执校验：{why}")
     if intermediates_only:
         print("  [模式] intermediates-only：只清 __jycache__ / _work_*，成品与草稿一律不动")
@@ -471,6 +526,10 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
     total = 0
     ready = []
     seen = set()
+    profile_marks = []
+    outputs = dict(video.get("outputs") or {})
+    covered = {version_profile(n, group) for n in targets}
+    work = []
     for n in targets:
         paths = dict((manifests[n][1].get("paths") or {}))
         # 兜底：旧 manifest 可能缺 export_file（record 时未写），整剧清时用 job.json
@@ -490,8 +549,69 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
                 return 2
             print(f"  [warn] {pref}找不到成品路径（manifest 与 job.json 均无 export_file），"
                   "本次只清中间产物；若成品已导出请先补写记录")
-        for label, kind, p in _plan(paths, n, include_drafts, intermediates_only,
-                                    only_export=bool(profile)):
+        work.append((n, version_profile(n, group), paths))
+    # 台账合并：manifest 只记录了 A 版的剧，B/C 版的成品只存在于
+    # job.json.video.outputs —— 这些版本也要纳入删除计划，否则会漏删。
+    if not profile and not intermediates_only:
+        for p, out in outputs.items():
+            out = dict(out or {})
+            if p in covered or not out.get("export_file"):
+                continue
+            name = str(out.get("draft") or p)
+            work.append((name, p, {"__output__": out}))
+            print(f"  [台账] {name}: manifest 无记录，按 job.json.video.outputs.{p} 纳入清理")
+    # 产物校验（与导出口径一致）：mp4 / progress.done / 封面三件套缺一即中止，
+    # --force 才放行；实时扫盘，手工补封面后重跑自动通过。
+    if not intermediates_only and not force:
+        conflicts = []
+        job_dir = os.path.join(source_dir, "cover_job")
+        for n, tprof, paths in work:
+            out = paths.get("__output__") or {}
+            state = str(out.get("state") or "").lower()
+            if not state:
+                # manifest 来源的版本也要看台账：单版本已清过的，文件本就不在
+                state = str((outputs.get(tprof) or {}).get("state") or "").lower()
+            if not state and tprof == "a":
+                state = str(video.get("export_state") or "").lower()
+            if state == "cleaned":
+                continue  # 已清版本文件本就不在，不参与校验
+            ef = paths.get("export_file") or out.get("export_file")
+            if not ef:
+                continue  # 无成品路径的版本由下面的 [错误]/[warn] 分支处理
+            res = audit_bundle(n, ef, out.get("export_dir") or "",
+                               job_dir=job_dir, profile=tprof)
+            if res.get("exempted"):
+                log_exemption_use(job_dir, n, tprof, res, write=not dry_run)
+            if not res["ok"]:
+                conflicts.append((n, res["missing"]))
+        if conflicts:
+            if dry_run:
+                print("  [告警] 成品产物校验未通过（dry-run 仅提示，计划照常输出）：")
+                for n, missing in conflicts:
+                    for m in missing:
+                        print(f"    - {n}: {m}")
+            elif receipts_ok:
+                print("  [冲突] 台账与磁盘不一致：回执证明已发布，但本地成品三件套不全"
+                      "（mp4 / progress.done / 封面），可能已被移动或删除。已中止 clean:")
+                for n, missing in conflicts:
+                    for m in missing:
+                        print(f"    - {n}: {m}")
+                print("  核对 06_publish/receipts 与导出目录；补齐缺件后重跑即可自动通过")
+                return 1
+            else:
+                print("  [冲突] 成品产物校验未通过（mp4 / progress.done / 封面三件套），已中止 clean:")
+                for n, missing in conflicts:
+                    for m in missing:
+                        print(f"    - {n}: {m}")
+                print("  补齐缺件后重跑即可自动通过（无需额外登记）；确需强推加 --force")
+                return 1
+    for n, tprof, paths in work:
+        if "__output__" in paths:
+            items = _output_plan_items(paths["__output__"])
+        else:
+            items = _plan(paths, n, include_drafts, intermediates_only,
+                          only_export=bool(profile))
+        for label, kind, p in items:
             rp = os.path.normcase(os.path.realpath(p))
             if rp in seen:
                 continue  # 多版本共享的同一路径只处理/计数一次
@@ -506,12 +626,32 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
             size = _entry_size(kind, p)
             total += size
             ready.append((n, label, kind, p, size))
+            if kind == "export_bundle" or (kind == "export_file" and label == "export_file"):
+                profile_marks.append((tprof, p))
             print(f"  [{'计划' if dry_run else '待删'}] {label}: {p} ({_fmt(size)})")
     print(f"  合计: {_fmt(total)}")
     if dry_run:
         print("  （dry-run：未执行任何删除，记录未改动）")
     else:
         print("  （非 dry-run：即将实际删除，可先用 --dry-run 复核）")
+        # 删成品前先写墓碑（不判定、不阻断）：成品 hash / 草稿 hash / 删除原因一并留档，
+        # 之后 sidecar 会随成品目录一起被删，墓碑是唯一能追溯「删掉的是哪一版」的证据。
+        tombs = []
+        if not intermediates_only and source_dir:
+            try:
+                import freshness
+                _jd = os.path.join(source_dir, "cover_job")
+                _done = set()
+                for tprof, p in profile_marks:
+                    v = tprof or "a"
+                    if v in _done:
+                        continue
+                    _done.add(v)
+                    tp = freshness.write_tombstone(_jd, v)
+                    if tp:
+                        tombs.append((tp, v, p))
+            except Exception as e:
+                print(f"  [warn] 墓碑写入失败（不影响清理）: {e}")
         cleaned = []
         for n, label, kind, p, size in ready:
             if os.path.isdir(p):
@@ -529,7 +669,20 @@ def clean(draft_name, dry_run=False, include_drafts=False, require_receipts=Fals
             else:
                 print(f"  [失败] {label}: {p}")
         if cleaned:
-            _mark_export_cleaned(source_dir, cleaned, profile=profile or None)
+            if profile:
+                _mark_export_cleaned(source_dir, cleaned, profile=profile)
+            else:
+                # 只回写"确实被删掉成品"的版本，逐版本各写各的
+                marks = {prof for prof, p in profile_marks if not os.path.exists(p)}
+                _mark_export_cleaned(source_dir, cleaned, profiles=marks)
+        if tombs:
+            try:
+                import freshness
+                for tp, _v, p in tombs:
+                    freshness.update_tombstone(
+                        tp, "deleted" if not os.path.exists(p) else "failed")
+            except Exception as e:
+                print(f"  [warn] 墓碑状态回写失败: {e}")
     # source_dir 只提示，永不清理；manifest 记录本身也永不删除
     if source_dir:
         print(f"  （源视频目录保留不动: {source_dir}）")
@@ -555,7 +708,7 @@ def _parse_clean_args(args):
     --intermediates-only/--profile。"""
     opt = {"job": None, "all": False, "dry_run": False,
            "require_receipts": False, "include_drafts": False,
-           "intermediates_only": False, "profile": None}
+           "intermediates_only": False, "profile": None, "force": False}
     i = 0
     while i < len(args):
         a = args[i]
@@ -569,6 +722,8 @@ def _parse_clean_args(args):
             opt["include_drafts"] = True
         elif a == "--intermediates-only":
             opt["intermediates_only"] = True
+        elif a == "--force":
+            opt["force"] = True
         elif a == "--profile" and i + 1 < len(args):
             i += 1
             opt["profile"] = args[i]
@@ -610,17 +765,20 @@ def main():
                        include_drafts=opt["include_drafts"],
                        require_receipts=opt["require_receipts"],
                        intermediates_only=opt["intermediates_only"],
-                       profile=opt["profile"])
+                       profile=opt["profile"], force=opt["force"])
             if rc != 0:
                 skipped.append(n)
             print()
         if skipped:
-            print("跳过（严格模式/无记录）:")
+            print("跳过（严格模式/无记录/产物缺件）:")
             for n in skipped:
                 print(f"  - {n}")
+            return 1
+        return 0
     else:
         print(__doc__)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

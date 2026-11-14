@@ -3,6 +3,7 @@
 运行：python tests\\test_export_retry.py（无第三方依赖）
 """
 import inspect, os, shutil, sys, tempfile, time
+from unittest import mock
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "lib"))
@@ -61,8 +62,12 @@ check("进度心跳无文件时为 0",
 
 cw.find_stream_draft = lambda _name: "测试剧串流"  # 不依赖本机真实草稿库
 job = {"workflow": {"mode": "full", "cut_s": None, "derive": []}, "video": {}}
-plan_on = cw.build_plan(JD, job, {"cold_start": True}, pending_edit=0)
-plan_off = cw.build_plan(JD, job, {"cold_start": False}, pending_edit=0)
+# 纯计划推导：write_log=False 关闭版本台账落盘（否则会要求真实 job.json）；
+# 导出路径改指临时目录，避免读到本机真实成品目录影响台账冲突判定。
+with mock.patch.object(cw.pc, "export_mp4_path", return_value=os.path.join(TMP, "x.mp4")), \
+        mock.patch.object(cw.pc, "get_export_dir", return_value=TMP):
+    plan_on = cw.build_plan(JD, job, {"cold_start": True}, pending_edit=0, write_log=False)
+    plan_off = cw.build_plan(JD, job, {"cold_start": False}, pending_edit=0, write_log=False)
 check("cold_start=true 时导出命令带 --cold-start",
       plan_on["action"] == "export" and "--cold-start" in plan_on["cmd"])
 check("cold_start=false 时导出命令不带 --cold-start",

@@ -74,10 +74,19 @@ def _slug(name: str) -> str:
 
 
 def _find_draft(series_name: str, since: float = 0) -> str | None:
-    """定位串流草稿：名称匹配「系列名*串流」，取 mtime 最新；since=0 表示不限时间"""
+    """定位串流草稿：精确匹配「系列名_第NN[-NN]集串流」，取 mtime 最新；since=0 不限时间。
+
+    不用 `系列名*串流` 前缀 glob：剧名互为前缀时会串剧，`_b` 克隆也可能被算进来。
+    """
+    pattern = re.compile(rf"{re.escape(series_name)}_第\d+(?:-\d+)?集串流")
+    try:
+        names = os.listdir(JY_DRAFT_ROOT)
+    except OSError:
+        return None
     cands = [
-        d for d in glob.glob(os.path.join(JY_DRAFT_ROOT, f"{series_name}*串流"))
-        if os.path.isdir(d) and os.path.getmtime(d) >= since
+        os.path.join(JY_DRAFT_ROOT, n) for n in names
+        if pattern.fullmatch(n) and os.path.isdir(os.path.join(JY_DRAFT_ROOT, n))
+        and os.path.getmtime(os.path.join(JY_DRAFT_ROOT, n)) >= since
     ]
     if not cands:
         return None
@@ -247,13 +256,29 @@ def _export_console_path(job_dir: str | None) -> str:
     return os.path.join(base, "export_console.log")
 
 
+def _close_jianying_after_batch(reason: str = "队列导出结束") -> None:
+    """批内复用收尾：统一走 jianying_proc 的 WM_CLOSE（异常路径由 finally 保证调用）。"""
+    try:
+        import jianying_proc as jp
+    except Exception:
+        return
+    if not jp.running():
+        return
+    print(f"🛑 {reason}：WM_CLOSE 关闭复用的剪映实例")
+    if not jp.stop_jianying(grace_s=20.0, force=False,
+                            log_fn=lambda m: print(f"  {m}")):
+        print("  ⚠️ 剪映未在时限内正常退出（不影响已完成成品）")
+
+
 def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = False,
-                job_dir: str | None = None) -> bool:
+                job_dir: str | None = None, keep_open: bool = False) -> bool:
     """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。
 
     timeout 按「无进展」计：进度 json 每 30s 刷新一次，超过 timeout 秒没有任何刷新
     才判定卡死并杀进程（导出慢但一直在写盘不会被误杀）。
     cold_start: 导出前冷启动剪映（每部剧一次，规避上一部刚导完时的 UI 假死）。
+    keep_open: 批内复用——导出后把实例留在首页，交给下一份接着用；
+    队列结束时由调用方统一 WM_CLOSE 关闭。单份导出保持 False（用完就关）。
     job_dir: 显式 cover_job；为空时按草稿名解析。缺字幕清单非空时直接拦截，
     不建目录、不清理残留、不启动导出子进程。
     """
@@ -274,6 +299,8 @@ def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = Fa
            "--fallback-dir", get_export_dir()]
     if cold_start:
         cmd.append("--cold-start")
+    if keep_open:
+        cmd.append("--keep-open")
 
     # 子进程输出落盘：pythonw 链路下没有控制台，dprint 原本全部丢失（13:25、13:59
     # 两次冷启动失败零证据）。这里直接重定向 OS 句柄，并记录启动/pid/退出码。
@@ -281,7 +308,8 @@ def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = Fa
     print(f"  📝 导出子进程日志: {log_path}")
     with open(log_path, "a", encoding="utf-8", errors="replace") as logf:
         logf.write(f"\n===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动导出子进程 "
-                   f"draft={draft_name} cold_start={int(cold_start)} =====\n")
+                   f"draft={draft_name} cold_start={int(cold_start)} "
+                   f"keep_open={int(keep_open)} =====\n")
         logf.write("cmd: " + " ".join(cmd) + "\n")
         logf.write(f"out: {out_mp4}\n")
         logf.flush()
@@ -310,6 +338,10 @@ def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = Fa
 
     if proc.returncode == 0:
         _consolidate_bundle(draft_name, out_mp4)
+        # 复用前提：上一份确实导出完成（子进程 rc=0 且成品已落盘）才切下一份。
+        if not os.path.isfile(out_mp4):
+            print(f"  ⚠️ 导出子进程成功但成品未落盘: {out_mp4}")
+            return False
     else:
         # 失败也要清掉本轮重试产生的「剧名(1)/(2)…」，保证目录只剩一个
         _preclean_bundles(draft_name, out_dir, keep_target=True)
@@ -363,97 +395,113 @@ def main() -> int:
     state = _load_state()
     failed = []
 
-    for i, target in enumerate(targets):
-        # 输入本身是磁盘上的真实目录时视为剧集目录，而非草稿名
-        # （os.path.join 遇到绝对路径会丢弃 JY_DRAFT_ROOT，需先排除）
-        is_draft = not os.path.isdir(target) and os.path.isdir(os.path.join(JY_DRAFT_ROOT, target))
-        name = os.path.basename(target)
-        st = _state_of(state, target)
+    # 批内复用：只有「导出阶段连续跑」的入口才复用一个剪映实例。
+    # full 模式逐部"生成→导出"，生成阶段必须先关剪映（防内存旧副本回写草稿），
+    # 复用跨不过去；输入全是现成草稿时没有生成阶段，可以整段复用。
+    as_draft = {t: (not os.path.isdir(t)
+                    and os.path.isdir(os.path.join(JY_DRAFT_ROOT, t)))
+                for t in targets}
+    reuse = (args.mode == "export"
+             or (args.mode == "full" and bool(targets) and all(as_draft.values())))
+    try:
+        for i, target in enumerate(targets):
+            # 输入本身是磁盘上的真实目录时视为剧集目录，而非草稿名
+            # （os.path.join 遇到绝对路径会丢弃 JY_DRAFT_ROOT，需先排除）
+            is_draft = as_draft[target]
+            name = os.path.basename(target)
+            st = _state_of(state, target)
 
-        if st.get("status") == "done":
-            print(f"⏭️  跳过已完成: {name}")
-            continue
-
-        # ---- 生成阶段（full/generate，且输入不是现成草稿名时）----
-        if args.mode in ("full", "generate") and not is_draft:
-            if not os.path.isdir(target):
-                print(f"✗ 目录不存在: {target}")
-                st["status"] = "failed"
-                failed.append(name)
+            if st.get("status") == "done":
+                print(f"⏭️  跳过已完成: {name}")
                 continue
-            draft = st.get("draft")
-            if st.get("status") not in ("pipelined", "export_failed") or not draft:
-                print(f"\n{'='*60}\n🎬 [{i+1}/{len(targets)}] 串流生成: {name}\n{'='*60}")
-                toast("🎬 开始生成草稿", f"{name}（{i+1}/{len(targets)}）")
-                started = time.time()
-                st.update({"status": "pipelining", "started": started})
-                _save_state(state)
-                ok = _run_pipeline(target, _slug(name), overrides_of.get(target))
-                draft = _find_draft(name, started) if ok else None
-                if not draft:
-                    st["status"] = "pipeline_failed"
-                    _save_state(state)
-                    toast("🎬 草稿生成失败", name)
+
+            # ---- 生成阶段（full/generate，且输入不是现成草稿名时）----
+            if args.mode in ("full", "generate") and not is_draft:
+                if not os.path.isdir(target):
+                    print(f"✗ 目录不存在: {target}")
+                    st["status"] = "failed"
                     failed.append(name)
                     continue
-                st.update({"status": "pipelined", "draft": draft})
+                draft = st.get("draft")
+                if st.get("status") not in ("pipelined", "export_failed") or not draft:
+                    print(f"\n{'='*60}\n🎬 [{i+1}/{len(targets)}] 串流生成: {name}\n{'='*60}")
+                    toast("🎬 开始生成草稿", f"{name}（{i+1}/{len(targets)}）")
+                    started = time.time()
+                    st.update({"status": "pipelining", "started": started})
+                    _save_state(state)
+                    ok = _run_pipeline(target, _slug(name), overrides_of.get(target))
+                    draft = _find_draft(name, started) if ok else None
+                    if not draft:
+                        st["status"] = "pipeline_failed"
+                        _save_state(state)
+                        toast("🎬 草稿生成失败", name)
+                        failed.append(name)
+                        continue
+                    st.update({"status": "pipelined", "draft": draft})
+                    _save_state(state)
+                if args.mode == "generate":
+                    print(f"✅ 草稿就绪（不导出）: {st['draft']}")
+                    continue  # generate 模式零等待直接进入下一部
+                time.sleep(args.stage_gap)  # full：生成→导出衔接缓冲
+            elif args.mode in ("full", "generate") and is_draft:
+                st.setdefault("draft", name)
+                st["status"] = "pipelined"
                 _save_state(state)
-            if args.mode == "generate":
-                print(f"✅ 草稿就绪（不导出）: {st['draft']}")
-                continue  # generate 模式零等待直接进入下一部
-            time.sleep(args.stage_gap)  # full：生成→导出衔接缓冲
-        elif args.mode in ("full", "generate") and is_draft:
-            st.setdefault("draft", name)
-            st["status"] = "pipelined"
-            _save_state(state)
-            if args.mode == "generate":
-                print(f"⏭️  已是现成草稿: {name}")
-                continue
+                if args.mode == "generate":
+                    print(f"⏭️  已是现成草稿: {name}")
+                    continue
 
-        # ---- 导出阶段（full/export）----
-        draft = st.get("draft") or (name if is_draft else _find_draft(name))
-        if not draft:
-            print(f"✗ 找不到对应串流草稿: {name}")
-            st["status"] = "export_failed"
-            _save_state(state)
-            failed.append(name)
-            continue
-        st["draft"] = draft
-        if _output_exists(draft):
-            print(f"⏭️  成品已存在，跳过导出: {draft}")
-            st["status"] = "done"
-            _save_state(state)
-            continue
-        print(f"\n📤 [{i+1}/{len(targets)}] 导出: {draft}")
-        job_dir = _job_dir_for(target, is_draft)
-        if job_dir:
-            try:
-                jm.require_export_allowed(job_dir)
-            except jm.ExportBlocked as e:
-                # 缺字幕未修复：该剧整轮跳过导出，只收尾通知一条，不进入失败重试计数
-                print(f"⛔ {name} {e}")
-                print("   请重剪这些集，确认字幕非空后重跑；未修复前不会导出。")
-                st["status"] = "blocked"
+            # ---- 导出阶段（full/export）----
+            draft = st.get("draft") or (name if is_draft else _find_draft(name))
+            if not draft:
+                print(f"✗ 找不到对应串流草稿: {name}")
+                st["status"] = "export_failed"
                 _save_state(state)
-                # full 模式的生成阶段已由 batch_runner 收尾通知；export 模式才在这里补一条
-                if args.mode == "export":
-                    subtitle_guard.notify(job_dir)
                 failed.append(name)
                 continue
-        st["status"] = "exporting"
-        _save_state(state)
-        if _run_export(draft, args.timeout, job_dir=job_dir):
-            st["status"] = "done"
+            st["draft"] = draft
+            if _output_exists(draft):
+                print(f"⏭️  成品已存在，跳过导出: {draft}")
+                st["status"] = "done"
+                _save_state(state)
+                continue
+            print(f"\n📤 [{i+1}/{len(targets)}] 导出: {draft}")
+            job_dir = _job_dir_for(target, is_draft)
+            if job_dir:
+                try:
+                    jm.require_export_allowed(job_dir)
+                except jm.ExportBlocked as e:
+                    # 缺字幕未修复：该剧整轮跳过导出，只收尾通知一条，不进入失败重试计数
+                    print(f"⛔ {name} {e}")
+                    print("   请重剪这些集，确认字幕非空后重跑；未修复前不会导出。")
+                    st["status"] = "blocked"
+                    _save_state(state)
+                    # full 模式的生成阶段已由 batch_runner 收尾通知；export 模式才在这里补一条
+                    if args.mode == "export":
+                        subtitle_guard.notify(job_dir)
+                    failed.append(name)
+                    continue
+            st["status"] = "exporting"
             _save_state(state)
-            print(f"✅ 完成: {name}")
-        else:
-            st["status"] = "export_failed"
-            _save_state(state)
-            failed.append(name)
+            if _run_export(draft, args.timeout, job_dir=job_dir, keep_open=reuse):
+                st["status"] = "done"
+                _save_state(state)
+                print(f"✅ 完成: {name}")
+            else:
+                st["status"] = "export_failed"
+                _save_state(state)
+                failed.append(name)
+                if reuse:
+                    # 失败后实例可能停在编辑页/导出视图：收干净再开下一部
+                    _close_jianying_after_batch(f"{name} 导出失败，收尾复用实例")
 
-        if i < len(targets) - 1 and reset > 0:
-            print(f"😴 休息 {reset:.0f}s 后继续下一部…")
-            time.sleep(reset)
+            if i < len(targets) - 1 and reset > 0:
+                print(f"😴 休息 {reset:.0f}s 后继续下一部…")
+                time.sleep(reset)
+    finally:
+        # 正常结束 / 报错 / 中断都统一收掉复用实例（单份导出本来就是子进程自己关）
+        if reuse:
+            _close_jianying_after_batch()
 
     ok = len(targets) - len(failed)
     summary = f"{args.mode} 模式成功 {ok}/{len(targets)}" + (f"，失败: {'、'.join(failed)}" if failed else "")
