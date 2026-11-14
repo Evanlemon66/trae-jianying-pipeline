@@ -57,12 +57,30 @@ def get_watch_config():
     return watch if isinstance(watch, dict) else {}
 
 
+def get_admission_config():
+    """准入测试草稿配置：presets.json 的 admission 段（缺失返回 {}）。
+
+    草稿名只认这里的 draft_name，代码里不写死；缺失时由调用方直接失败。
+    """
+    admission = _cfg().get("admission") or {}
+    return admission if isinstance(admission, dict) else {}
+
+
 def preset_profile_name(value):
-    """预设组名归一化：presets_a / presets_A / a → a（去掉 presets_ 前缀）。"""
+    """预设组名归一化：presets_a / presets_A / A / a_group → a。
+
+    统一小写：watcher 的版本名与草稿后缀一律 `[a-z][a-z0-9]{0,7}`，
+    否则 `--profile B` 会建出 `_B`，和 watcher 期望的 `_b` 形成两套口径。
+    """
     s = str(value or "").strip()
     if s.lower().startswith("presets_"):
         s = s[len("presets_"):]
-    return s.strip()
+    s = s.strip()
+    for suf in ("_group", "-group", "组"):
+        if s.endswith(suf):
+            s = s[: -len(suf)].strip()
+            break
+    return s.lower()
 
 
 def parse_preset_profiles(value):

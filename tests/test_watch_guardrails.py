@@ -27,9 +27,11 @@ from unittest import mock
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "lib"))
 sys.path.insert(0, os.path.join(_ROOT, "pipeline"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import job_manifest as jm  # noqa: E402
 import edit_state as eds  # noqa: E402
 import cover_watch as cw  # noqa: E402
+from bundle_fixture import make_bundle  # noqa: E402
 
 fails = []
 toasts = []
@@ -39,6 +41,32 @@ TMP = os.path.join(tempfile.gettempdir(), "watch_guardrails_test")
 shutil.rmtree(TMP, ignore_errors=True)
 ROOT = os.path.join(TMP, "root", "短剧")
 os.makedirs(ROOT, exist_ok=True)
+DRAFT = os.path.join(TMP, "drafts", "默认串流草稿")
+os.makedirs(DRAFT, exist_ok=True)
+
+
+def set_artifacts(present):
+    """导出目标三件套是否存在：影响「台账 ⇄ 磁盘」冲突判定。
+
+    真实形态：mp4 非空 + progress.done=true + 可读尺寸的竖版封面，
+    不再用空文件碰巧通过（以后启用严格 progress/尺寸校验也不会整片变红）。
+    """
+    mp4 = os.path.join(TMP, "x.mp4")
+    rels = (mp4, mp4 + ".progress.json",
+            os.path.join(TMP, "默认串流草稿-封面.jpg"),
+            os.path.join(TMP, "计划强制导出串流-封面.jpg"))
+    if present:
+        # 两个草稿共用同一个 mock 出来的导出 mp4，封面按草稿名各自一份
+        make_bundle(TMP, "默认串流草稿", skip={"mp4", "progress"})
+        make_bundle(TMP, "计划强制导出串流", skip={"mp4", "progress"})
+        with open(mp4, "wb") as f:
+            f.write(b"m" * 10240)
+        with open(mp4 + ".progress.json", "w", encoding="utf-8") as f:
+            json.dump({"progress": 100, "done": True}, f)
+    else:
+        for p in rels:
+            if os.path.exists(p):
+                os.remove(p)
 
 
 def check(name, cond, extra=""):
@@ -127,6 +155,10 @@ print("\n== ② build_plan 接入 export_state ==")
 
 
 def plan(jd, *, phase=None, pending_edit=0, draft=None, policy="immediate"):
+    # 本节验证的是导出标记参与调度：前提是草稿已存在（无草稿会先落到剪辑分支），
+    # 因此默认给一个临时草稿目录，而不是 mock 成 None。
+    if draft is None:
+        draft = DRAFT
     job = read_job(jd)
     with mock.patch.object(cw, "find_stream_draft", return_value=draft), \
             mock.patch.object(cw.pc, "export_mp4_path", return_value=os.path.join(TMP, "x.mp4")), \
@@ -136,11 +168,13 @@ def plan(jd, *, phase=None, pending_edit=0, draft=None, policy="immediate"):
 
 
 jd = make_job("计划已清理", export_state="cleaned")
+set_artifacts(False)
 p = plan(jd)
 check("cleaned → 不调度", p["action"] == "blocked" and "cleaned" in p["reason"], p)
 check("cleaned → 无可执行命令", not p.get("cmd"))
 
 jd = make_job("计划已导出", export_state="exported")
+set_artifacts(True)
 p = plan(jd)
 check("exported → 等清理不重复导出",
       p["action"] == "blocked" and "已导出" in p["reason"], p)
@@ -156,12 +190,14 @@ p = plan(jd, phase="export", draft=draft_dir)
 check("--phase export 强制路径不受影响", p["action"] == "export", p)
 
 jd = make_job("计划队列闸门", stage="covers_ready")
+set_artifacts(False)
 p = plan(jd, pending_edit=2, draft=draft_dir, policy="after_edit_queue_drained")
 check("after_edit_queue_drained 语义不变（有队列则挡）",
       p["action"] == "blocked" and "2 部待剪辑" in p["reason"], p)
 job = read_job(jd)
 job["video"]["export_state"] = "exported"
 jm.save_job(job, jd)
+set_artifacts(True)
 p = plan(jd, pending_edit=2, draft=draft_dir, policy="after_edit_queue_drained")
 check("exported 优先于编辑队列闸门（不重复导出）",
       p["action"] == "blocked" and "已导出" in p["reason"], p)

@@ -11,10 +11,22 @@ import tempfile
 import threading
 from unittest import mock
 
+try:
+    import pytest
+except ImportError:  # 脚本方式运行时不依赖 pytest
+    pytest = None
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "lib"))
 import export_lock as el  # noqa: E402
 import cover_watch as cw  # noqa: E402
+
+if pytest is not None:
+    @pytest.fixture
+    def tmp(tmp_path):
+        """脚本 main() 直接传目录字符串；pytest 下用 tmp_path 等价提供。"""
+        return str(tmp_path)
+
 
 fails = []
 

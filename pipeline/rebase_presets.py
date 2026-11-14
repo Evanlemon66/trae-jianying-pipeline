@@ -84,7 +84,7 @@ def main():
     if job_dir:
         print(f"🗂️ 版本封面来源: {job_dir}")
     else:
-        print("⚠️ 未定位到 cover_job，克隆草稿将沿用源封面")
+        print("⚠️ 未定位到 cover_job：扩展版本将改用源草稿主轨视频抽帧兜底（A 版沿用源封面）")
 
     try:
         r = clone_draft_with_presets(
@@ -101,7 +101,7 @@ def main():
     print(f"\n✅ 新草稿已生成: {r['target']}")
     print(f"   源草稿 : {r['source']}")
     print(f"   预设组 : {r['profile'] or '(无)'} → {r['presets'] or '未合并任何预设'}")
-    print(f"   封面   : {r['cover'] or '(未找到组封面，沿用源草稿)'}")
+    print(f"   封面   : {r['cover'] or '(无)'}（来源: {r.get('cover_source') or 'source_draft'}）")
     print(f"   剥离   : 轨道 {r['stripped']['tracks']} / 素材 {r['stripped']['materials']}")
     print(f"   时长   : {r['duration_us'] / 1e6:.2f}s")
 
@@ -111,6 +111,18 @@ def main():
             try:
                 from pipeline import clear_export_stale
                 clear_export_stale(r["target"])
+            except Exception:
+                pass
+            # 写时确权：同步记一份成品出身（sidecar + E2），失败不影响结果
+            try:
+                import freshness
+                from pipeline import export_mp4_path
+                _jd = _infer_job_dir(r["target"])
+                _out = export_mp4_path(r["target"])
+                if _jd and os.path.isfile(_out):
+                    freshness.record_export(
+                        _jd, freshness.version_for_draft(_jd, r["target"]),
+                        r["target"], _out)
             except Exception:
                 pass
         else:
