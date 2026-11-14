@@ -43,6 +43,9 @@ from export_config import export_mp4_path, get_export_dir  # noqa: E402
 import export_config as pc  # noqa: E402
 import job_manifest as jm  # noqa: E402
 import subtitle_guard  # noqa: E402
+import export_lock  # noqa: E402  # 全局导出锁：脚本导出与 watcher 互斥
+import pipeline as jp  # noqa: E402  # 导出失效标记 / 草稿目录解析
+import freshness  # noqa: E402  # E2 成品新鲜度（sidecar + 版本槽）
 from no_window import NO_WINDOW, hidden_child_env  # noqa: E402
 
 STATE_PATH = os.path.join(_HERE, "_series_queue_state.json")
@@ -102,9 +105,79 @@ def _all_stream_drafts() -> list[str]:
 
 
 def _output_exists(draft_name: str) -> bool:
-    """成品已存在且 >1MB 视为已导出，跳过（成品按剧名子目录归置）"""
+    """成品已存在且 >1MB 视为已导出，跳过（成品按剧名子目录归置）。
+
+    草稿带 `_export_stale.json` 时一票否决：草稿重建/发布后旧 mp4 仍在，
+    只看文件会把旧成品当成新成品跳过导出。
+    """
+    if jp.export_is_stale(os.path.join(JY_DRAFT_ROOT, draft_name)):
+        return False
     out = export_mp4_path(draft_name)
     return os.path.isfile(out) and os.path.getsize(out) > 1 * 1024 * 1024
+
+
+def _declared_profiles(job: dict) -> list[str]:
+    """job 声明的版本（基础版 a 恒在）：workflow.preset_profile + 已有 outputs。"""
+    procs = pc.parse_preset_profiles((job.get("workflow") or {}).get("preset_profile"))
+    for ver in ((job.get("video") or {}).get("outputs") or {}):
+        if ver not in procs:
+            procs.append(ver)
+    return procs or ["a"]
+
+
+def _version_of_draft(draft_name: str, profiles: list[str]) -> str:
+    """草稿名 → 版本：`<基础草稿>_<版本>` 命中声明版本时取该版本，否则为基础版 a。"""
+    for prof in profiles:
+        if prof != "a" and draft_name.endswith("_" + prof):
+            return prof
+    return "a"
+
+
+def _record_export_freshness(draft_name: str, out_mp4: str) -> None:
+    """写 E2 sidecar + `edges.e2.versions[<版本>]`；失败只告警（best-effort）。"""
+    try:
+        if not (out_mp4 and os.path.isfile(out_mp4)):
+            return
+        job_dir = freshness.job_dir_for_draft(draft_name)
+        if not job_dir:
+            return
+        freshness.record_export(job_dir, freshness.version_for_draft(job_dir, draft_name),
+                                draft_name, out_mp4)
+    except Exception as e:
+        print(f"  [warn] 记录成品新鲜度失败（忽略）: {e}")
+
+
+def _finalize_export(draft_name: str, out_mp4: str, job_dir: str | None) -> bool:
+    """导出成功后的收尾，顺序固定：台账 → 清 stale → E2。
+
+    台账按实际导出的草稿写 `video.outputs[<版本>]`（多版本各记各的）；
+    台账失败时**不**清 stale、**不**写 E2，直接返回 False（fail-closed）：
+    watcher 看到 stale 会重导，而不是把「成品在、台账缺」判成 blocked。
+    后两步失败只告警：台账已成立，watcher 仍能靠 stale/progress 兜底。
+    没有 job 可登记（脚本直接跑单条草稿）时跳过台账，仍清 stale、写 E2。
+    """
+    if job_dir:
+        try:
+            job = jm.load_job(os.path.join(job_dir, "job.json"))
+            prof = _version_of_draft(draft_name, _declared_profiles(job))
+            jm.record_video(job_dir, export_dir=os.path.dirname(out_mp4) or None,
+                            export_file=out_mp4, draft_name=draft_name, profile=prof)
+            print(f"  🧾 台账已登记: outputs.{prof} ← {os.path.basename(out_mp4)}")
+        except Exception as e:
+            print(f"  ⚠️ 台账登记失败（保留导出失效标记，下次重跑）: {e}")
+            return False
+    jp.clear_export_stale(os.path.join(JY_DRAFT_ROOT, draft_name))
+    _record_export_freshness(draft_name, out_mp4)
+    return True
+
+
+def _own_export_lock() -> bool:
+    """当前进程是否已持有全局导出锁（watcher 在 run_export 外层已持锁）。"""
+    try:
+        data = export_lock.read_lock() or {}
+        return int(data.get("pid") or 0) == os.getpid()
+    except Exception:
+        return False
 
 
 def _parse_target(raw: str) -> tuple[str, dict]:
@@ -313,6 +386,30 @@ def _export_cmd(draft_name: str, out_mp4: str, cold_start: bool, keep_open: bool
 
 def _run_export(draft_name: str, timeout: float = 1800, *, cold_start: bool = False,
                 job_dir: str | None = None, keep_open: bool = False) -> bool:
+    """导出统一入口：外层持 `.export.lock`，再走 preclean + 子进程 + 归拢。
+
+    watcher 调用本函数前已在 `run_export` 里持有同一把锁（同进程），
+    这里识别到「本进程已持锁」就复用，不重复加锁、也不释放别人的锁。
+    取不到锁时直接返回 False（不启动子进程、不动目录），由调用方记失败。
+    """
+    acquired = False
+    if not _own_export_lock():
+        if not export_lock.acquire(owner=f"series_runner {draft_name}"):
+            holder = export_lock.read_lock() or {}
+            print(f"  ⛔ 全局导出锁被占用（pid={holder.get('pid')} "
+                  f"owner={holder.get('owner')}），本次不导出")
+            return False
+        acquired = True
+    try:
+        return _run_export_locked(draft_name, timeout, cold_start=cold_start,
+                                  job_dir=job_dir, keep_open=keep_open)
+    finally:
+        if acquired:
+            export_lock.release()
+
+
+def _run_export_locked(draft_name: str, timeout: float = 1800, *, cold_start: bool = False,
+                       job_dir: str | None = None, keep_open: bool = False) -> bool:
     """robust_auto_export 位置参数直达导出落点，--move 搬运到默认目录的剧名子目录。
 
     timeout 按「无进展」计：进度 json 每 30s 刷新一次，超过 timeout 秒没有任何刷新
@@ -520,9 +617,18 @@ def main() -> int:
             st["status"] = "exporting"
             _save_state(state)
             if _run_export(draft, args.timeout, job_dir=job_dir, keep_open=reuse):
-                st["status"] = "done"
-                _save_state(state)
-                print(f"✅ 完成: {name}")
+                out_mp4 = export_mp4_path(draft)
+                if _finalize_export(draft, out_mp4, job_dir):
+                    st["status"] = "done"
+                    _save_state(state)
+                    print(f"✅ 完成: {name}")
+                else:
+                    # 成品已落盘但台账没写成：保留 stale 标记，下次重跑而不是让 watcher 判冲突
+                    st["status"] = "export_failed"
+                    _save_state(state)
+                    failed.append(name)
+                    if reuse:
+                        _close_jianying_after_batch(f"{name} 台账登记失败，收尾复用实例")
             else:
                 st["status"] = "export_failed"
                 _save_state(state)
