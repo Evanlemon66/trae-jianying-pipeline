@@ -32,6 +32,23 @@ from typing import Any, Callable, Optional
 _HERE_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_HERE_DIR))))
 _LIB_DIR = os.path.join(_REPO_ROOT, "lib")
+
+
+def _require_repo_layout():
+    """上探仓库依赖层；找不到时给出布局说明，而不是裸 ModuleNotFoundError。"""
+    missing = [rel for rel in ("lib/jianying_launch.py", "lib/jianying_proc.py")
+               if not os.path.isfile(os.path.join(_REPO_ROOT, *rel.split("/")))]
+    if missing:
+        raise ImportError(
+            "未找到仓库依赖层，jy_instance.py 不能脱离仓库单独使用。\n"
+            "支持的唯一布局：<repo>/.trae/skills/jianying-editor/examples/jy_instance.py\n"
+            f"本次按上探推算的仓库根：{_REPO_ROOT}\n"
+            f"缺失：{', '.join(missing)}\n"
+            "请把整个仓库（含 lib/ 与 pipeline/）一起 clone/解压后再运行。"
+        )
+
+
+_require_repo_layout()
 if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 import jianying_launch as jl  # noqa: E402
@@ -78,6 +95,18 @@ def _window_by_process(uia):
     except Exception:
         return None
 
+
+def _is_draft_card(control, _depth=0):
+    """首页草稿卡片：LegacyIAccessible.Description = HomePageDraftTitle:<草稿名>。
+
+    与 robust_auto_export.open_draft 的卡片判定同源，用来验证首页真的渲染出了
+    可交互内容（而不是只有一个 HomePage 类名的空壳/卡死窗口）。
+    """
+    try:
+        return str(control.GetPropertyValue(30159) or "").startswith("HomePageDraftTitle:")
+    except Exception:
+        return False
+
 # ── 启动即死检测（口径统一在 jianying_launch，模块内保留同名别名供调用方引用）──
 EARLY_DEATH_WINDOW_S = jl.EARLY_DEATH_WINDOW_S
 EARLY_DEATH_RETRIES = jl.EARLY_DEATH_RETRIES
@@ -111,6 +140,10 @@ class Backend:
 
     def process_running(self) -> bool:  # pragma: no cover - 接口
         raise NotImplementedError
+
+    def prime(self) -> None:  # pragma: no cover - 接口
+        """在当前（主）线程初始化 UIA 客户端；默认无操作。"""
+        return None
 
     def window_exists(self) -> bool:  # pragma: no cover
         raise NotImplementedError
@@ -154,6 +187,18 @@ class UIABackend(Backend):
             self._uia = uia
         return self._uia
 
+    def prime(self) -> None:
+        """在主线程创建 _AutomationClient 单例（探测线程随后可直接复用）。
+
+        首次创建若发生在 poll_with_timeout 的探测线程，该线程未 CoInitialize，
+        会报 "Can not load UIAutomationCore.dll"，就绪探测永远 False（表现为启动
+        超时，实际实例已可用）。
+        """
+        try:
+            self._u().GetRootControl().ClassName
+        except Exception:
+            pass
+
     def process_running(self) -> bool:
         try:
             import psutil
@@ -188,10 +233,35 @@ class UIABackend(Backend):
         return _window_by_process(uia)
 
 
+    def _home_ready(self, w) -> bool:
+        """首页「真能用」：除 ClassName 是 HomePage 外，还必须能枚举到可交互控件。
+
+        UI 假死时窗口类名仍是 HomePage_QMLTYPE_*，只看 ClassName 会把卡死实例判成
+        就绪，自愈于是 skip 掉重启。这里要求 UIA 真能读到草稿卡片（与 open_draft
+        同一 Desc 前缀），读不到再退到首页按钮/文本；UIA 调用阻塞或抛错（假死典型
+        表现）一律判不可用。外层 _probe 另有线程超时兜底。
+        """
+        try:
+            card = w.TextControl(searchDepth=6, Compare=_is_draft_card)
+            if card.Exists(0) and card.IsEnabled:
+                return True
+        except Exception:
+            pass
+        try:
+            btn = w.ButtonControl(searchDepth=6)
+            if btn.Exists(0) and btn.IsEnabled:
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(w.TextControl(searchDepth=6).Exists(0))
+        except Exception:
+            return False
+
     def is_home(self) -> bool:
         try:
             w = self._main_window()
-            return bool(w) and "HomePage" in (w.ClassName or "")
+            return bool(w) and "HomePage" in (w.ClassName or "") and self._home_ready(w)
         except Exception:
             return False
 
@@ -273,6 +343,10 @@ class JyInstance:
         # 启动即死重试预算：每个管理器（= 每次导出运行）只有 EARLY_DEATH_RETRIES 次，
         # 不会随导出层 attempt 重试倍增。
         self._budget = jl.LaunchBudget(EARLY_DEATH_RETRIES)
+        # 最近一次 launch 的结果（died/timeout 等），供统一判定打 launch_failed 标记
+        self.last_outcome = None
+        # 台账分类：导出链 export / 准入链 admit；由 ensure_for_export 显式设置
+        self.entry = "export"
 
     # ── 探测 ──
     def _probe(self, state: str) -> bool:
@@ -356,6 +430,8 @@ class JyInstance:
           - 启动即死按管理器级预算（EARLY_DEATH_RETRIES=1）重拉一次，不随 attempt 放大。
         timeout 默认 180s：窗口出现但 HomePage 未渲染完仍算"未就绪"，继续轮询。
         """
+        # UIA 单例必须在调用线程先建好，否则下面的探测线程会因未 CoInitialize 全部失败。
+        self.backend.prime()
         # 防双开（唯一收口）：进程已经在就只重连/等待，绝不再 spawn 第二个实例。
         # 与 robust_auto_export 的“进程退出即判拉起失败 → watcher 跨轮重拉”配合，
         # 两条路径都先过这里，保证同一时刻只有一个剪映进程。
@@ -385,7 +461,7 @@ class JyInstance:
         outcome = jl.ensure_jianying(
             exe_path=exe, timeout=timeout, readiness="home",
             require_exists=False, budget=self._budget,
-            entry="export",
+            entry=self.entry,
             ready_fn=lambda: self._probe("home"),
             alive_fn=self.backend.process_running,
             spawn_fn=self.backend.launch,
@@ -456,6 +532,74 @@ class JyInstance:
             return True
         raise JyInstanceError(
             f"剪映两次尝试均未达到状态 {state}（窗口未就绪/冷启动失败），已重启一次仍失败")
+
+    # 进程在但首页没渲染完（正常冷启动尾声）的复用宽限；超过仍不可交互才判 UI 假死。
+    REUSE_READY_GRACE_S = 30.0
+
+    def _raise_unready(self, what: str) -> None:
+        """拉起/重启未到达可用首页：把 launch 的 died/timeout 打成 launch_failed 标记。"""
+        out = self.last_outcome
+        oc = getattr(out, "outcome", "") if out is not None else ""
+        if oc in ("died", "died_late", "died_after_ready", "timeout"):
+            raise JyInstanceError(
+                f"[launch_failed:{oc} alive={out.alive_s:.1f}s attempt={out.attempt} "
+                f"env_check={int(bool(out.env_check_seen))}] {what}后未到达可交互首页")
+        raise JyInstanceError(f"{what}后未到达可交互首页（窗口未就绪/UI 假死）")
+
+    def ensure_for_export(self, force_clean: bool = False,
+                          timeout: float = HOME_READY_TIMEOUT_S,
+                          entry: str = "export") -> bool:
+        """导出前实例判定（唯一口径，准入链同样走这里）：实例是否可用、是否需要干净重启。
+
+        三个导出入口（cover_watch / series_runner / 直调 robust）与准入链
+        （pipeline_ui.ui_core.launch_via_manager）只表达意图，复用还是干净重启全由
+        这里判定，不再各自维护 cold_start 默认值：
+          force_clean=True   → 无条件冷启动（调用方显式强制）
+          进程不在           → launch
+          首页且可交互       → 复用（唯一允许复用的条件）
+          编辑页             → 软关回首页，失败/假死再重启
+          进程在但不可用     → 宽限等待后仍不可交互 = UI 假死 → restart，绝不复用
+        entry 只影响启动台账分类（export / admit）。
+        返回是否已停在可交互首页；拉起失败抛含分类标记的 JyInstanceError。
+        """
+        # 先在本线程建 UIA 单例：detect/launch 的探测都在子线程里跑，首次创建若发生在
+        # 子线程会因未 CoInitialize 全部失败，把已就绪的实例误判成启动超时。
+        self.backend.prime()
+        self.entry = entry or "export"
+
+        if force_clean:
+            self._log("实例判定：显式要求干净启动 → 重启剪映")
+            if self.restart(timeout):
+                return True
+            self._raise_unready("冷启动")
+
+        if not self.backend.process_running():
+            self._log("实例判定：剪映未运行 → 拉起")
+            if self.launch(timeout):
+                return True
+            self._raise_unready("拉起")
+
+        state = self.detect()
+        if state == "home":
+            self._log("实例判定：首页可交互 → 复用现有实例")
+            return True
+        if state == "editing":
+            self._log("实例判定：停在编辑页 → 软关回首页（失败再重启）")
+            if self.go_home(timeout=SOFT_HOME_TIMEOUT_S, allow_restart=True,
+                            restart_timeout=timeout):
+                return True
+            self._raise_unready("回首页")
+
+        # 进程在但窗口/页面不可用：先给冷启动尾声留宽限，仍不可交互即判 UI 假死。
+        self._log(f"实例判定：进程在但实例不可用（state={state}），等待首页可交互...")
+        if self.wait_ready("home", self._time() + self.REUSE_READY_GRACE_S):
+            self._log("实例判定：宽限内首页恢复可交互 → 复用")
+            return True
+        self._log("实例判定：宽限内首页仍不可交互（疑似 UI 假死）→ 干净重启")
+        if self.restart(timeout):
+            return True
+        self._raise_unready("重启")
+        return False  # pragma: no cover - _raise_unready 必抛
 
     def go_home(self, timeout: float = SOFT_HOME_TIMEOUT_S, allow_restart: bool = True,
                 restart_timeout: float = HOME_READY_TIMEOUT_S) -> bool:

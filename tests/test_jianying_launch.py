@@ -227,8 +227,10 @@ def test_readiness_variants():
     # 默认仍是等窗口（与既有准入行为一致）
     assert inspect.signature(ui_core.launch_and_connect).parameters['readiness'].default == 'window'
     import ui_nav
-    assert inspect.signature(ui_nav.open_draft).parameters['readiness'].default == 'window'
-    assert inspect.signature(ui_nav._launch_until_card).parameters['readiness'].default == 'window'
+    # 准入已统一到实例管理器：不再暴露 readiness（就绪口径固定 home）
+    assert 'readiness' not in inspect.signature(ui_nav.open_draft).parameters
+    assert 'readiness' not in inspect.signature(ui_nav._launch_until_card).parameters
+    assert inspect.signature(ui_nav.open_draft).parameters['ready_timeout'].default == 120.0
     # 'window' 缺 ready_fn → 明确报错（不得静默当 home）
     try:
         jl.ensure_jianying(exe_path='fake.exe', readiness='window',
@@ -331,7 +333,7 @@ def test_call_sites_params_unchanged():
     from export_config import get_admission_config
     cfg = get_admission_config() or {}
     assert (cfg.get('open') or {}).get('hot_wait_after_build') == 0
-    # 就绪口径：导出=home，准入=window
+    # 就绪口径：导出与准入都等首页（准入经 ui_core.launch_via_manager → ensure_for_export）
     assert inspect.signature(jl.ensure_jianying).parameters['readiness'].default == 'home'
 
 

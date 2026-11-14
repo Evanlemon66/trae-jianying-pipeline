@@ -36,6 +36,14 @@ if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 import jianying_launch as jl  # noqa: E402
 
+# 实例判定唯一口径：与导出链共用 examples/jy_instance.py 的 ensure_for_export
+_EXAMPLES_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', '.trae', 'skills',
+    'jianying-editor', 'examples'))
+if _EXAMPLES_DIR not in sys.path:
+    sys.path.insert(0, _EXAMPLES_DIR)
+import jy_instance  # noqa: E402
+
 PROPERTY_ID_FULLDESC = 30159   # LegacyIAccessible.Description（剪映语义标记都在这）
 
 
@@ -1040,6 +1048,28 @@ def launch_and_connect(exe_path=None, max_wait=60, retries=0, readiness='window'
         f"启动后 {outcome.alive_s:.0f}s 剪映进程退出（启动即死，pid={outcome.pid}），"
         f"未等到主窗口")
 
+
+
+def launch_via_manager(readiness='home', force_clean=False, timeout=120.0):
+    """准入冷启动：复用导出链的实例判定（`JyInstance.ensure_for_export`）。
+
+    与 `launch_and_connect` 的区别：就绪口径固定为 home（首页真能枚举出可交互
+    控件），复用/软关/宽限/干净重启全部由实例管理器判定，准入不再自己维护
+    "窗口出现即就绪"的第二套口径。失败时原样抛出管理器异常，保留
+    `[launch_failed:…]` / `[window_missing]` / `[window_activate_timeout]` 标记，
+    供失败分类与台账使用。
+
+    返回 `_activate_and_classify` 的 `(win, page)`。
+    """
+    if readiness != 'home':
+        raise ValueError(f"准入只支持 readiness='home'（收到 {readiness!r}）")
+    exe = resolve_jianying_exe()
+    mgr = jy_instance.JyInstance(find_exe=lambda: exe, log=dprint)
+    mgr.ensure_for_export(force_clean=force_clean, timeout=timeout, entry='admit')
+    win = mgr.backend.rebind_window()
+    if win is None:
+        raise RuntimeError('[window_missing] 实例已就绪但绑定主窗口失败')
+    return _activate_and_classify(win)
 
 
 _PAGE_FEATS = (

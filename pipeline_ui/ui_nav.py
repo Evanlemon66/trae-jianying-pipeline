@@ -5,7 +5,7 @@ import time
 import uiautomation as uia
 
 from ui_core import (connect_jianying, dprint, jl, launch_and_connect, op_mark,
-                     enum_jianying_windows, op_stage)
+                     enum_jianying_windows, op_stage, launch_via_manager)
 
 
 def switch_to_home(max_wait=30):
@@ -170,27 +170,26 @@ def _wait_draft_card(name, seconds):
         time.sleep(2)
 
 
-def _launch_until_card(name, cold_wait=90, max_launch=2, readiness='window'):
-    """冷启动拉起并找卡片：覆盖『启动即死』重试、『启动后停在编辑页』两种情况。
+def _launch_until_card(name, cold_wait=90, max_launch=2, ready_timeout=120.0):
+    """冷启动拉起并找卡片：拉起统一走实例管理器（首页可交互才算就绪）。
 
-    readiness（默认 'window'，与既有行为一致）决定等窗口就绪还是等首页就绪：
-      - 'window'：拉起后若停在编辑页 → 先 switch_to_home 再找卡片；
-      - 'home'  ：launch_and_connect 已等到首页才返回，下面的 edit 分支通常走不到；
-                  若冷启动停在编辑页且一直没出现首页，会等满 420s 判本轮失败，
-                  再由外层 max_launch 决定是否再拉一轮。
+    每轮调用 `ui_core.launch_via_manager`（内部即 `ensure_for_export`）：
+      - 进程不在 → 拉起；进程在但首页假死 → 管理器自行干净重启，不再带病复用；
+      - 就绪口径固定 home，不再有"窗口出现即就绪"的第二套判定；
+      - 失败异常保留 `[launch_failed:…]` / `[window_missing]` /
+        `[window_activate_timeout]` 标记，便于分类与台账。
+    外层 max_launch 仍是本函数的重拉上限（管理器内部另有自己的早死预算）。
     """
     global JIANYING_LAUNCHED
     for attempt in range(1, max_launch + 1):
         try:
-            # retries=0：重拉预算归本函数（max_launch），共用层不再叠加
-            launch_and_connect(max_wait=420, retries=0, readiness=readiness)
+            launch_via_manager(force_clean=False, timeout=ready_timeout)
             JIANYING_LAUNCHED = True   # 本轮确实拉起过剪映，收尾时由准入决定是否关闭
         except Exception as e:
             dprint(f'  [cold] 第{attempt}次拉起失败: {e}')
             time.sleep(3)
             continue
-        # 'window' 口径下剪映冷启动可能直接恢复到上次的编辑页 → 先回首页，否则卡片永远扫不到
-        # 'home' 口径下 launch_and_connect 已确认首页，这里的 edit 判定通常不成立
+        # 管理器已保证可交互首页；若仍停在编辑页（极端情况）先回首页，否则卡片扫不到
         _, pt = connect_jianying(retry=False)
         if pt == 'edit':
             dprint('  [cold] 启动后停在编辑页，先回首页再找卡片')
@@ -207,15 +206,15 @@ def _launch_until_card(name, cold_wait=90, max_launch=2, readiness='window'):
 
 
 def open_draft(name, timeout=60, hot_wait=30, cold_wait=90, max_launch=2,
-               allow_cold_restart=True, readiness='window'):
+               allow_cold_restart=True, ready_timeout=120.0):
     """打开指定草稿。
 
     hot_wait            热复用等待秒数（首页列表已在）；0 = 只扫一次就转冷启动
     cold_wait           冷启动后每轮找卡片秒数（默认 90，与旧行为一致）
     max_launch          冷启动重拉次数（默认 2，与旧行为一致）
     allow_cold_restart  False = 禁止杀进程/重开剪映；热态做不到直接报错
-    readiness           冷启动就绪口径：'window'（默认，等窗口）/ 'home'（等首页）；
-                        见 _launch_until_card 的两种分支说明
+    ready_timeout       冷启动就绪墙钟，直接透传给实例管理器 ensure_for_export
+                        （就绪口径固定为「首页可交互」）
     """
     t_open = time.time()
     refreshed = False
@@ -267,7 +266,7 @@ def open_draft(name, timeout=60, hot_wait=30, cold_wait=90, max_launch=2,
         t_c = time.time()
         # 刚杀完进程，跳过「先找窗口」；内置『启动即死→重拉』与『启动后停在编辑页→回首页』
         ctrl = _launch_until_card(name, cold_wait=cold_wait, max_launch=max_launch,
-                                  readiness=readiness)
+                                  ready_timeout=ready_timeout)
         dprint(f'[open_draft] 冷启动窗口就绪 {time.time()-t_c:.1f}s')
         if ctrl:
             dprint(f'[open_draft] 冷启动后卡片出现于 +{time.time()-t_open:.1f}s → 点击')
