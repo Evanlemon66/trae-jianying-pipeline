@@ -235,8 +235,9 @@ def run_extract_audio(workdir: str = ".", timeout_sec: int = 30) -> dict:
     # --- Step 5: 解除所有锁定和隐藏（阶段 6 边界：分离已完成，进入最终形态布局）---
     op_stage('6 草稿最终形态(只隐藏中文轨,其余解除隐藏)')
     dprint("\n[5/6] 解除所有轨道的锁定和隐藏")
-    restore_result = restore_all_tracks(win, scan_hint=hint,
-                                        expected_tracks=len(rows0) + 1)
+    # expected_tracks 由 restore_all_tracks 直接读 draft_content.json 的真实轨道数：
+    # 旧口径 len(rows0)+1 受滚动视口影响，视口外的轨道会被当成不存在，永远差一条。
+    restore_result = restore_all_tracks(win, scan_hint=hint)
     if not restore_result.get('ok'):
         reason = restore_result.get('reason')
         if reason == 'scroll_unavailable':

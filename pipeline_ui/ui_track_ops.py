@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from typing import List, Optional, Tuple
 
@@ -581,8 +583,11 @@ def _light_row_state(win, WL, WT, WW, WH, rows):
 
 
 # ============ 可视区判定 + 多态纵向滚动 ============
-# 键盘优先：本机实测 wheel / scrollbar 均无位移，PageUp/PageDown 才真正能滚动时间线
+# 不设固定优先级：实测同一台机器上 wheel / scrollbar / keyboard 的有效性会随轮次变化
+# （上一轮只有键盘有位移，本轮只有滚轮/滚动条有位移），任何固定顺序都会白跑两轮。
+# 改为轮转起手：每轮从上一次成功模态的下一个开始试，谁先产生位移就用谁。
 SCROLL_MODES = ('keyboard', 'wheel', 'scrollbar')
+_SCROLL_ORDER_START = 0     # 轮转起手索引（相对 SCROLL_MODES）
 
 
 def _safe_timeline_rect(win):
@@ -666,19 +671,31 @@ def _scroll_once(win, direction, mode, tr):
 
 def scroll_timeline_vertical(win, direction='down', modes=SCROLL_MODES) -> dict:
     """
-    多态纵向滚动时间线：键盘 PageUp/PageDown（主力）→ 滚轮 → 拖滚动条（兜底）。
+    多态纵向滚动时间线：keyboard / wheel / scrollbar **轮转起手**，谁有位移就用谁。
     down=看下方轨道，up=看上方轨道。
-    每个模态执行后对比亮度行检测的 y 集合：真的动了才算生效，没动记为该模态不可用。
+
+    不设固定优先级：本机实测模态有效性逐轮变化（上一轮只有键盘动，这一轮只有
+    滚轮/滚动条动），固定顺序会让每轮都先白试一遍无效模态。维护一个模块级
+    轮转索引：本次从上次命中的下一个模态开始试，命中后索引后移；全失败也后移，
+    保证下一轮起手模态与这一轮不同。
+
+    每个模态执行后对比亮度行检测的 y 集合：真的动了才算生效，没动记为该模态无位移。
     返回 {'ok','mode','tried','reason'}；不可用时 reason 明确（no_timeline_rect /
     all_modes_failed），**不静默跳过**。
     """
+    global _SCROLL_ORDER_START
     rows0, tr, _img, _WL, _WT = _light_scan(win)
     if not tr:
         dprint("  ⚠️ 滚动不可用：拿不到时间线 rect")
         return {'ok': False, 'mode': None, 'tried': [], 'reason': 'no_timeline_rect'}
     sig0 = tuple(r['ymid'] for r in rows0)
+    order = tuple(modes)
+    n = len(order) or 1
+    start = _SCROLL_ORDER_START % n
+    ordered = order[start:] + order[:start]
+    dprint(f"  滚动模态轮转起手: {ordered[0]}（上次起手索引={start}）")
     tried = []
-    for mode in modes:
+    for mode in ordered:
         try:
             _scroll_once(win, direction, mode, tr)
         except Exception as e:
@@ -694,7 +711,9 @@ def scroll_timeline_vertical(win, direction='down', modes=SCROLL_MODES) -> dict:
                f"{'生效' if moved else '无位移'}（方向={direction}，"
                f"{len(sig0)} 行 → {len(sig1)} 行）")
         if moved:
+            _SCROLL_ORDER_START = (order.index(mode) + 1) % n
             return {'ok': True, 'mode': mode, 'tried': tried, 'reason': 'ok'}
+    _SCROLL_ORDER_START = (start + 1) % n
     return {'ok': False, 'mode': None, 'tried': tried, 'reason': 'all_modes_failed'}
 
 
@@ -725,32 +744,86 @@ def _reflow_rows(win, rows, tr=None):
     return out, True, img, WT
 
 
-def restore_all_tracks(win, max_rounds=2, scan_hint=None, expected_tracks=None) -> dict:
-    """
-    收尾合并操作：批量解锁 → 批量恢复可见 → 轻量复检。
+def _draft_track_count() -> int:
+    """当前草稿 draft_content.json 的真实轨道数（expected_tracks 的唯一事实源）。
 
-    在原有"批量裸点 + 轻量复检"之上补两条判据（对应 T5 卡在 ymid=855 的根因）：
-      ① 行位置漂移：插入新轨会让时间线自动滚动，hint 里的 ymid 已不是那一行。
-         每轮先用亮度行检测重排 y；不重排就点会点在别的行上，复检必然"仍锁定"。
-      ② 可视区外：expected_tracks 多于当前可检测行数时，目标在视口外，
-         必须多态滚动（滚轮→滚动条→键盘）把它滚进来再判；三种模态都不可用时
-         reason='scroll_unavailable'，与"真的锁着"区分开，日志能看出是哪一种。
+    取代旧的「可见行数 + 1」下界：可见行数受滚动视口影响，视口外的轨道会被
+    当成不存在，expected 永远差一条 → 上一轮 admission 落到 scroll_unavailable。
+    读不到草稿（无活动草稿/解析失败）返回 0，调用方退化为"当前可视区干净即完成"。
+    """
+    try:
+        from ui_recognize_translate import DRAFT_ROOT, _active_draft_name
+        name = _active_draft_name()
+        if not name:
+            dprint("  ⚠️ 无活动草稿，expected_tracks 退化为最可视区判据")
+            return 0
+        p = os.path.join(DRAFT_ROOT, name, 'draft_content.json')
+        with open(p, encoding='utf-8') as f:
+            d = json.load(f)
+        n = len(d.get('tracks') or [])
+        dprint(f"  草稿真实轨道数 = {n}（读自 {p}）")
+        return n
+    except Exception as e:
+        dprint(f"  ⚠️ 读取草稿轨道数失败（{type(e).__name__}: {e}），"
+               f"expected_tracks 退化为最可视区判据")
+        return 0
+
+
+def _estimate_vshift(pre_ymids, post_ymids, tol=6) -> int:
+    """滚动前后整摞轨道的纵向位移（post - pre），用于平移跨滚动累计的覆盖坐标。
+
+    取"能匹配上最多行"的位移；匹配不足 2 行视为估计失败返回 0（不平移，
+    宁可覆盖少算而判失败，也不能虚增覆盖把脏轨道放过）。
+    """
+    best_d, best_m = 0, 0
+    for p in pre_ymids:
+        for q in post_ymids:
+            d = q - p
+            if d == 0:
+                continue
+            m = sum(1 for x in pre_ymids
+                    if any(abs(x + d - y) <= tol for y in post_ymids))
+            if m > best_m or (m == best_m and abs(d) > abs(best_d)):
+                best_d, best_m = d, m
+    return best_d if best_m >= 2 else 0
+
+
+def restore_all_tracks(win, max_rounds=6, scan_hint=None, expected_tracks=None) -> dict:
+    """
+    收尾合并操作：边扫边解锁/恢复可见，边滚边累计覆盖，最后终验。
+
+    判据（取代旧的"一屏齐活"）：
+      ① 每轮只处理**当前可视区**里的脏行：锁定行点锁列、隐藏行点眼睛列，
+         点后轻量复检；复检不干净就下一轮重扫重试（行可能漂移）。
+      ② 可视区干净后向未走到的方向滚一屏，把视口外的轨道滚进来继续处理；
+         每轮记录覆盖（已确认干净的轨道 ymid），滚动后按整摞位移平移坐标。
+      ③ expected_tracks 默认读 draft_content.json 的真实轨道数（不再用
+         可见行数 + 1）；累计覆盖 >= expected_tracks 才算齐。
+      ④ 上下两端都滚不动仍覆盖不足 → reason='scroll_unavailable'（看不见 ≠ 锁着），
+         上层据此落 track_restore_failed，不再混进 unknown。
 
     scan_hint=(rows, img, WL, WT, WW, eye_x)：复用调用方刚扫过的结果。
     返回 {'unlocked','unhidden','ok','reason','still_locked','still_hidden',
-          'scroll_unavailable','scroll_tried','drift_rounds'}
+          'scroll_unavailable','scroll_tried','drift_rounds','covered','expected_tracks'}
     """
     from ui_calibration import get_param
     WL, WT, WW, WH = get_window_rect(win)
     _ensure_geom(win, WL, WT, WW, WH)
     lock_x = WL + _hdr_x(int(get_param('track_header', 'lock_x', 50)))
 
+    if not expected_tracks:
+        expected_tracks = _draft_track_count()
+    expected_tracks = int(expected_tracks or 0)
+    if expected_tracks:
+        dprint(f"  预期轨道数 = {expected_tracks}（draft_content.json tracks 长度）")
+
     total_unlocked = total_unhidden = 0
-    ok = True
-    clean_confirmed = False
-    scroll_unavailable = False
+    covered = set()          # 已确认干净的轨道（ymid，滚动后按位移补偿）
     scroll_tried = []
     drift_rounds = 0
+    top_reached = bottom_reached = False
+    clean_confirmed = False
+    scroll_unavailable = False
     still_locked: List[int] = []
     still_hidden: List[int] = []
     rows = img = eye_x = None
@@ -767,114 +840,121 @@ def restore_all_tracks(win, max_rounds=2, scan_hint=None, expected_tracks=None) 
                 return {'unlocked': total_unlocked, 'unhidden': total_unhidden,
                         'ok': False, 'reason': 'no_rows', 'still_locked': [],
                         'still_hidden': [], 'scroll_unavailable': False,
-                        'scroll_tried': scroll_tried, 'drift_rounds': drift_rounds}
+                        'scroll_tried': scroll_tried, 'drift_rounds': drift_rounds,
+                        'covered': sorted(covered), 'expected_tracks': expected_tracks}
 
-        # ① 行位置复检：旧 ymid 可能已被自动滚动带偏，先按当前屏幕重排
+        # ① 行位置复检：插入新轨/滚动都会让 ymid 失效，先按当前屏幕重排
         rows, drifted, img, WT = _reflow_rows(win, rows, tr)
         if drifted:
             drift_rounds += 1
             dprint(f"  ⚠️ 第{rnd + 1}轮: 轨道行位置漂移，按当前可视位置重排"
                    f"（{len(rows)} 行，旧 ymid 不再作为判据）")
-
-        # ② 可视区外补偿：可检测行数少于预期轨道数 → 有轨道在视口外，先滚进来
-        if expected_tracks and len(rows) < expected_tracks:
-            dprint(f"  ⚠️ 可视行 {len(rows)} < 预期轨道 {expected_tracks} 条："
-                   f"有轨道在时间线视口外（不等于锁定），尝试多态滚动")
-            for direction in ('down', 'up'):
-                if len(rows) >= expected_tracks:
-                    break
-                rr = scroll_timeline_vertical(win, direction)
-                scroll_tried.append({'dir': direction, **rr})
-                if rr['ok']:
-                    rows, img, _, WT, _, eye_x = scan_tracks(win)
-                    tr = _safe_timeline_rect(win)
-                    rows, _d, img, WT = _reflow_rows(win, rows, tr)
-                    dprint(f"  滚动后可见 {len(rows)} 行（方向={direction}，模态={rr['mode']}）")
-            if len(rows) < expected_tracks:
-                scroll_unavailable = True
-                dprint(f"  ⚠️ 滚动补偿未凑满预期轨道（{len(rows)}/{expected_tracks}）："
-                       f"缺失的轨道无法判定是锁定还是不可见")
-
         if img is None:      # 轻量检测拿不到图时，退回一次整窗抓屏
             img, _sl0, _sh0 = _light_row_state(win, WL, WT, WW, WH, rows)
+            WT = get_window_rect(win)[1]
 
-        locked = [r['ymid'] for r in rows if is_row_locked(img, WT, r['ymid'])]
-        hidden = [r['ymid'] for r in rows if r['hidden']]
-        locked = [y for y in locked if _row_in_view(y, tr)]   # 视口外的行不点
-        hidden = [y for y in hidden if _row_in_view(y, tr)]
+        in_view = [r for r in rows if _row_in_view(r['ymid'], tr)]
+        locked = [r['ymid'] for r in in_view if is_row_locked(img, WT, r['ymid'])]
+        hidden = [r['ymid'] for r in in_view if r['hidden']]
 
-        if not locked and not hidden:
-            if rnd == 0:
-                dprint("  所有轨道均未锁定且可见")
-            break
-
-        # ③ 批量裸点解锁
         if locked:
             dprint(f"  解锁 {len(locked)} 行: {locked}")
             for y in locked:
                 op_mark('点击锁定', f'ymid={y} → 解锁 @({lock_x},{y}) 尝试1')
                 pyautogui.click(lock_x, y)
                 time.sleep(0.4)
-            time.sleep(0.8)  # 让剪映批量响应解锁
-
-        # ④ 批量裸点恢复可见
+            time.sleep(0.6)
+            total_unlocked += len(locked)
         if hidden:
             dprint(f"  恢复可见 {len(hidden)} 行: {hidden}")
-            for y in hidden:
+            for y in sorted(hidden, reverse=True):   # 下→上，避免行高变化带偏后续 y
                 op_mark('点击眼睛', f'ymid={y} → 恢复可见 @({eye_x},{y}) 尝试1')
                 pyautogui.click(eye_x, y)
                 time.sleep(0.4)
-            time.sleep(0.8)  # 让剪映批量响应恢复
+            time.sleep(0.6)
+            total_unhidden += len(hidden)
 
-        total_unlocked += len(locked)
-        total_unhidden += len(hidden)
+        # ② 轻量复检 + 本轮覆盖累计（点击后行可能漂移，先重排再判）
+        time.sleep(0.8)
+        rows, drifted, img, WT = _reflow_rows(win, rows, tr)
+        if drifted:
+            drift_rounds += 1
+            dprint("  ⚠️ 点击后行位置再次漂移，复检按新 y 重判")
+        if img is None:      # 没有可用图（拿不到时间线）→ 退回整窗抓屏直读
+            img, _sl1, _sh1 = _light_row_state(win, WL, WT, WW, WH, rows)
+            WT = get_window_rect(win)[1]
+        in_view = [r for r in rows if _row_in_view(r['ymid'], tr)]
+        still_locked = [r['ymid'] for r in in_view if is_row_locked(img, WT, r['ymid'])]
+        still_hidden = [r['ymid'] for r in in_view if r['hidden']]
+        clean_now = [r['ymid'] for r in in_view
+                     if r['ymid'] not in still_locked and r['ymid'] not in still_hidden]
+        covered.update(clean_now)
+        dprint(f"  第{rnd + 1}轮覆盖累计: 可视干净 {len(clean_now)} 行，"
+               f"累计 {len(covered)}/{expected_tracks or '?'} 行")
 
-        # ⑤ 轻量复检：每次都用重排后的新 y 判，避免拿旧 y 读新屏幕
-        time.sleep(1)
-        still_l = still_h = None
-        for _try in range(3):
-            rows, drifted, img, WT = _reflow_rows(win, rows, tr)
-            if drifted:
-                drift_rounds += 1
-                dprint("  ⚠️ 点击后行位置再次漂移，复检按新 y 重判")
-            if img is None:      # 没有可用图（拿不到时间线）→ 退回整窗抓屏直读
-                img, still_l, still_h = _light_row_state(win, WL, WT, WW, WH, rows)
-            else:
-                still_l = [r['ymid'] for r in rows
-                           if _row_in_view(r['ymid'], tr) and is_row_locked(img, WT, r['ymid'])]
-                still_h = [r['ymid'] for r in rows
-                           if _row_in_view(r['ymid'], tr) and r['hidden']]
-            if not still_l and not still_h:
-                break
-            time.sleep(1)
-        if not still_l and not still_h:
+        if still_locked or still_hidden:
+            dprint(f"  ⚠️ 复检未干净: 仍锁定={still_locked} 仍隐藏={still_hidden}，"
+                   f"下一轮重扫重试")
+            rows = None          # 下一轮用完整 scan_tracks 重扫
+            continue
+
+        if not expected_tracks:
+            # 读不到草稿轨道数：退化为旧判据（当前可视区干净即完成），不做无尽滚动
             clean_confirmed = True
-            rows = None          # 干净了，无需再扫
             break
-        dprint(f"  ⚠️ 轻量复检未干净: 仍锁定={still_l} 仍隐藏={still_h}，回退完整扫描重试")
-        rows = None              # 下一轮用完整 scan_tracks 重扫
+        if len(covered) >= expected_tracks:
+            clean_confirmed = True
+            break
+        if top_reached and bottom_reached:
+            break
 
-    # 最终验证：未被轻量复检明确确认干净时，必须完整扫描；扫不到行也不能判绿。
+        # ③ 边滚边清：朝还没走到的方向滚一屏，把视口外的轨道滚进来
+        direction = 'up' if bottom_reached else 'down'
+        pre_ymids = [r['ymid'] for r in rows]
+        rr = scroll_timeline_vertical(win, direction)
+        scroll_tried.append({'dir': direction, **rr})
+        if not rr['ok']:
+            if direction == 'down':
+                bottom_reached = True
+            else:
+                top_reached = True
+            dprint(f"  ⚠️ {direction} 方向滚不动（{rr.get('reason')}）→ 标记该端到底")
+            rows = None
+            continue
+        rows, img, _, WT, _, eye_x = scan_tracks(win)
+        tr = _safe_timeline_rect(win)
+        if not rows:
+            continue
+        shift = _estimate_vshift(pre_ymids, [r['ymid'] for r in rows])
+        if shift:
+            covered = {y + shift for y in covered}
+            dprint(f"  滚动后轨道整体位移 {shift:+d}px，已干净坐标同步平移")
+        else:
+            dprint("  ⚠️ 滚动后位移估计失败，已干净坐标不平移（可能低估覆盖）")
+
+    # 终验：循环内没明确确认干净时，必须完整扫描复检，扫不到行也不能判绿
     if not clean_confirmed:
         rows2, img2, _, WT2, _, _ = scan_tracks(win)
         tr = _safe_timeline_rect(win)
         if not rows2:
-            ok = False
             still_locked, still_hidden = [], []
             dprint("  ⚠️ 收尾终验未扫到轨道，无法确认干净")
         else:
             rows2, _d, img2, WT2 = _reflow_rows(win, rows2, tr)
-            still_locked = [r['ymid'] for r in rows2
-                            if _row_in_view(r['ymid'], tr) and is_row_locked(img2, WT2, r['ymid'])]
-            still_hidden = [r['ymid'] for r in rows2
-                            if _row_in_view(r['ymid'], tr) and r['hidden']]
-            if still_locked or still_hidden:
-                ok = False
-                dprint(f"  ⚠️ 收尾未干净: 仍锁定={still_locked} 仍隐藏={still_hidden}")
+            in_view = [r for r in rows2 if _row_in_view(r['ymid'], tr)]
+            still_locked = [r['ymid'] for r in in_view
+                            if is_row_locked(img2, WT2, r['ymid'])]
+            still_hidden = [r['ymid'] for r in in_view if r['hidden']]
+            covered.update(r['ymid'] for r in in_view
+                           if r['ymid'] not in still_locked and r['ymid'] not in still_hidden)
 
-    # 有轨道没被滚进可视区 → 无论可见部分多干净都不能判绿（看不见 ≠ 已解锁）
-    if scroll_unavailable:
-        ok = False
+    # 覆盖不足 = 有轨道始终没被滚进可视区/没被扫到（不是"锁定"，也不能判绿）
+    if expected_tracks and len(covered) < expected_tracks:
+        scroll_unavailable = True
+        dprint(f"  ⚠️ 覆盖不足：已确认干净 {len(covered)}/{expected_tracks} 条轨道，"
+               f"缺失轨道仍在可视区外或未被扫到（看不见 ≠ 已解锁）")
+
+    ok = not scroll_unavailable and not still_locked and not still_hidden
 
     # 结论分类：把"看不见"和"真锁着"分开
     if ok:
@@ -887,14 +967,16 @@ def restore_all_tracks(win, max_rounds=2, scan_hint=None, expected_tracks=None) 
         reason = 'unverified'
 
     if reason == 'clean':
-        dprint(f"  ✅ 收尾完成：解锁 {total_unlocked} 行、恢复可见 {total_unhidden} 行")
+        dprint(f"  ✅ 收尾完成：解锁 {total_unlocked} 行、恢复可见 {total_unhidden} 行，"
+               f"覆盖 {len(covered)}/{expected_tracks or '?'} 条轨道")
     elif reason == 'scroll_unavailable':
-        dprint("  ⚠️ 有轨道不在可视区，且滚轮/滚动条/键盘均无法滚动时间线："
+        dprint("  ⚠️ 有轨道不在可视区，且三种滚动模态都滚不到："
                "这是「看不见」，不能判成「锁定」；需人工滚动后复跑")
     return {'unlocked': total_unlocked, 'unhidden': total_unhidden, 'ok': ok,
             'reason': reason, 'still_locked': still_locked, 'still_hidden': still_hidden,
             'scroll_unavailable': scroll_unavailable, 'scroll_tried': scroll_tried,
-            'drift_rounds': drift_rounds}
+            'drift_rounds': drift_rounds, 'covered': sorted(covered),
+            'expected_tracks': expected_tracks}
 
 
 def hide_text_tracks_only(win) -> List[int]:

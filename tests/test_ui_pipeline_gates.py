@@ -49,6 +49,7 @@ def test_restore_last_light_failure_forces_full_scan_and_fails(monkeypatch):
         return [row], img, 0, 0, 200, 75
 
     monkeypatch.setattr(ui_track_ops, 'scan_tracks', dirty_scan)
+    monkeypatch.setattr(ui_track_ops, '_draft_track_count', lambda: 0)
     hint = ([row], img, 0, 0, 200, 75)
 
     result = ui_track_ops.restore_all_tracks(win, max_rounds=1, scan_hint=hint)
@@ -225,6 +226,7 @@ def test_scroll_all_modes_fail_is_reported(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError('模态不可用')
 
+    monkeypatch.setattr(ui_track_ops, '_SCROLL_ORDER_START', 0)
     monkeypatch.setattr(ui_track_ops, '_light_scan',
                         lambda _w: ([{'ymid': 100}], (0, 0, 500, 300), object(), 0, 0))
     monkeypatch.setattr(ui_track_ops, '_scroll_once', boom)
@@ -237,6 +239,10 @@ def test_scroll_all_modes_fail_is_reported(monkeypatch):
     assert r['reason'] == 'all_modes_failed'
     assert [t['mode'] for t in r['tried']] == ['keyboard', 'wheel', 'scrollbar']
     assert all(t['ok'] is False for t in r['tried'])
+
+    # 模态无固定优先级：全失败后起手索引后移，下一轮换 wheel 先试
+    r2 = ui_track_ops.scroll_timeline_vertical(win)
+    assert [t['mode'] for t in r2['tried']] == ['wheel', 'scrollbar', 'keyboard']
 
 
 def test_restore_marks_scroll_unavailable_instead_of_still_locked(monkeypatch):
@@ -282,6 +288,7 @@ def test_restore_reflows_stale_hint_before_unlock(monkeypatch):
                         lambda _w: ([dict(fresh)], (0, 0, 200, 900), img, 0, 0))
     monkeypatch.setattr(ui_track_ops, 'scan_tracks',
                         lambda _w: ([dict(fresh)], img, 0, 0, 200, 900))
+    monkeypatch.setattr(ui_track_ops, '_draft_track_count', lambda: 0)
     monkeypatch.setattr(ui_track_ops, 'is_row_locked',
                         lambda _img, _wt, ymid: int(ymid) == 603 and not clicks)
     monkeypatch.setattr(ui_track_ops.pyautogui, 'click',

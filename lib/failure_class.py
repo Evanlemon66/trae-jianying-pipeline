@@ -37,12 +37,14 @@ EXPORT_TIMEOUT = "export_timeout"  # 导出无进展超时（看门狗卡死）
 VERSION_DIALOG = "version_dialog"  # 版本更新/公告弹窗挡路
 ARTIFACTS_INCOMPLETE = "artifacts_incomplete"  # 导出返回成功但 mp4/封面/progress 不全
 VERIFY_FAILED = "verify_failed"    # 导出后质检（帧对齐）未通过
+TRACK_RESTORE_FAILED = "track_restore_failed"  # 轨道恢复失败（轨道在可视区外/点后仍脏）
 VERSION_UNSUPPORTED = "version_unsupported"  # 剪映版本不在支持范围（预检拒绝）
 UNKNOWN = "unknown"
 
 CATEGORIES = (UI_HANG, WINDOW_MISSING, WINDOW_ACTIVATE_TIMEOUT, LAUNCH_FAILED,
               ASSET_MISSING, DISK_FULL, EXPORT_TIMEOUT, VERSION_DIALOG,
-              ARTIFACTS_INCOMPLETE, VERIFY_FAILED, VERSION_UNSUPPORTED, UNKNOWN)
+              ARTIFACTS_INCOMPLETE, VERIFY_FAILED, TRACK_RESTORE_FAILED,
+              VERSION_UNSUPPORTED, UNKNOWN)
 
 # 跨轮重拉只对"拉起本身失败"生效：这类失败与草稿/素材无关，重新拉起有实质意义。
 # 由 robust_auto_export 在实例管理器 launch() 返回 died/timeout 时打 `[launch_failed:`
@@ -75,6 +77,9 @@ STRATEGY = {
     # 导出成功但产物不全 / 质检（帧对齐）不过：可重试，按退避重导；连续失败会暂停
     ARTIFACTS_INCOMPLETE: {"retryable": True, "action": RESTART, "counts": True},
     VERIFY_FAILED: {"retryable": True, "action": RESTART, "counts": True},
+    # 轨道恢复失败（可视区外/解锁或恢复可见后复检仍脏）：不是导出本身的问题，
+    # 准入可重跑；重启回首页后重新定位轨道再试，不能落 unknown 静默放弃。
+    TRACK_RESTORE_FAILED: {"retryable": True, "action": RESTART, "counts": True},
     # 版本不符是环境问题：重试不会改变版本，直接拒绝并提示支持版本
     VERSION_UNSUPPORTED: {"retryable": False, "action": REFUSE_LAUNCH, "counts": False},
     UNKNOWN:        {"retryable": True,  "action": RESTART,       "counts": True},
@@ -112,6 +117,13 @@ def classify(error: Optional[str], phase: Optional[str] = None) -> tuple[str, st
     #     必须先于「未找到 / 超时」等宽泛关键词，否则会被误判成可重试的 ui_hang。
     if _has(e, "版本预检不通过", "不会静默拉起其它版本", "仅支持剪映"):
         return VERSION_UNSUPPORTED, STRATEGY[VERSION_UNSUPPORTED]["action"]
+
+    # 0.6 轨道恢复失败（轨道在时间线可视区外 / 解锁或恢复可见后复检仍脏）：
+    #     准入轨道整理阶段的专属失败，必须在「超时/未找到/窗口」等宽泛规则前命中，
+    #     否则会落到 unknown 或误判成 ui_hang。
+    if _has(e, "恢复轨道失败", "可视区外", "无法判定是锁定还是不可见",
+            "轨道锁定或隐藏"):
+        return TRACK_RESTORE_FAILED, STRATEGY[TRACK_RESTORE_FAILED]["action"]
 
     # 1. 磁盘不足：不可重试，拒绝启动
     if _has(e, "磁盘空间不足", "磁盘不足", "空间不足", "no space", "ENOSPC"):

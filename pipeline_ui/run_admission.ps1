@@ -14,8 +14,19 @@ $logDir = Join-Path $here 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir ('admission_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
 
-& $Python (Join-Path $here 'admission_test.py') --stop-after $StopAfter 2>&1 |
-    Tee-Object -FilePath $log
-$code = $LASTEXITCODE
-"EXITCODE=$code  LOG=$log" | Tee-Object -FilePath $log -Append
+# python 把日志写到 stderr 时，PowerShell 会把它包成 ErrorRecord；在
+# $ErrorActionPreference='Stop' 下这条记录会升级为终止错误，脚本在写入
+# EXITCODE= 之前就退出（上一轮日志缺 EXITCODE 行的原因）。所以调用期间降级为
+# Continue，并放进 try/finally 保证末尾一定写 EXITCODE。
+$code = 1
+try {
+    $ErrorActionPreference = 'Continue'
+    & $Python (Join-Path $here 'admission_test.py') --stop-after $StopAfter 2>&1 |
+        Tee-Object -FilePath $log
+    if ($null -ne $LASTEXITCODE) { $code = [int]$LASTEXITCODE }
+} catch {
+    "PIPELINE_ERROR=$($_.Exception.Message)" | Tee-Object -FilePath $log -Append
+} finally {
+    "EXITCODE=$code  LOG=$log" | Tee-Object -FilePath $log -Append
+}
 exit $code
