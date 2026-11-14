@@ -235,7 +235,7 @@ def test_scroll_all_modes_fail_is_reported(monkeypatch):
 
     assert r['ok'] is False
     assert r['reason'] == 'all_modes_failed'
-    assert [t['mode'] for t in r['tried']] == ['wheel', 'scrollbar', 'keyboard']
+    assert [t['mode'] for t in r['tried']] == ['keyboard', 'wheel', 'scrollbar']
     assert all(t['ok'] is False for t in r['tried'])
 
 

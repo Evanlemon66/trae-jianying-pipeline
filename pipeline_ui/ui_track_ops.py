@@ -581,7 +581,8 @@ def _light_row_state(win, WL, WT, WW, WH, rows):
 
 
 # ============ 可视区判定 + 多态纵向滚动 ============
-SCROLL_MODES = ('wheel', 'scrollbar', 'keyboard')
+# 键盘优先：本机实测 wheel / scrollbar 均无位移，PageUp/PageDown 才真正能滚动时间线
+SCROLL_MODES = ('keyboard', 'wheel', 'scrollbar')
 
 
 def _safe_timeline_rect(win):
@@ -665,7 +666,7 @@ def _scroll_once(win, direction, mode, tr):
 
 def scroll_timeline_vertical(win, direction='down', modes=SCROLL_MODES) -> dict:
     """
-    多态纵向滚动时间线：滚轮 → 拖滚动条 → 键盘 PageUp/PageDown。
+    多态纵向滚动时间线：键盘 PageUp/PageDown（主力）→ 滚轮 → 拖滚动条（兜底）。
     down=看下方轨道，up=看上方轨道。
     每个模态执行后对比亮度行检测的 y 集合：真的动了才算生效，没动记为该模态不可用。
     返回 {'ok','mode','tried','reason'}；不可用时 reason 明确（no_timeline_rect /
