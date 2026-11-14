@@ -2,7 +2,7 @@
 
 > 状态：全部完成（2026-11-14），整仓 282 passed / 1 warning。
 
-前置：spec 见 [spec.md](file:///d:/剪映5.9/剪映5.9版+jianying-skill/国内用户下载这个（trae+skill）/trae-jianying-skill/specs/r04-r05-fail-closed/spec.md)
+前置：spec 见 [spec.md](spec.md)
 
 ## T1 R04 白名单唯一实现
 - [x] 新增 `pipeline/restore_backups.py`：`EXACT_BACKUP_NAMES`、`BACKUP_DIR_NAMES`、

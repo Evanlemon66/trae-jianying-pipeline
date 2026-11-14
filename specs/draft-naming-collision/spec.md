@@ -124,7 +124,7 @@ N3 视是否仍使用 `--all-stream` 决定，若使用则必须改。
 2. `find_stream_draft("X")` 对库中不存在严格前缀重叠的剧名，返回唯一且等于基础草稿（非 `_b`）。
 3. `rebase_presets.py --profile B` 与 `--profile b` 生成同名目录 `..._b`，`_profile_of_draft` 返回 `b`。
 4. `series_runner --mode export --all-stream` 清单中不出现 `_b`/`_c` 克隆（除非显式要求包含）。
-5. 静态检查：`python -m py_compile` 通过相关文件；不新增对 `pipeline/presets.json` 与 `D:\短剧` job 数据的写入。
+5. 静态检查：`python -m py_compile` 通过相关文件；不新增对 `pipeline/presets.json` 与 `<剧集根>` job 数据的写入。
 
 ## 5. 待批准项
 

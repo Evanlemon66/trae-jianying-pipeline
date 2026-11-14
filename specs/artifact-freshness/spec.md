@@ -1,7 +1,7 @@
 # 产物新鲜度（Artifact Freshness）规格
 
 > 状态：设计已批准，本文件只写规格，未改动任何代码。
-> 实施边界：只改仓库内代码；不读写 `D:\短剧` 下的 job 数据（除用户显式指定 job 运行 `check`）；不碰正在跑的 A 版 edit→export；不自动重导、不自动归档。
+> 实施边界：只改仓库内代码；不读写 `<剧集根>` 下的 job 数据（除用户显式指定 job 运行 `check`）；不碰正在跑的 A 版 edit→export；不自动重导、不自动归档。
 
 ## 0. 模型
 
@@ -281,11 +281,11 @@ E1 输出：草稿的 `canon_draft()` 强摘要 + `weak_hash`，加草稿目录�
 
 ```bash
 # 我知道我改过（或我知道这版不能用）
-python pipeline/freshness.py --job "D:\短剧\<剧>\cover_job" \
+python pipeline/freshness.py --job "<剧集根>\<剧>\cover_job" \
   --edge all --mark-stale --reason "手工拖了第 12 集的片段"
 
 # 确认这版能用，把 unknown/stale 直接变 valid
-python pipeline/freshness.py --job "D:\短剧\<剧>\cover_job" \
+python pipeline/freshness.py --job "<剧集根>\<剧>\cover_job" \
   --edge e1 --reuse-as-is
 ```
 
@@ -436,7 +436,7 @@ def main(argv=None) -> int                    # CLI
 - 不改 `stage` 语义、`STAGES`、`export_state` 状态机。
 - 不改 `pipeline.py` 的预设合并逻辑（复合片段 duration 是另一案）。
 - 不引入新依赖；PIL 仅作可选加速，缺失时退回字节 hash。
-- 不动 `D:\短剧` 下任何 job 文件；测试全部用临时目录。
+- 不动 `<剧集根>` 下任何 job 文件；测试全部用临时目录。
 
 ## 11. 验收
 
@@ -453,7 +453,7 @@ def main(argv=None) -> int                    # CLI
    `draft_cover.jpg` 单独被改 → 仍 valid；`derived.covers_stale=true` → stale(covers_pending_regeneration)。
 10. **联动**：`_framefix_draft.py` 改草稿并记录 → E1 valid、E2 自动 stale；重导后 E2 valid。
 11. **总开关**：`JY_FRESHNESS=0` 时全部 unknown，watcher 行为与改动前一致。
-12. **无副作用**：测试不产生对 `D:\短剧`、`D:\油管打猎` 的任何写入。
+12. **无副作用**：测试不产生对 `<剧集根>`、`<导出根>` 的任何写入。
 13. **归档**：有 sidecar 的 valid 版本、故意改坏的 stale 版本、无 sidecar 的 legacy 版本——
     三种都允许归档；snapshot 分别标 `valid` / `stale` / `legacy`；sidecar 随 mp4 一起搬走。
 14. **clean**：三种状态都允许删除；墓碑分别记 `valid` / `stale(reason)` / `legacy`，
@@ -523,7 +523,7 @@ freshness_of(job_dir, version, consumer="scheduler")
 - 判定顺序固定为：sidecar → E2 `valid` → E2 `stale` → **基线命中 → `legacy(reason=baseline)`**
   → 否则 `evidence_missing`。
 - 基线文件：`data/freshness_legacy_baseline.json`（可用 `JY_FRESHNESS_BASELINE` 覆盖路径）。
-  只由 `python scripts/freshness_baseline.py --root D:\短剧 --write` 生成；
+  只由 `python scripts/freshness_baseline.py --root <剧集根> --write` 生成；
   再次生成必须显式 `--append`（只增不删）或 `--force`（整份覆盖）。
 - 命中条件：`job_id`（优先）或归一化 job 目录 + 版本 + 成品 `size_bytes` 三者一致。
   size 变了视为「上线后重导过」，不再命中。

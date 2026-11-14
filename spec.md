@@ -1,6 +1,6 @@
 # Spec：无字幕策略「跑完 + 清单 + 导出前拦」（v2）
 
-范围：只实现无字幕策略；不跑这部剧、不启 watcher、不动 `D:\短剧` 数据。
+范围：只实现无字幕策略；不跑这部剧、不启 watcher、不动 `<剧集根>` 数据。
 
 v2 相对 v1 补齐的决策点：`job_dir` 显式传递（不再只靠向上查找）、内存兜底拦截（job.json 缺失时也不导出）、通知集中到单一模块且进程内去重、`series_runner` 被拦后的状态与通知、`robust_auto_export.py` 直调入口也设闸门、watcher 日志去重、导出闸门与 `.export_state.json` 的一致性。
 
@@ -230,7 +230,7 @@ def subtitle_gate(draft_name, roots=None) -> list[int]
 ## 5. 验收
 
 ```powershell
-cd "d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill"
+cd "<repo>"
 python tests\test_subtitle_missing.py
 python tests\test_export_gate.py
 python tests\test_subtitle_missing_notify.py
@@ -244,4 +244,4 @@ Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }
 - 不自动重试缺字幕集；不改 ASR 候选链 / GPU / watcher 心跳与指纹。
 - 不改 `--phase export` 语义，不给 watcher 加通知。
 - 不重构 batch_runner / series_runner / robust_auto_export 的其他流程。
-- 不写 `D:\短剧`，不启动 watcher，不导出。
+- 不写 `<剧集根>`，不启动 watcher，不导出。

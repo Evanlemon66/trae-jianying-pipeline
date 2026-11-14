@@ -47,7 +47,7 @@
 ### D2（必须改）`Step 10.9` 是基础版唯一补 composition 的位置，且可被异常跳过
 - 位置：`pipeline/pipeline.py` L3322-3343（`if cover_image or cover_extract_from_video:` → `set_cover_composition` + `save_draft` + `set_draft_cover`）。
 - 跳过路径：Step 10.8「残缺集自动补翻 + 复验」失败即 `raise`（L3275-3320；raise 点 L3286、L3308、L3316），Step 10.9 永不执行。
-- 实跑证据：`D:\短剧\八零猎王：赶山捕兽遇旺妻\cover_job\06_publish\pipeline.log` L3991 已发布草稿 → L4012 进入 10.8 → L4014 补翻脚本 rc=1（ollama 不可达）→ L4028 终检未过 → L4029-4036 RuntimeError（栈顶为 pipeline.py `run_pipeline`）。全日志只有 L176 的 `设置草稿封面: cover_image=...cover_04_vertical.png`（L2794 的 print），没有 `设置草稿封面(导出前原子落盘)`。
+- 实跑证据：`<剧集根>\八零猎王：赶山捕兽遇旺妻\cover_job\06_publish\pipeline.log` L3991 已发布草稿 → L4012 进入 10.8 → L4014 补翻脚本 rc=1（ollama 不可达）→ L4028 终检未过 → L4029-4036 RuntimeError（栈顶为 pipeline.py `run_pipeline`）。全日志只有 L176 的 `设置草稿封面: cover_image=...cover_04_vertical.png`（L2794 的 print），没有 `设置草稿封面(导出前原子落盘)`。
 - 结果：A 草稿 `cover=null`、`Resources/cover` 不存在、`draft_cover.jpg` 在导出时被首帧覆盖（32,461 B，07:36:14）。
 
 ### D3（必须改）edit 失败不阻断 export：草稿存在即放行
@@ -136,7 +136,7 @@
 
 ## 6. 已导出成品的处理
 
-- 默认不动：A 版 `D:\油管打猎\L\八零猎王：赶山捕兽遇旺妻_第01-142集串流\` 保持现状。
+- 默认不动：A 版 `<导出根>\八零猎王：赶山捕兽遇旺妻_第01-142集串流\` 保持现状。
 - 若要求补齐：`python lib/cover_watch.py reopen --job "<cover_job>" --yes`（L1962 起）退回 `covers_ready` 后重导 A；重导前必须先满足选项 1，否则仍会缺封面。
 - 不允许「只把 04_covers 的竖版图复制成 `-封面.jpg`」了事：那会与剪映实际渲染的封面不一致，且 `progress.cover` 仍为空，不满足判据 2/5。
 

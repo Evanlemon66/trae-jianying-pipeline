@@ -2,7 +2,7 @@
 
 > 状态：全部完成（用户确认 `full` 复用重测结束后实施），整仓 319 passed / 1 warning。
 
-前置：[spec.md](file:///d:/剪映5.9/剪映5.9版+jianying-skill/国内用户下载这个（trae+skill）/trae-jianying-skill/specs/watcher-script-parity/spec.md)
+前置：[spec.md](spec.md)
 
 ## T1 `_output_exists` 加 stale 判断
 - [x] `pipeline/series_runner.py` 引入 `pipeline as jp`。

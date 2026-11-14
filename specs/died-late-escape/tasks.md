@@ -2,7 +2,7 @@
 
 > 状态：全部完成（2026-11-14），整仓 269 passed。第二层暂缓。
 
-前置：spec 见 [spec.md](file:///d:/剪映5.9/剪映5.9版+jianying-skill/国内用户下载这个（trae+skill）/trae-jianying-skill/specs/died-late-escape/spec.md)
+前置：spec 见 [spec.md](spec.md)
 
 ## T1 进程存活辅助与等待循环抽取
 - [x] `robust_auto_export.py` 新增 `_proc_alive(exporter)`（异常按 True）。

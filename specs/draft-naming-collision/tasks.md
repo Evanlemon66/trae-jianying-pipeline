@@ -27,4 +27,4 @@
 ## T6 静态验证（不跑导出、不动 job 数据）
 - [ ] `python -m py_compile lib/cover_watch.py pipeline/series_runner.py pipeline/export_config.py pipeline/preset_ops.py`
 - [ ] 只读跑 `build_plan` 对 5 种结构：A+B / 仅 A / A+B+C / B 组缺图 / 缺 `presets_b`
-- [ ] 确认 `pipeline/presets.json` 与 `D:\短剧` 无写入
+- [ ] 确认 `pipeline/presets.json` 与 `<剧集根>` 无写入

@@ -1,7 +1,7 @@
 # 分阶段重跑（Stage Rerun）规格
 
 > 状态：**只写规格，不改代码**。落地等 A 线退出后再议；本轮不动 `pipeline.py`、ingest 判定、`batch_runner`。
-> 边界：不改 `pipeline/presets.json`、不动 `D:\短剧` 数据、不启停剪映和 watcher。
+> 边界：不改 `pipeline/presets.json`、不动 `<剧集根>` 数据、不启停剪映和 watcher。
 
 ## 0. 要解决的问题
 

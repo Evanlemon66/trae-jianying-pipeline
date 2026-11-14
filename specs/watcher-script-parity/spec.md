@@ -1,7 +1,7 @@
 # spec — series_runner fail-closed 补丁
 
 > 状态：**已实施**（用户确认 `full` 复用重测结束后落码），整仓 319 passed / 1 warning。
-> 对照依据：[docs/watcher-vs-script-parity.md](file:///d:/剪映5.9/剪映5.9版+jianying-skill/国内用户下载这个（trae+skill）/trae-jianying-skill/docs/watcher-vs-script-parity.md)
+> 对照依据：[docs/watcher-vs-script-parity.md](../../docs/watcher-vs-script-parity.md)
 
 ## 背景
 
