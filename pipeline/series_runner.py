@@ -43,6 +43,7 @@ from export_config import export_mp4_path, get_export_dir  # noqa: E402
 import export_config as pc  # noqa: E402
 import job_manifest as jm  # noqa: E402
 import subtitle_guard  # noqa: E402
+import export_guard as eg  # noqa: E402  # 导出链守卫（与 watcher / 直调同口径）
 import export_lock  # noqa: E402  # 全局导出锁：脚本导出与 watcher 互斥
 import pipeline as jp  # noqa: E402  # 导出失效标记 / 草稿目录解析
 import freshness  # noqa: E402  # E2 成品新鲜度（sidecar + 版本槽）
@@ -53,6 +54,7 @@ BATCH_RUNNER = os.path.join(_HERE, "batch_runner.py")
 AUTO_EXPORTER = os.path.join(
     _ROOT, ".trae", "skills", "jianying-editor", "examples", "robust_auto_export.py"
 )
+VERIFY_SCRIPT = os.path.join(_HERE, "verify_export.py")
 JY_DRAFT_ROOT = pc.get_projects_root()
 # 各模式部间默认间隔（秒）：generate 不碰剪映零等待；export 留 60s 回首页；full 120s
 _MODE_DEFAULT_RESET = {"full": 120, "generate": 0, "export": 60}
@@ -431,6 +433,26 @@ def _run_export_locked(draft_name: str, timeout: float = 1800, *,
             return False
     out_mp4 = export_mp4_path(draft_name)
     out_dir = os.path.dirname(out_mp4)
+    # 前置守卫（与 watcher 同源）：崩溃回收 → 配置覆盖 → 旧成品归档。
+    # 直调（无 job 上下文）时这三项没有落点，必须显式声明跳过，不能静默略过。
+    if job_dir:
+        if eg.reap_stale(job_dir, progress_ts=eg.progress_mtime(out_mp4)):
+            print("  ♻️ 真源回收：上次导出心跳超时（stale），转重试")
+        try:
+            eg.apply_job_config(job_dir, log=lambda m: print(f"  {m}"))
+        except Exception as e:
+            print(f"  ⛔ export_config 失败: {e}")
+            return False
+        if os.path.isfile(out_mp4) and jp.export_is_stale(os.path.join(_draft_root(), draft_name)):
+            try:
+                moved = eg.archive_stale_outputs(out_mp4)
+            except Exception as e:
+                print(f"  ⛔ 旧成品归档失败 {draft_name}: {e}")
+                return False
+            for s, d in moved:
+                print(f"  🧹 旧成品归档: {os.path.basename(s)} → {os.path.basename(d)}")
+    else:
+        print("  ℹ️ 无 job 上下文，跳过 reap / 配置覆盖 / 归档旧产物")
     # 只建父目录：剧名目录留给剪映自己创建，否则剪映会把成品写进「剧名(1)」
     os.makedirs(os.path.dirname(out_dir), exist_ok=True)
     _preclean_bundles(draft_name, out_dir)
@@ -449,7 +471,10 @@ def _run_export_locked(draft_name: str, timeout: float = 1800, *,
         logf.write(f"out: {out_mp4}\n")
         logf.flush()
         started = time.time()
-        proc = subprocess.Popen(cmd, cwd=_ROOT, env=hidden_child_env(),
+        child_env = hidden_child_env()
+        # 收尾守卫由本层统一执行，子进程不再重复跑一遍（避免二次质检）
+        child_env["JY_GUARD_PARENT"] = "1"
+        proc = subprocess.Popen(cmd, cwd=_ROOT, env=child_env,
                                 creationflags=NO_WINDOW,
                                 stdin=subprocess.DEVNULL,
                                 stdout=logf, stderr=subprocess.STDOUT)
@@ -476,6 +501,15 @@ def _run_export_locked(draft_name: str, timeout: float = 1800, *,
         # 复用前提：上一份确实导出完成（子进程 rc=0 且成品已落盘）才切下一份。
         if not os.path.isfile(out_mp4):
             print(f"  ⚠️ 导出子进程成功但成品未落盘: {out_mp4}")
+            return False
+        # 收尾守卫（4/5/6）：三件套 → 质检 → 收尾证据。直调时 job_dir=None，
+        # 只跑这三项，不碰 job.json（前置三项已在上面显式声明跳过）。
+        res = eg.gate_after_export(draft_name, out_mp4, job_dir=job_dir,
+                                   started_at=started, verify_script=VERIFY_SCRIPT,
+                                   creationflags=NO_WINDOW,
+                                   log=lambda m: print(f"  {m}"))
+        if not res["ok"]:
+            print(f"  ⛔ 导出后校验未通过（{res['failure_class']}）: {res['brief']}")
             return False
     else:
         # 失败也要清掉本轮重试产生的「剧名(1)/(2)…」，保证目录只剩一个

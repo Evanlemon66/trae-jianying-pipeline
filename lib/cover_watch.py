@@ -71,6 +71,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pipeline"))
 import job_manifest as jm  # noqa: E402
 import export_lock  # noqa: E402
+import export_guard as eg  # noqa: E402  # 导出链守卫（与 UI/通知解耦，三入口共用）
 import export_state as es  # noqa: E402  # 导出状态机单一真源（.export_state.json）
 import edit_state as eds  # noqa: E402  # edit 阶段失败退避/暂停（.edit_state.json）
 import state_io as _sio  # noqa: E402  # 状态文件公共读写（只读查看用）
@@ -691,65 +692,9 @@ def _profile_of_draft(base_draft: str, draft_name: str) -> str:
     return suffix
 
 
-def _artifact_paths(draft_name: str) -> dict[str, str]:
-    """成品三件套路径（与 pipeline.archive_stale_outputs / series_runner 同口径）。"""
-    out = pc.export_mp4_path(draft_name)
-    out_dir = os.path.dirname(os.path.abspath(out))
-    return {"mp4": out,
-            "封面": os.path.join(out_dir, f"{draft_name}-封面.jpg"),
-            "progress": out + ".progress.json"}
-
-
-def _progress_side_path(draft_name: str) -> str:
-    """导出运行中的进度侧写（成品目录同级），完成后会被 robust_auto_export 删除。"""
-    out = pc.export_mp4_path(draft_name)
-    out_dir = os.path.dirname(os.path.abspath(out))
-    return os.path.join(os.path.dirname(out_dir), os.path.basename(out_dir) + ".progress.json")
-
-
 def _missing_artifacts(draft_name: str, *, strict_progress: bool = False) -> list[str]:
-    """成品三件套缺失项（mp4 / -封面.jpg / progress）。
-
-    strict_progress=True 只认成品目录内那份（mp4.progress.json）：导出成功收尾一定
-    会写它并删侧写，用于"导出后判成败"；冲突巡检放宽到侧写，避免历史成品误报。
-    """
-    paths = _artifact_paths(draft_name)
-    missing = [k for k in ("mp4", "封面") if not os.path.isfile(paths[k])]
-    progress_ok = os.path.isfile(paths["progress"]) or (
-        not strict_progress and os.path.isfile(_progress_side_path(draft_name)))
-    if not progress_ok:
-        missing.append("progress")
-    return missing
-
-
-def _success_evidence_missing(mp4: str, started_at: float | None = None) -> list[str]:
-    """完成收尾前的硬证据：正式名 mp4 真在（且是本轮产物）+ 旁 progress 的 done 为真。
-
-    导出过程中文件是 `<UUID>.mp4`，收尾 `--move` 才改成草稿名。因此只认正式名
-    路径，并额外用 mtime 排除"旧成品/旧 progress 冒充本轮结果"。
-    """
-    if not os.path.isfile(mp4):
-        return ["mp4(正式名未出现)"]
-    try:
-        st = os.stat(mp4)
-    except OSError:
-        return ["mp4(不可 stat)"]
-    if st.st_size <= 0:
-        return ["mp4(空文件)"]
-    if started_at is not None and st.st_mtime < started_at - 2:
-        return ["mp4(旧文件：正式名本轮未更新)"]
-    pj = mp4 + ".progress.json"
-    if not os.path.isfile(pj):
-        return ["progress"]
-    try:
-        with open(pj, encoding="utf-8") as f:
-            rec = json.load(f)
-        pst = os.stat(pj)
-    except (OSError, ValueError):
-        return ["progress(不可解析)"]
-    if started_at is not None and pst.st_mtime < started_at - 2:
-        return ["progress(非本轮)"]
-    return [] if rec.get("done") is True else ["progress.done!=true"]
+    """成品三件套缺失项（实现收在 lib/export_guard.py，三入口共用同一口径）。"""
+    return eg.missing_artifacts(draft_name, strict_progress=strict_progress)
 
 
 def _output_conflicts(job: dict[str, Any], base_draft: str,
@@ -1555,14 +1500,8 @@ def _plan_line(plan: dict[str, Any]) -> str:
 # ── export_config（旧版一句话偏好，保持兼容）─────────────────────
 
 def _read_export_config(job_dir: str) -> dict[str, Any]:
-    p = os.path.join(job_dir, EXPORT_CONFIG_NAME)
-    if not os.path.isfile(p):
-        return {}
-    with open(p, encoding="utf-8-sig") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
-        raise ValueError(f"{EXPORT_CONFIG_NAME} 应为 JSON 对象")
-    return data
+    """读 export_config.json（非法 JSON / 非对象抛错；实现收在 lib/export_guard.py）。"""
+    return eg.read_export_config(job_dir)
 
 
 def _read_start_ep(job_dir: str) -> int:
@@ -1590,41 +1529,11 @@ def _read_start_ep(job_dir: str) -> int:
 
 
 def apply_export_config(job_dir: str) -> Optional[list[str]]:
-    """旧版 export_config.json：cut_s 写 job.json、derive 返回覆盖列表（可空）。"""
-    cfg = _read_export_config(job_dir)
-    if not cfg:
-        return None
-    applied: list[str] = []
-    cut = cfg.get("cut_s")
-    if cut is not None:
-        if isinstance(cut, bool) or not isinstance(cut, (int, float)) or cut <= 0:
-            raise ValueError(f"export_config.cut_s 应为正数秒: {cut!r}")
-        job = jm.load_job(os.path.join(job_dir, "job.json"))
-        if (job.get("video") or {}).get("cut_s") != cut:
-            jm.update_job(job_dir, {"video": {"cut_s": cut}},
-                          event="export_config", detail=f"cut_s={cut}")
-        applied.append(f"cut_s={cut}")
-    derive_override: Optional[list[str]] = None
-    if "derive" in cfg:
-        raw = cfg.get("derive")
-        if raw is None or raw == [] or (isinstance(raw, str) and raw.strip().lower() in ("", "none")):
-            derive_override = []
-        else:
-            names = [raw] if isinstance(raw, str) else list(raw)
-            if any(str(n).strip().lower() == "all" for n in names):
-                derive_override = list(jm.DERIVE_PRESETS)
-            else:
-                derive_override = []
-                for n in names:
-                    key = jm.DERIVE_ALIASES.get(str(n).strip().lower(), str(n).strip().lower())
-                    if key not in jm.DERIVE_PRESETS:
-                        raise ValueError(f"export_config.derive 未知平台: {n}")
-                    if key not in derive_override:
-                        derive_override.append(key)
-        applied.append(f"derive={derive_override if derive_override else '不派生'}")
-    if applied:
-        _log(job_dir, "export_config: " + ", ".join(applied))
-    return derive_override
+    """旧版 export_config.json：cut_s 写 job.json、derive 返回覆盖列表（可空）。
+
+    实现收在 lib/export_guard.py（子进程也要用）；日志仍写本 job 的 watcher.log。
+    """
+    return eg.apply_job_config(job_dir, log=lambda m: _log(job_dir, m))
 
 
 # ── 阶段执行 ──────────────────────────────────────────────
@@ -2224,52 +2133,11 @@ def run_clone(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
 def _run_verify(script: str, draft_name: str, mp4_path: str, job_dir: str) -> tuple[int, str]:
     """调用导出后质检脚本，返回 (rc, 明细日志路径)。
 
-    watcher 由 pythonw 托管、没有控制台：子进程若继承空 stdout，
-    verify_export.py 里的 sys.stdout.reconfigure / print 会直接抛异常，
-    导致质检恒 rc=1 且没有任何明细。这里把子进程 stdout/stderr 显式落到
-    06_publish/verify.log，既是真实质检结论，也保留可回溯的明细。
+    实现收在 lib/export_guard.py（三入口共用）；子进程 stdout/stderr 仍落到
+    06_publish/verify.log，pythonw 托管下也有可回溯的质检明细。
     """
-    log_dir = os.path.join(job_dir, "06_publish")
-    log_path = os.path.join(log_dir, "verify.log")
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8", errors="replace") as logf:
-            logf.write(f"\n===== {jm.now_iso()} {draft_name} =====\n")
-            logf.flush()
-            rc = subprocess.call([sys.executable, script, draft_name, mp4_path],
-                                 cwd=os.path.dirname(script),
-                                 stdout=logf, stderr=subprocess.STDOUT,
-                                 creationflags=NO_WINDOW)
-        return rc, log_path
-    except OSError as e:
-        _log(job_dir, f"verify 启动失败: {e}")
-        return 2, log_path
-
-
-def _verify_failure_brief(vlog: str, rc: int) -> str:
-    """verify 未通过：退出码 + 结论行/漂移数值（给 job.video.last_edit_error 同级的
-    失败原因用，必须带数值，不能只说"质检没过"）。"""
-    try:
-        with open(vlog, encoding="utf-8", errors="replace") as f:
-            data = f.read()[-8192:]
-    except OSError:
-        return f"verify rc={rc}（明细日志不可读: {vlog}）"
-    marker = data.rfind("=====")
-    if marker >= 0:
-        data = data[marker:]
-    picked: list[str] = []
-    for line in data.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if (s.startswith("帧级漂移:") or s.startswith("字幕帧位:")
-                or "δ_v=" in s or s.startswith("❌")):
-            if s not in picked:
-                picked.append(s)
-    base = f"verify rc={rc}（明细 {vlog}）"
-    if not picked:
-        return base
-    return base + "｜" + " ⏎ ".join(x[:200] for x in picked[-4:])
+    return eg.run_verify(script, draft_name, mp4_path, job_dir,
+                         creationflags=NO_WINDOW, log=lambda m: _log(job_dir, m))
 
 
 def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
@@ -2306,7 +2174,7 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
     _log(job_dir, "export start")
     # 崩溃恢复（不假设优雅退出）：上次 exporting 且心跳超时 → 回收为 retrying 再走本轮
     pm, _, _ = _progress_info(out_mp4)
-    if es.reap_stale(job_dir, progress_mtime=pm):
+    if eg.reap_stale(job_dir, progress_ts=pm):
         _log(job_dir, "真源回收：上次导出心跳超时（stale），转重试")
     try:
         legacy_override = apply_export_config(job_dir)
@@ -2374,7 +2242,7 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
             # 不覆盖、也不与新成品混为一谈。任一改名失败整组回滚并硬失败。
             if os.path.isfile(one_out) and jp.export_is_stale(os.path.join(_draft_root(), dn)):
                 try:
-                    moved = jp.archive_stale_outputs(one_out)
+                    moved = eg.archive_stale_outputs(one_out)
                 except Exception as e:
                     brief = _exception_brief(e, where="archive_stale")
                     _log(job_dir, f"旧成品归档失败 {dn}: {brief}")
@@ -2444,50 +2312,26 @@ def run_export(job_dir: str, plan: dict[str, Any], cfg: dict[str, Any],
                 es.record_recovery(job_dir, _read_progress_recovery(one_out))
                 toast("❌ 导出失败", f"{name} {dn}（{p_class}）", icon="error")
                 return False
-            # 闸门④（产物三件套）：导出返回成功但 mp4/封面/progress 缺任一件 →
-            # 该版本判失败：不 verify、不 record、不 succeed、不写 exported。
-            missing_art = _missing_artifacts(dn, strict_progress=True)
-            if missing_art:
-                brief = f"导出返回成功但产物不全：缺 {', '.join(missing_art)}（{one_out}）"
-                _log(job_dir, f"export 判失败 {idx}/{len(targets)}: {dn}｜{brief}")
-                note_export_result(job_dir, name, False,
-                                   pause_after=int(cfg.get("retry_pause_after",
-                                                           RETRY_PAUSE_AFTER)),
-                                   error=brief, failure_class="artifacts_incomplete",
-                                   retryable=True, phase="export", profile=prof)
-                toast("❌ 导出产物不全（按失败处理）", f"{name} {dn}：缺 {', '.join(missing_art)}",
-                      icon="error")
-                return False
-            # 逐份质检（与 batch_runner 默认行为一致；--no-verify 关闭）
+            # 闸门④⑤⑥（三件套 → 质检 → 收尾证据）收在 export_guard，与
+            # series_runner / 直调共用同一口径；这里只负责登记失败与通知。
             es.heartbeat(job_dir, phase="verify", profile=prof)
-            if verify and os.path.isfile(verify_script):
-                _log(job_dir, f"verify start {idx}/{len(targets)}: {dn}")
-                rc, vlog = _run_verify(verify_script, dn, one_out, job_dir)
-                _log(job_dir, f"verify rc={rc} {idx}/{len(targets)}: {dn}（明细 {vlog}）")
-                if rc != 0:
-                    # 闸门⑤（帧对齐 = 发布门槛）：verify 不过（如 B 版漂移）不进
-                    # outputs、不算已导出；失败原因与实测数值写进状态机/日志。
-                    brief = _verify_failure_brief(vlog, rc)
-                    _log(job_dir, f"export 判失败（质检未通过，不登记成品）: {brief}")
-                    note_export_result(job_dir, name, False,
-                                       pause_after=int(cfg.get("retry_pause_after",
-                                                               RETRY_PAUSE_AFTER)),
-                                       error=brief, failure_class="verify_failed",
-                                       retryable=True, phase="verify", profile=prof)
-                    toast("⛔ 质检未通过（不登记成品）", f"{name} {dn}\n{brief}", icon="error")
-                    return False
-            # 完成收尾的硬门槛：mp4 真在 + progress.done 为真，缺一不算导出成功
-            miss_ev = _success_evidence_missing(one_out, export_started)
-            if miss_ev:
-                brief = f"收尾缺产物证据：缺 {', '.join(miss_ev)}（{one_out}）"
-                _log(job_dir, f"export 判失败 {idx}/{len(targets)}: {dn}｜{brief}")
+            res = eg.gate_after_export(dn, one_out, job_dir=job_dir,
+                                       started_at=export_started, verify=verify,
+                                       verify_script=verify_script,
+                                       creationflags=NO_WINDOW,
+                                       ctx=f" {idx}/{len(targets)}",
+                                       log=lambda m: _log(job_dir, m))
+            if not res["ok"]:
+                if res["stage"] == "verify":
+                    _log(job_dir, f"export 判失败（质检未通过，不登记成品）: {res['brief']}")
+                else:
+                    _log(job_dir, f"export 判失败 {idx}/{len(targets)}: {dn}｜{res['brief']}")
                 note_export_result(job_dir, name, False,
                                    pause_after=int(cfg.get("retry_pause_after",
                                                            RETRY_PAUSE_AFTER)),
-                                   error=brief, failure_class="artifacts_missing",
-                                   retryable=True, phase="export", profile=prof)
-                toast("❌ 导出未完成（缺产物证据）", f"{name} {dn}：缺 {', '.join(miss_ev)}",
-                      icon="error")
+                                   error=res["brief"], failure_class=res["failure_class"],
+                                   retryable=True, phase=res["phase"], profile=prof)
+                toast(res["toast_title"], f"{name} {dn}{res['toast_detail']}", icon="error")
                 return False
             exported.append((dn, one_out))
     finally:

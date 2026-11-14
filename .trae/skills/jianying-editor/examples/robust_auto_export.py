@@ -2000,6 +2000,27 @@ def subtitle_gate(draft_name, roots=None):
     return jm.subtitle_missing(best[0])
 
 
+def _post_export_gate(draft_name, output_path):
+    """直调本脚本的收尾守卫：无 job 上下文，只跑 4/5/6（三件套→质检→收尾证据）。
+
+    前置三项守卫（reap / 配置覆盖 / 归档旧产物）需要 job 目录，直调没有落点，
+    这里**显式**打印跳过说明——静默略过会让排查误以为守卫已经跑过。
+    由 series_runner 拉起时（JY_GUARD_PARENT=1）不重复执行，守卫由父进程统一跑。
+    """
+    import export_guard as eg
+    print("[guard] 无 job 上下文，跳过 reap / 配置覆盖 / 归档旧产物")
+    mp4 = _TASK.get("real_file") or output_path
+    if not os.path.isfile(mp4):
+        mp4 = output_path
+    # done 进度固定写在 output_path 旁（--move 与否都一样），显式传进去
+    res = eg.gate_after_export(
+        draft_name, mp4, job_dir=None, started_at=_TASK.get("start_time"),
+        verify=True, verify_script=os.path.join(_REPO_ROOT, "pipeline", "verify_export.py"),
+        creationflags=_NO_WINDOW, progress_path=output_path + ".progress.json",
+        log=lambda m: dprint(f"[guard] {m}"))
+    return res["ok"], res["brief"]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="剪映自动化导出工具")
     parser.add_argument("draft_name", help="草稿名称")
@@ -2043,6 +2064,11 @@ if __name__ == "__main__":
                 keep_open=args.keep_open, fallback_dir=args.fallback_dir,
                 cold_start=args.cold_start and attempt == 1,
                 resolution=args.resolution)
+            if os.environ.get("JY_GUARD_PARENT") != "1":
+                gate_ok, gate_brief = _post_export_gate(args.draft_name, args.output_path)
+                if not gate_ok:
+                    print(f"⛔ 导出后校验未通过: {gate_brief}")
+                    sys.exit(3)
             sys.exit(0)
         except Exception as e:
             reason = str(e)
