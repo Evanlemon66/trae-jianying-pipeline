@@ -7,16 +7,16 @@
 
 用法：
   # 只读扫描，先看会写什么（默认 dry-run，不落盘）
-  python scripts/freshness_baseline.py --root D:\\短剧
+  python scripts/freshness_baseline.py --root "<剧集根>"
 
   # 首次生成（文件已存在时必须二选一：--force 覆盖 / --append 追加）
-  python scripts/freshness_baseline.py --root D:\\短剧 --write
+  python scripts/freshness_baseline.py --root "<剧集根>" --write
 
   # 人工补充新发现的历史产物（只增不删）
-  python scripts/freshness_baseline.py --root D:\\短剧 --append --write
+  python scripts/freshness_baseline.py --root "<剧集根>" --append --write
 
   # 显式整份重算（会丢掉旧条目，谨慎）
-  python scripts/freshness_baseline.py --root D:\\短剧 --force --write
+  python scripts/freshness_baseline.py --root "<剧集根>" --force --write
 
 约束：只读 job.json 与成品文件；只写基线文件本身，不改任何 job 数据。
       不启动/关闭剪映、不跑导出、不启停 watcher。
@@ -34,8 +34,10 @@ from datetime import datetime
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "lib"))
+sys.path.insert(0, os.path.join(_ROOT, "pipeline"))
 
 import freshness  # noqa: E402
+from export_config import get_series_root  # noqa: E402
 
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".ruff_cache",
              "node_modules", "__jycache__", ".trae-html-share-packages"}
@@ -204,7 +206,7 @@ def build_payload(entries, roots, report, command):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="生成 sidecar 上线前的一次性冻结基线")
     ap.add_argument("--root", action="append", default=None,
-                    help="只读扫描根目录，可重复；默认 D:\\短剧")
+                    help="只读扫描根目录，可重复；默认按统一配置解析（series_root → watch.roots[0] → D:\\短剧）")
     ap.add_argument("--out", default=None,
                     help="基线文件路径；默认 data/freshness_legacy_baseline.json")
     ap.add_argument("--write", action="store_true", help="真正落盘（默认 dry-run）")
@@ -215,7 +217,7 @@ def main(argv=None):
 
     if args.append and args.force:
         ap.error("--append 与 --force 只能二选一")
-    roots = args.root or ["D:\\短剧"]
+    roots = args.root or [get_series_root()]
     out = os.path.abspath(args.out or freshness.baseline_path())
 
     print(f"扫描根目录: {', '.join(os.path.abspath(r) for r in roots)}")

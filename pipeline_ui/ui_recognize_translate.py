@@ -33,6 +33,8 @@ import json
 import ctypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pipeline"))
+from export_config import get_projects_root
 
 import pyautogui
 import uiautomation as uia
@@ -482,8 +484,7 @@ def resolve_recognize_defaults(win):
     }
 
 # 草稿完成检测（draft_content.json 的 materials.texts 数量；自动取最近修改的草稿）
-DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                          "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+DRAFT_ROOT = get_projects_root()
 CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ui_calibration.json')
 
 

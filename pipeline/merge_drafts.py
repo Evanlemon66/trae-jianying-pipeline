@@ -32,8 +32,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import draft_io  # noqa: E402  草稿写盘唯一原语
 from restore_backups import prune_restore_backups  # noqa: E402  恢复备份源唯一白名单
-_DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                           "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+from export_config import get_projects_root  # noqa: E402
+_DRAFT_ROOT = get_projects_root()
 # 合并暂存区：放在剪映草稿目录之外（同盘），合并完再整体搬进去。
 # 剪映只扫描 _DRAFT_ROOT，构建中的半成品不会被剪映看到，避免缓存中间状态导致后几集空白。
 _STAGING_ROOT = os.path.join(os.path.dirname(_DRAFT_ROOT), "__jybuild__")

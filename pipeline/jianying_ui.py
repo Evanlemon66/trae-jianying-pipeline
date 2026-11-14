@@ -7,7 +7,8 @@ import pyautogui
 import uiautomation as uia
 
 COORDS_PATH = os.path.abspath("jianying_coords.json")
-DRAFT_ROOT = os.path.join(os.environ["LOCALAPPDATA"], "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+from export_config import get_projects_root
+DRAFT_ROOT = get_projects_root()
 
 def load_coords():
     with open(COORDS_PATH, "r", encoding="utf-8") as f:

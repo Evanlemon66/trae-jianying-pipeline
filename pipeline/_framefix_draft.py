@@ -23,12 +23,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import draft_io  # noqa: E402  草稿写盘唯一原语
+from export_config import get_projects_root  # noqa: E402
 
 
 def _ffprobe_path():
-    p = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.2-full_build\bin\ffprobe.EXE")
-    if os.path.exists(p):
-        return p
     try:
         from export_config import get_ffprobe
         return get_ffprobe()
@@ -123,7 +121,7 @@ def fix_draft(draft_name, draft_root=None, run_tests=True):
 
     Args:
         draft_name: 草稿名（即 drafts 根目录下的子目录名）
-        draft_root: drafts 根目录，默认 %LOCALAPPDATA%\\JianyingPro\\User Data\\Projects\\com.lveditor.draft
+        draft_root: drafts 根目录，默认取统一的草稿根配置
         run_tests: 是否跑字幕平移单元测试断言（防回归）
 
     Returns:
@@ -138,8 +136,7 @@ def fix_draft(draft_name, draft_root=None, run_tests=True):
     """
     fp = _ffprobe_path()
     if draft_root is None:
-        draft_root = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                                  "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+        draft_root = get_projects_root()
     draft_dir = os.path.join(draft_root, draft_name)
     cur_p = os.path.join(draft_dir, "draft_content.json")
     pub_p = os.path.join(draft_dir, "_pipeline_backup.json")
@@ -409,8 +406,7 @@ def fix_overlay_tail(draft_name, draft_root=None):
         dict: {draft_dir, video_end, old_max_end, n_overlay, n_text_clamp, changed}
     """
     if draft_root is None:
-        draft_root = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                                  "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+        draft_root = get_projects_root()
     draft_dir = os.path.join(draft_root, draft_name)
     cur_p = os.path.join(draft_dir, "draft_content.json")
     if not os.path.exists(cur_p):
@@ -526,8 +522,7 @@ if __name__ == "__main__":
     if sys.argv[1] == "--tailfix":
         root = sys.argv[3] if len(sys.argv) > 3 else None
         if root is None:
-            root = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                                "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+            root = get_projects_root()
         targets = ([d for d in os.listdir(root) if d.endswith("集串流")]
                    if sys.argv[2] == "all" else [sys.argv[2]])
         for name in targets:

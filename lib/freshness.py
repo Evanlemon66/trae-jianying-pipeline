@@ -104,17 +104,13 @@ def sha256_file(path, chunk=4 * 1024 * 1024):
 
 
 def _drafts_root():
-    try:
-        from utils.formatters import get_default_drafts_root
-        return get_default_drafts_root()
-    except Exception:
-        return os.path.join(os.environ.get("LOCALAPPDATA", ""), "JianyingPro",
-                            "User Data", "Projects", "com.lveditor.draft")
+    from export_config import get_projects_root
+    return get_projects_root()
 
 
 def _preset_root():
-    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "JianyingPro",
-                        "User Data", "Presets", "Combination", "Presets")
+    from export_config import get_presets_root
+    return get_presets_root()
 
 
 def _norm_version(version):

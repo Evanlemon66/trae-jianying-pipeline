@@ -33,8 +33,7 @@ sys.path.insert(0, _HERE)
 import pipeline as pl  # noqa: E402
 import draft_io  # noqa: E402  草稿写盘唯一原语
 
-DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                          "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+DRAFT_ROOT = pl.DRAFT_ROOT
 
 
 def _load_draft(name):

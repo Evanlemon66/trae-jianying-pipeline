@@ -5,16 +5,25 @@ OCR 文字定位层（RapidOCR / PP-OCRv4 中文模型）
 职责：窗口截图 → OCR → 按关键词返回文字中心坐标（绝对屏幕坐标）。
 只负责"找到初始坐标"，点击成败由各模块的验证闭环判定。
 
-依赖装在 D 盘 pipeline_ui/pylibs（pip --target），模型随包自带。
+依赖目录由统一配置解析（JY_UI_PYLIBS > presets.json ui_pylibs > 自动探测 > 默认
+<依赖根>/ui_pylibs），模型随 rapidocr 包自带。
 """
 from __future__ import annotations
 
 import os
 import sys
 
-_PYLIBS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pylibs')
-if _PYLIBS not in sys.path:
-    sys.path.insert(0, _PYLIBS)
+_UI_DIR = os.path.dirname(os.path.abspath(__file__))
+_PIPELINE_DIR = os.path.normpath(os.path.join(_UI_DIR, '..', 'pipeline'))
+if _PIPELINE_DIR not in sys.path:
+    sys.path.insert(0, _PIPELINE_DIR)
+
+from export_config import get_ui_pylibs_dir
+
+# 目录不存在时插入也不报错；真正缺包会在首次 _get_engine() 时给出可读错误
+UI_PYLIBS_DIR = get_ui_pylibs_dir()
+if UI_PYLIBS_DIR not in sys.path:
+    sys.path.insert(0, UI_PYLIBS_DIR)
 
 import numpy as np
 
@@ -26,7 +35,20 @@ _engine = None
 def _get_engine():
     global _engine
     if _engine is None:
-        from rapidocr_onnxruntime import RapidOCR
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError as e:
+            raise ImportError(
+                "未找到 rapidocr_onnxruntime（pipeline_ui UI 自动化 OCR 依赖）。\n"
+                f"  依赖目录: {UI_PYLIBS_DIR}\n"
+                "  安装命令: py -3.12 -m pip install --target "
+                f"\"{UI_PYLIBS_DIR}\" rapidocr_onnxruntime==1.4.4 "
+                "numpy==2.2.4 opencv-python==4.11.0.86 pillow==13.0.0\n"
+                "  或直接运行: powershell -ExecutionPolicy Bypass -File "
+                "pipeline\\install_deps.ps1（Step 4b）\n"
+                "  影响范围: 仅 pipeline_ui 的 UI 自动化路径（admission_test 会整轮中止，"
+                "ui_vocal_separate 会降级走兜底链）；watcher/导出链不受影响。"
+            ) from e
         _engine = RapidOCR()
     return _engine
 

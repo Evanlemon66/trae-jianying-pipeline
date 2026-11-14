@@ -18,7 +18,7 @@ funasr-onnx==0.4.3
 videocaptioner==1.4.2
 audio-separator==0.47.1
 pyloudnorm==0.2.0      # ITU-R BS.1770-4 LUFS 响度计量（环境声泄漏检测）
-silero-vad==6.2.3      # 语音活动检测（VAD，模型文件随包自带；备份在 D:\AI_Deps\models\silero-vad\）
+silero-vad==6.2.3      # 语音活动检测（VAD，模型文件随包自带；备份在 <依赖根>\models\silero-vad\）
 
 # torch/torchaudio 必须装 CUDA 版（demucs GPU 加速，42x 实时速率）：
 #   pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu126
@@ -37,9 +37,11 @@ silero-vad==6.2.3      # 语音活动检测（VAD，模型文件随包自带；�
 # 已知无关冲突（不处理，与 pipeline 无关）：httpcore 1.0.5 要 h11<0.15（现 0.16.0）、
 # mitmproxy 12.2.3 要 typing-extensions<=4.14（现 4.16.0）——均属 mitmproxy 独立工具链
 
-# ── pipeline_ui UI 自动化 OCR（必须装进 pipeline_ui/pylibs，不装全局）──
+# ── pipeline_ui UI 自动化 OCR（装进配置的 ui_pylibs 目录，不装全局）──
 # admission_test / ui_pipeline 通过 ocr_locate 导入 rapidocr_onnxruntime；
-# 由 pipeline/install_deps.ps1 的 Step 4b 执行：
-#   pip install --target pipeline_ui\pylibs rapidocr_onnxruntime==1.4.4 numpy==2.2.4 opencv-python==4.11.0.86 pillow==13.0.0
+# 目标目录由 pipeline/export_config.py 的 get_ui_pylibs_dir() 解析：
+#   JY_UI_PYLIBS > presets.json 的 ui_pylibs > 自动探测（旧仓库内 pipeline_ui/pylibs）> 默认 <deps_root>\ui_pylibs（本机 D:\AI_Deps\ui_pylibs）
+# 由 pipeline/install_deps.ps1 的 Step 4b 按该路径执行：
+#   pip install --target <ui_pylibs> rapidocr_onnxruntime==1.4.4 numpy==2.2.4 opencv-python==4.11.0.86 pillow==13.0.0
 # 刻意不在本文件启用，避免 `pip install -r requirements.txt` 把它装进全局 site-packages。
 # rapidocr_onnxruntime==1.4.4

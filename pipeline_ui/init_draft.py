@@ -13,11 +13,11 @@
 函数调用：
   from init_draft import init_draft
   init_draft()                                  # 草稿名/素材目录取 presets.json admission 段
-  init_draft(draft_name='X', video_dir=r'D:\path\to\videos') # 自定义
+  init_draft(draft_name='X', video_dir=r'D:/path/to/videos') # 自定义
 
 CLI（不带参数时 --draft-name/--video-dir/--limit 等默认值同样来自 admission 段）：
   py -3.12 pipeline_ui/init_draft.py
-  py -3.12 pipeline_ui/init_draft.py --draft-name X --video-dir "D:\\..." --limit 5 --no-open
+  py -3.12 pipeline_ui/init_draft.py --draft-name X --video-dir "<素材目录>" --limit 5 --no-open
 """
 import os, sys, glob, time, unicodedata, re
 

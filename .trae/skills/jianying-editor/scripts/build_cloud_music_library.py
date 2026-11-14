@@ -5,18 +5,13 @@ import os
 from typing import Dict
 
 from utils.cli_protocol import emit_result, make_result
-from utils.config import CONFIG
+from utils.formatters import get_default_drafts_root
 from utils.errors import InfraError
 from utils.logging_utils import setup_logger
 
 logger = setup_logger("build_cloud_music_library")
 
-LOCAL_APP_DATA = os.getenv("LOCALAPPDATA")
-PROJECTS_ROOT = CONFIG.projects_root_override or (
-    os.path.join(LOCAL_APP_DATA, r"JianyingPro\User Data\Projects\com.lveditor.draft")
-    if LOCAL_APP_DATA
-    else ""
-)
+PROJECTS_ROOT = get_default_drafts_root()
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MUSIC_CSV = os.path.join(SKILL_ROOT, "data", "cloud_music_library.csv")

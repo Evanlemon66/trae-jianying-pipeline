@@ -5,8 +5,8 @@ video.status=done 挡住已导出剧，但剧目录仍留在公共 roots；本�
 "显式归档"：写 stage=archived（check_trigger 硬拦），再把整剧目录移出 roots。
 
 用法（项目根目录）：
-  python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档" --dry-run
-  python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档"
+  python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>" --dry-run
+  python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>"
 
 准入（默认满足其一即可）：
   - publish.status == "published"（已有成功回执）

@@ -33,9 +33,9 @@ sys.stdout.reconfigure(encoding="utf-8")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import draft_io  # noqa: E402  草稿写盘唯一原语
+from export_config import get_projects_root  # noqa: E402
 
-DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                          "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+DRAFT_ROOT = get_projects_root()
 
 
 # 优先句末，其次分号/冒号，再退到逗号

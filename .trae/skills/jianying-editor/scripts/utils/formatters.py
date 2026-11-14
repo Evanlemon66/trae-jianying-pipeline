@@ -7,8 +7,35 @@ from typing import Dict, List, Union
 
 
 # ----------------- 路径自动探测 -----------------
+def _load_export_config():
+    """向上查找仓库 pipeline/export_config.py；找不到返回 None。"""
+    import sys as _sys
+
+    cur = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(8):
+        candidate = os.path.join(cur, "pipeline", "export_config.py")
+        if os.path.isfile(candidate):
+            pipeline_dir = os.path.dirname(candidate)
+            if pipeline_dir not in _sys.path:
+                _sys.path.insert(0, pipeline_dir)
+            try:
+                import export_config
+                return export_config
+            except Exception:
+                return None
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
 def get_default_drafts_root() -> str:
-    """自动探测剪映草稿目录 (Windows)"""
+    """自动探测剪映草稿目录（环境变量 > presets.json > 自动探测 > 默认）。"""
+    export_config = _load_export_config()
+    if export_config is not None:
+        return export_config.get_projects_root()
+
     local_app_data = os.environ.get("LOCALAPPDATA")
     user_profile = os.environ.get("USERPROFILE")
 
