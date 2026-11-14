@@ -9,6 +9,8 @@ _*.py
 # 个人配置（含个人预设名/密钥/导出目录，不入库；参考 *.example.json）
 pipeline/presets.json
 pipeline/vc_config.json
+# sidecar 上线前的一次性冻结基线（含本机绝对路径/剧名，由 scripts/freshness_baseline.py 生成）
+data/freshness_legacy_baseline.json
 
 # Python 缓存
 __pycache__/
