@@ -78,6 +78,9 @@ def test_constants_pinned():
     assert jl.EARLY_DEATH_SETTLE_S == 0.0
     assert jl.RESTART_SETTLE_S == 0.0
     assert jl.POST_READY_WATCH_S == 8.0
+    # 崩溃框独立预算：本机 nvapi 已连续崩 3 次，不能被早死预算（1）吃掉
+    assert jl.CRASH_RETRIES == 2
+    assert jl.CRASH_SETTLE_S == 3.0
     # 导出链通过别名引用同一口径
     assert ji.HOME_READY_TIMEOUT_S == 120.0
     assert ji.EARLY_DEATH_RETRIES == 1
@@ -119,6 +122,24 @@ def test_retry_budget_is_per_run_not_per_call():
     _run(clock, fake, budget=budget)   # 同一运行的第二次 launch
     assert len(fake.spawns) == 3, '预算耗尽后不得再重拉'
     assert budget.remaining == 0
+
+
+def test_crash_retry_has_its_own_budget():
+    """崩溃框不与早死挤占预算：进程不退出也能连拉 1+CRASH_RETRIES 次。"""
+    clock = Clock()
+    fake = FakeJianying(clock, [None])
+    orig_crash, orig_dismiss = jl.crash_dialogs, jl.dismiss_window
+    jl.crash_dialogs = lambda: [{'hwnd': 1, 'title': 'VEDetector has stopped working',
+                                 'text': 'nvapi', 'pid': 99}]
+    jl.dismiss_window = lambda hwnd: True
+    try:
+        out = _run(clock, fake)
+    finally:
+        jl.crash_dialogs, jl.dismiss_window = orig_crash, orig_dismiss
+    assert out.ok is False
+    assert out.crash_retry is False, '预算耗尽那次不应再标记为崩溃重拉'
+    assert len(fake.spawns) == 1 + jl.CRASH_RETRIES, len(fake.spawns)
+    assert clock.sleeps.count(jl.CRASH_SETTLE_S) == jl.CRASH_RETRIES
 
 
 # ── 4. 重拉前不得静默：早退实例未进应用层，等 2s 无收益（实测 6 轮无差别）──

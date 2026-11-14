@@ -64,14 +64,27 @@ EARLY_DEATH_SETTLE_S = 0.0
 # 若日后在 restart 路径实测到互斥失败，再按证据回调，不要凭感觉加回。
 RESTART_SETTLE_S = 0.0
 
+# VEDetector 崩溃框（nvapi 崩溃）单独一份预算：崩溃不是"早退"，本机实测连续崩 3 次，
+# 与早死共用 1 次预算会让第 2 次崩溃就直接放弃。崩溃重拉前固定静置，避免立刻再撞，
+# 这段等待不进早死路径（早死路径仍为 0，见上）。
+CRASH_RETRIES = 2
+CRASH_SETTLE_S = 3.0
+
 # ready 后观察窗：窗口就绪 ≠ 稳定。07:10:23 那次实例 ready 后 8s 内进程消失，
 # 但 ensure_jianying 在 ready 分支直接 return，台账里完全没有这条形态。
 # ready 后 POST_READY_WATCH_S 内进程消失 → 判 died_after_ready，落台账并进重试。
 # 代价：每次成功拉起多等这段观察窗（默认 8s，可按调用方传 post_ready_watch_s=0 关闭）。
 POST_READY_WATCH_S = 8.0
 
-_JY_LOG_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", ""), "JianyingPro", "User Data", "Log")
+_PIPE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pipeline")
+if os.path.isfile(os.path.join(_PIPE_DIR, "export_config.py")) and _PIPE_DIR not in sys.path:
+    sys.path.insert(0, _PIPE_DIR)
+try:
+    from export_config import get_jianying_log_dir
+    _JY_LOG_DIR = get_jianying_log_dir()
+except Exception:  # 独立拷贝 lib 时退回约定位置
+    _JY_LOG_DIR = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "JianyingPro", "User Data", "Log")
 
 
 class JianyingLaunchError(RuntimeError):
@@ -107,19 +120,32 @@ class LaunchOutcome:
     crash_at: str = ''                  # 发现崩溃框的时刻（ISO）
     app_gpu_probes: Optional[int] = None      # 主日志 GetGPUInfoEx 轮数
     app_not_find_device: Optional[int] = None  # 主日志 not find device 行数
+    crash_retry: bool = False    # 本次失败是否因崩溃框而重拉（与早死预算分开）
     error: str = ''
 
 
 class LaunchBudget:
-    """启动即死重拉预算。每次运行创建一个，耗尽后不再重拉。"""
+    """启动重拉预算。每次运行创建一个，耗尽后不再重拉。
 
-    def __init__(self, retries: int = EARLY_DEATH_RETRIES):
+    两份独立预算：早死（died/died_after_ready）与崩溃框（VEDetector 崩溃），
+    互不挤占——否则本机已知的 nvapi 连续崩溃会把早死预算一次用光。
+    """
+
+    def __init__(self, retries: int = EARLY_DEATH_RETRIES,
+                 crash_retries: int = CRASH_RETRIES):
         self.remaining = max(0, int(retries))
+        self.crash_remaining = max(0, int(crash_retries))
 
     def take(self) -> bool:
         if self.remaining <= 0:
             return False
         self.remaining -= 1
+        return True
+
+    def take_crash(self) -> bool:
+        if self.crash_remaining <= 0:
+            return False
+        self.crash_remaining -= 1
         return True
 
 
@@ -257,15 +283,8 @@ def _presets_jianying_dir(log_fn: Callable[[str], None]) -> str:
     return (get_jianying_dir() or '').strip()
 
 
-def resolve_jianying_exe(required: str = REQUIRED_JY_VERSION,
-                         log_fn: Optional[Callable[[str], None]] = None) -> str:
-    """解析剪映可执行文件并校验版本（带来源清单）。
-
-    版本门分两档：
-      - 明确读到文件版本且 ≠ required → 跳过该候选；
-      - 读不到版本信息 → 打告警后接受该候选（附目录名佐证），不因此放宽拒绝条件。
-    全部候选都不可用时抛 JianyingLaunchError，绝不静默返回其它大版本。
-    """
+def jianying_candidates(log_fn: Optional[Callable[[str], None]] = None) -> list[tuple[str, str]]:
+    """只读收集剪映候选 exe（presets.json > 环境变量 > 卸载注册表）。不会拉起进程。"""
     log = log_fn or (lambda _m: None)
     cands: list[tuple[str, str]] = []
     try:
@@ -277,7 +296,51 @@ def resolve_jianying_exe(required: str = REQUIRED_JY_VERSION,
     env_dir = (os.environ.get('JY_JIANYING_DIR') or '').strip()
     if env_dir:
         cands.append((f'JY_JIANYING_DIR={env_dir}', os.path.join(env_dir, EXE_NAME)))
-    cands.extend(registry_jianying_exes())
+    try:
+        cands.extend(registry_jianying_exes())
+    except Exception as e:
+        log(f'  [jy-path] 读取注册表失败: {e}')
+    return cands
+
+
+def inspect_jianying_install(required: str = REQUIRED_JY_VERSION) -> dict:
+    """只读检查剪映安装与版本（doctor 与版本预检共用，不拉起剪映）。
+
+    返回 {ok, exe, version, source, checked, problems, message}。
+    """
+    cands = jianying_candidates()
+    checked: list[tuple[str, str, str]] = []
+    problems: list[str] = []
+    for src, path in cands:
+        if not path or not os.path.isfile(path):
+            problems.append(f'{src} → 不存在: {path}')
+            continue
+        version = jianying_version_of(path)
+        checked.append((src, path, version))
+        if version and version == required:
+            return {"ok": True, "exe": path, "version": version, "source": src,
+                    "checked": checked, "problems": problems, "message": ""}
+    if not checked:
+        return {"ok": False, "exe": "", "version": "", "source": "", "checked": checked,
+                "problems": problems,
+                "message": f'未找到剪映专业版安装（仅支持 {required}），请安装或设置 JY_JIANYING_DIR'}
+    versions = sorted({v for _s, _p, v in checked if v})
+    return {"ok": False, "exe": "", "version": "", "source": "", "checked": checked,
+            "problems": problems,
+            "message": f'仅支持剪映 {required}，检测到: {", ".join(versions) or "无法读取版本"}'}
+
+
+def resolve_jianying_exe(required: str = REQUIRED_JY_VERSION,
+                         log_fn: Optional[Callable[[str], None]] = None) -> str:
+    """解析剪映可执行文件并校验版本（带来源清单）。
+
+    版本门分两档：
+      - 明确读到文件版本且 ≠ required → 跳过该候选；
+      - 读不到版本信息 → 打告警后接受该候选（附目录名佐证），不因此放宽拒绝条件。
+    全部候选都不可用时抛 JianyingLaunchError，绝不静默返回其它大版本。
+    """
+    log = log_fn or (lambda _m: None)
+    cands = jianying_candidates(log)
 
     problems = []
     for src, p in cands:
@@ -695,6 +758,7 @@ def _record_launch(outcome: LaunchOutcome, *, launch_id: str, entry: str,
         'notfind': outcome.app_not_find_device,
         'crash': bool(outcome.crash_title),
         'crash_title': outcome.crash_title,
+        'crash_retry': bool(outcome.crash_retry),
         'pid': outcome.pid,
         'how': outcome.how,
         'readiness': readiness,
@@ -786,6 +850,7 @@ def ensure_jianying(
         outcome = LaunchOutcome(exe=exe, pid=pid, attempt=attempt, how=how,
                                 launched=True, outcome='timeout')
         env_first = None          # 本次尝试内检测窗首次出现时刻
+        crashed = False           # 本次失败是否来自崩溃框（走独立预算）
         while True:
             # 1) 崩溃框优先：记录（标题/正文/pid/时刻）→ WM_CLOSE → 按启动即死走重试
             crash = crash_dialogs()
@@ -801,8 +866,9 @@ def ensure_jianying(
                         f"closed={dismiss_window(c['hwnd'])}")
                 outcome.alive_s = time_fn() - started
                 outcome.outcome = 'died'
+                crashed = True
                 outcome.error = (f'环境检测崩溃框（{c0["title"]}，pid={c0["pid"]}），'
-                                 f'已关闭并按早退重试')
+                                 f'已关闭并按崩溃重试')
                 break
 
             # 2) 环境检测窗排他：检测窗还在（转圈/崩溃）就不许判 ready
@@ -880,7 +946,11 @@ def ensure_jianying(
                 tick_fn(elapsed, attempt)
             sleep_fn(poll_interval)
 
-        retry = outcome.outcome in ('died', 'died_after_ready') and budget.take()
+        if crashed:
+            retry = budget.take_crash()
+        else:
+            retry = outcome.outcome in ('died', 'died_after_ready') and budget.take()
+        outcome.crash_retry = bool(crashed and retry)
         if env_first is not None and not outcome.env_check_span:
             outcome.env_check_span = time_fn() - env_first
         _fill_log_stats(outcome, started)
@@ -920,7 +990,8 @@ def ensure_jianying(
                        readiness=readiness, started_iso=started_iso)
         if not retry:
             return outcome
-        sleep_fn(settle_s)
+        # 崩溃重拉固定静置，避免新实例立刻再撞同一个 nvapi 崩溃；早死路径仍为 0。
+        sleep_fn(max(settle_s, CRASH_SETTLE_S) if crashed else settle_s)
         attempt += 1
 
 
