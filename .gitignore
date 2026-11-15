@@ -90,3 +90,11 @@ pipeline_ui/*.bmp
 pipeline_ui/*.stall.png
 pipeline_ui/*.progress.json
 pipeline_ui/*.err
+# 准入/导出实跑证据与临时产物（日志、截图、草稿快照、测试片段，不入库）
+pipeline_ui/_evidence_*/
+pipeline_ui/_draft_snapshots/
+pipeline_ui/*.verify.log
+pipeline_ui/verify_timeline*.png
+pipeline_ui.progress.json
+workdir_r*/
+specs/ui-admission-launch/evidence/
