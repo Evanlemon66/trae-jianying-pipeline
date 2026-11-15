@@ -729,11 +729,17 @@ def _parse_clean_args(args):
     --intermediates-only/--profile。"""
     opt = {"job": None, "all": False, "dry_run": False,
            "require_receipts": False, "include_drafts": False,
-           "intermediates_only": False, "profile": None, "force": False}
+           "intermediates_only": False, "profile": None, "force": False,
+           "manual": False, "manifest_dir": None}
     i = 0
     while i < len(args):
         a = args[i]
-        if a == "--all":
+        if a == "--manual":
+            opt["manual"] = True
+        elif a == "--manifest-dir" and i + 1 < len(args):
+            i += 1
+            opt["manifest_dir"] = args[i]
+        elif a == "--all":
             opt["all"] = True
         elif a == "--dry-run":
             opt["dry_run"] = True
@@ -784,6 +790,51 @@ def _audit_conflicts(work, outputs, video):
     return conflicts
 
 
+def _parse_manual_args(args):
+    """解析 archive/verify 的 --manual 参数（默认路径不使用这些开关）。"""
+    opt = {"job": None, "all": False, "dry_run": False, "profile": None,
+           "force": False, "manifest_dir": None, "archive_root": None,
+           "staging_root": None, "scope": "drama", "mirror_job": False,
+           "manual": False}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--manual":
+            opt["manual"] = True
+        elif a == "--all":
+            opt["all"] = True
+        elif a == "--dry-run":
+            opt["dry_run"] = True
+        elif a == "--force":
+            opt["force"] = True
+        elif a == "--mirror-job":
+            opt["mirror_job"] = True
+        elif a in ("--job", "-j") and i + 1 < len(args):
+            i += 1
+            opt["job"] = args[i]
+        elif a == "--profile" and i + 1 < len(args):
+            i += 1
+            opt["profile"] = args[i]
+        elif a == "--manifest-dir" and i + 1 < len(args):
+            i += 1
+            opt["manifest_dir"] = args[i]
+        elif a == "--archive-root" and i + 1 < len(args):
+            i += 1
+            opt["archive_root"] = args[i]
+        elif a == "--staging-root" and i + 1 < len(args):
+            i += 1
+            opt["staging_root"] = args[i]
+        elif a == "--scope" and i + 1 < len(args):
+            i += 1
+            opt["scope"] = args[i]
+        elif a.lower() == "all" and not opt["job"]:
+            opt["all"] = True
+        elif not a.startswith("-") and not opt["job"]:
+            opt["job"] = a
+        i += 1
+    return opt
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
@@ -795,6 +846,12 @@ def main():
         show_one(" ".join(sys.argv[2:]))
     elif cmd == "clean":
         opt = _parse_clean_args(sys.argv[2:])
+        if opt["manual"]:  # 手工判定层：完全独立模块，默认路径不受影响
+            try:
+                import manual_clean
+            except ImportError:
+                from pipeline import manual_clean
+            return manual_clean.main(opt)
         if not opt["all"] and not opt["job"]:
             print(__doc__)
             return
@@ -821,6 +878,31 @@ def main():
                 print(f"  - {n}")
             return 1
         return 0
+    elif cmd in ("archive", "verify"):
+        opt = _parse_manual_args(sys.argv[2:])
+        if not opt["manual"]:
+            print(f"[错误] 默认路径没有 `{cmd}` 的手工语义；请加 --manual"
+                  + ("（默认归档入口是 pipeline/archive_job.py）"
+                     if cmd == "archive" else ""))
+            return 1
+        if cmd == "archive":
+            try:
+                import manual_archive as mod
+            except ImportError:
+                from pipeline import manual_archive as mod
+            mirror = None
+            if opt["mirror_job"]:  # 可选镜像：job 侧唯一的接触点，失败不影响返回码
+                try:
+                    import job_manifest as _jm
+                except ImportError:
+                    from lib import job_manifest as _jm
+                mirror = _jm.update_job
+            return mod.main(opt, mirror=mirror)
+        try:
+            import manual_verify as mod
+        except ImportError:
+            from pipeline import manual_verify as mod
+        return mod.main(opt)
     else:
         print(__doc__)
         return 1
