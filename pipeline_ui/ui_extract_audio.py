@@ -47,12 +47,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ui_core import (
     dprint, connect_jianying, ensure_maximized, send_keys, select_main_track,
-    op_mark, op_timeline, take_op_marks, op_stage,
+    op_mark, op_timeline, take_op_marks, op_stage, _panel_prop_kind,
+    ensure_keyboard_focus, get_window_rect, require_maximized,
 )
 from ui_track_ops import (
     scan_tracks, find_main_track, lock_track, restore_all_tracks,
-    _set_row_hidden, is_row_locked, get_lock_x,
-    scroll_timeline_vertical,
+    _set_row_hidden, is_row_hidden, is_row_locked, get_lock_x,
+    scroll_timeline_to_top, scroll_timeline_vertical, _estimate_vshift,
     _HDR_SCALE,
 )
 from ui_calibration import update_param
@@ -103,10 +104,15 @@ def _cluster_text_rows(rows):
     """顶部连续成簇的 text 轨 = 识别字幕产生的字幕轨（中文+英文）。
 
     与下方误分类的旧轨用 40px 逻辑间距断开（按 _HDR_SCALE 换算：1920 下 40px，
-    4K@150% 下 60px，否则 4K 实测字幕行间距 42px 会被断成单条）。
+    4K@150% 下 60px）。但固定 40px 在 100% 缩放下比实测字幕行距 42px 还小
+    （2560x1368 实测：两条字幕轨行高 15px、行距 42px），会把中文/英文两条字幕
+    断成两个单行簇 → 用「实测行高 ×3」兜底，仍远小于普通轨道行距（70px）。
     """
     gap = 40 * max(float(_HDR_SCALE), 0.5)
     text_rows = sorted([r for r in rows if r['type'] == 'text'], key=lambda r: r['ymid'])
+    if text_rows:
+        row_h = max(int(r['y_bot']) - int(r['y_top']) for r in text_rows)
+        gap = max(gap, 3.0 * row_h)
     cluster = []
     for r in text_rows:
         if not cluster or r['ymid'] - cluster[-1]['ymid'] <= gap:
@@ -122,22 +128,21 @@ def _top_text_cluster(win):
     return _cluster_text_rows(rows), eye_x, win
 
 
-def _scroll_to_top(win, max_steps=8):
-    """朝上滚时间线，直到三模态均无位移（=已到顶）。返回 (ok, why)。
+def _scroll_to_top(win, max_steps=8, source=''):
+    """朝上滚时间线到顶（幂等，有上限，给证据）。返回 (ok, why)。
 
-    复用 scroll_timeline_vertical 的多模态轮转：reason='all_modes_failed' 表示
-    keyboard / scrollbar / wheel 全都没有位移 —— 这正是"已经在顶层"的判据。
+    实现在 ui_track_ops.scroll_timeline_to_top：
+      ① 位移判据仍复用 scroll_timeline_vertical（ymid 集合是否变化）；
+      ② 到顶 = 连续两次上滚全部模态零位移 + 顶部行 ymid 签名稳定；
+      ③ 到顶签名持久化到 ui_calibration.json，签名完全一致时直接返回，不发滚动事件。
     """
-    for i in range(max_steps):
-        r = scroll_timeline_vertical(win, direction='up')
-        if r.get('ok'):
-            continue
-        if r.get('reason') == 'all_modes_failed':
-            dprint(f"  ✅ 已到顶层：第 {i + 1} 次上滚三模态均无位移"
-                   f"（tried={[t.get('mode') for t in (r.get('tried') or [])]}）")
-            return True, f'第 {i + 1} 次上滚三模态均无位移'
-        return False, f'滚动不可用（{r.get("reason")}）'
-    return False, f'连续上滚 {max_steps} 次仍有位移，未确认到顶'
+    r = scroll_timeline_to_top(win, max_steps=max_steps, source=source)
+    el = r.get('elapsed_s')
+    if r.get('ok'):
+        tag = ('缓存命中' if r.get('cached')
+               else ('拖滑块' if r.get('method') == 'drag_thumb' else '滚轮确认'))
+        return True, f"{tag}（{el}s）：{r.get('evidence')}"
+    return False, f"{r.get('reason')}（rounds={r.get('rounds')}，{el}s，{r.get('evidence')}）"
 
 
 def _top_text_cluster_checked(win):
@@ -172,6 +177,56 @@ def _verify_zh_hidden(win, ymid):
     if not hit['hidden']:
         return False, f'中文字幕轨 ymid={ymid} 复检仍可见', win
     return True, f'ymid={ymid} hidden=True', win
+
+
+def _pre_separation_recheck(win, subs):
+    """分离前复检：两条新字幕轨确实锁定+隐藏，且 Ctrl+A 之后只选中主轨。
+
+    口径（用户确认）：复检对象是刚生成的两条字幕轨与选中范围，不是预设轨。
+    判据全部走现有 UI 识别，不猜：
+      1) [1/6] 拿到的字幕轨（ymid）逐条复核 hidden=True 且锁图标为锁定态；
+      2) 除主轨外不得存在「可见且未锁定」的行（否则 Ctrl+A 会把它一起选上）；
+      3) 右侧面板必须是片段属性（草稿属性 = 什么都没选中）。
+    返回错误串（空串表示通过）。
+
+    ⚠️ 不要在隐藏后重扫重分类找 text 轨：隐藏/锁定行采不到片段橙色像素，
+    scan_tracks 会把它们归成 unknown/audio（甚至整行检不出），必然假阴性
+    （2026-11-15 准入实测：隐藏后 总=1、text=0）。所以判据 1 只用已知 ymid
+    直接读眼睛/锁列像素，不依赖行分类。
+    """
+    dprint("\n[2.5/6] 分离前复检：字幕轨锁定+隐藏 / 选中范围只有主轨")
+    rows, img, WL, WT, WW, _, win = _safe_scan(win)
+    if img is None:
+        return '分离前复检失败：复扫取不到截图，无法确认隐藏/锁定与选中范围'
+    bad = []
+    if len(subs) != 2:
+        bad.append(f'[1/6] 只拿到 {len(subs)} 条字幕轨（应为识别出的 2 条），'
+                   f'ymid={[r["ymid"] for r in subs]}')
+    for r in subs:
+        ymid = int(r['ymid'])
+        hidden = bool(is_row_hidden(img, WL, WT, WW, ymid))
+        locked = bool(is_row_locked(img, WT, ymid))
+        if not (hidden and locked):
+            bad.append(f"字幕轨 ymid={ymid} 未保持锁定+隐藏"
+                       f"（hidden={hidden} locked={locked}）")
+    main, _ = find_main_track(win, rows or [], img)
+    if not main:
+        bad.append('复扫时主轨丢失（M2 封面校验未过）')
+    else:
+        loose = [r['ymid'] for r in rows
+                 if abs(r['ymid'] - main['ymid']) > 20
+                 and not r['hidden'] and not is_row_locked(img, WT, r['ymid'])]
+        if loose:
+            bad.append(f'主轨之外仍有可被选中的轨道 ymid={loose}（可见且未锁定）')
+    panel_kind, panel_ev = _panel_prop_kind(win)
+    if panel_kind != 'clip':
+        bad.append(f'右侧面板不是片段属性（kind={panel_kind}, evidence={panel_ev}）'
+                   f'→ Ctrl+A 后未确认有片段被选中')
+    if bad:
+        return '分离前复检未通过，已拒绝发送 Ctrl+Shift+S：' + '；'.join(bad)
+    dprint(f"  ✅ 复检通过：字幕轨 ymid={[r['ymid'] for r in subs]} 锁定+隐藏；"
+           f"主轨 ymid={main['ymid']}；主轨外无可见未锁定行；面板=片段属性{panel_ev}")
+    return ''
 
 
 def _write_final_layout(win, audio_row, type_overrides=None):
@@ -216,6 +271,7 @@ TERMINAL_SAMPLE_INTERVAL_S = 0.5   # 采样间隔（秒）
 TERMINAL_STABLE_HOLD_S = 40.0      # 连续多久无落盘变化才算进入稳定态
 TERMINAL_TIMEOUT_S = 180.0         # 总采样超时（秒）
 TERMINAL_NOCHANGE_S = 30.0         # 这么久连一次变化都没有 → 快捷键没有生效
+MAIN_LOCATE_MAX_STEPS = 6          # [2/6] 回顶后向下找主轨的最大滚动轮数（每轮一步）
 _SEP_KEY_SENDS = 0                 # 本次运行累计发送 Ctrl+Shift+S 的次数
 
 # 不同版本/素材来源写"视频原声"用的字段名不一，命中任一即视为显式标记
@@ -394,6 +450,25 @@ def _destroyed_reason(before, sig):
 def _send_separate_hotkey(win):
     """发送分离快捷键并计数（采样日志要能回答"这段时间里有没有第二次键事件"）。"""
     global _SEP_KEY_SENDS
+    # 键前再取一次键盘焦点：焦点在桌面时整串键会被丢弃且草稿毫无变化
+    # （2026-11-15 实测 [key-evidence] 焦点控件=PaneControl '桌面 1'）。
+    # 前提断言：窗口必须处于最大化。未最大化 → SW_MAXIMIZE 恢复；若发生了恢复
+    # （rect 已变）或恢复失败，则此前算出的选中坐标全部失配 → 拒绝发键，返回 -1。
+    _zoom_ok, _zoom_rect, _zoom_fixed = require_maximized(win)
+    if not _zoom_ok or _zoom_fixed:
+        dprint(f"  ⛔ 分离音频已中止：窗口最大化断言未通过（ok={_zoom_ok}, "
+               f"恢复过={_zoom_fixed}, rect={_zoom_rect}），未发送 Ctrl+Shift+S")
+        return -1
+    # 焦点守卫只允许在不改变窗口几何的前提下操作：前后 rect 一变就拒绝发键。
+    rect0 = get_window_rect(win)
+    focus_ok = ensure_keyboard_focus(win)
+    rect1 = get_window_rect(win)
+    if rect0 != rect1:
+        dprint(f"  ⛔ 键盘焦点守卫前后窗口 rect 变化 {rect0}→{rect1}，坐标已失配，"
+               f"拒绝发送 Ctrl+Shift+S")
+        return -1
+    if not focus_ok:
+        dprint("  ⚠️ 键盘焦点守卫未通过，仍尝试发送（后面靠草稿采样判定）")
     op_mark('组合键', 'Ctrl+Shift+S（分离音频）')
     _key_inject_evidence(win, SEPARATE_AUDIO_HOTKEY)
     pyautogui.hotkey(*SEPARATE_AUDIO_HOTKEY)
@@ -586,21 +661,65 @@ def run_extract_audio(workdir: str = ".", timeout_sec: float = TERMINAL_TIMEOUT_
 
     # --- Step 1: 隐藏并锁定两条字幕轨 ---
     dprint("\n[1/6] 隐藏并锁定两条字幕轨")
+    # 用户口径：隐藏中文字幕轨前默认先把滑轮滑到最上面。必须放在扫描之前——
+    # _top_text_cluster 取的是"当前可视区最上面的 text 簇"，视口不在顶时会取错行。
+    # 到顶失败就中止，不拿看不见的行去点。
+    top_ok, top_why = _scroll_to_top(win, source='[1/6]')
+    if not top_ok:
+        return _fail(f'隐藏字幕轨失败：top_not_reached —— {top_why}；一次都不点')
     subs, eye_x, win = _top_text_cluster(win)
     if len(subs) < 2:
-        dprint(f"  ⚠️ 顶部字幕轨簇只有 {len(subs)} 条（预期 2 条），继续执行")
+        return _fail(f'顶部字幕轨簇只有 {len(subs)} 条（预期 2 条）：视口不完整，'
+                     '拒绝继续锁定/隐藏（先确认到顶与行检测是否正常）')
     for r in subs:  # 先全部锁定（锁定不引起行位移）
         lock_track(win, r['ymid'], want_locked=True)
     for r in sorted(subs, key=lambda x: -x['ymid']):  # 从下往上隐藏（防行位移错位）
         _set_row_hidden(win, eye_x, r['ymid'], True, f"字幕轨 ymid={r['ymid']}")
 
-    # --- Step 2: Home + Ctrl+A 选中主轨 ---
-    dprint("\n[2/6] Home + Ctrl+A 选中主轨")
+    # --- Step 2: Home + Ctrl+A 选中主轨（不点片段）---
+    dprint("\n[2/6] Home + Ctrl+A 选中主轨（不点片段）")
     rows0, _, _, _, _, _, win = _safe_scan(win)
     main0, _ = find_main_track(win, rows0)
+    # [1/6] 已经把时间线回了顶，主轨（恒在最底部）可能被挤出视口。
+    # 此时不能直接判"未定位主轨"：向下滚到主轨可见再继续，每轮重扫避免用过期 ymid；
+    # 滚不动（两端模态零位移）就停，按原有口径中止。
+    for _locate in range(MAIN_LOCATE_MAX_STEPS):
+        if main0:
+            break
+        pre_y = [r['ymid'] for r in rows0]
+        rr = scroll_timeline_vertical(win, direction='down')
+        if not rr.get('ok'):
+            dprint(f"  ⚠️ [2/6] 向下滚定位主轨失败（{rr.get('reason')}），停止下滚")
+            break
+        dprint(f"  ⚠️ [2/6] 主轨不在视口（回顶后），已下滚 1 步（第 {_locate + 1} 次）重扫")
+        rows0, _, _, _, _, _, win = _safe_scan(win)
+        # subs 是 [1/6] 回的顶视口坐标；下滚后必须按整摞位移同步平移，
+        # 否则 [2.5/6] 会拿过期 ymid 去读眼睛/锁列 = 读到别的行（假阴性）。
+        shift = _estimate_vshift(pre_y, [r['ymid'] for r in rows0])
+        if shift:
+            for r in subs:
+                r['ymid'] += shift
+            dprint(f"  字幕轨 ymid 随下滚同步平移 {shift:+d}px → {[r['ymid'] for r in subs]}")
+        else:
+            dprint("  ⚠️ [2/6] 下滚后位移估计失败，字幕轨 ymid 未平移"
+                   "（[2.5/6] 复检可能读到错行）")
+        main0, _ = find_main_track(win, rows0)
     if not main0:
         return _fail('未定位主轨（无可用 video 行或 M2 封面校验未过），拒绝用下方预设轨顶替')
-    select_main_track()
+    # 期望段数取草稿主轨真实段数，避免把"只选中一段"当成全选通过
+    _dp = _draft_path()
+    try:
+        _expect_seg = int(_draft_sig(_dp)['main_segments']) if _dp else None
+    except Exception:
+        _expect_seg = None
+    if not select_main_track(win=win, main_row=main0, expect_segments=_expect_seg):
+        return _fail('选中主轨失败：Home 后时间码未回到 00:00:00 或主轨未全部白描边'
+                     '（已在发送 Ctrl+Shift+S 前中止）')
+
+    # --- Step 2.5: 分离前复检（不通过就不发 Ctrl+Shift+S）---
+    recheck_err = _pre_separation_recheck(win, subs)
+    if recheck_err:
+        return _fail(recheck_err)
 
     # --- Step 3: Ctrl+Shift+S 分离音频 ---
     dprint("\n[3/6] Ctrl+Shift+S 分离音频")
@@ -618,7 +737,8 @@ def run_extract_audio(workdir: str = ".", timeout_sec: float = TERMINAL_TIMEOUT_
     dprint(f"  分离前草稿: 主轨(id={before_sig['main_id']}) "
            f"{before_sig['main_segments']} 段，videos={before_sig['n_videos']}，"
            f"audio 轨={len(before_sig['audio_tracks'])}，总轨={before_sig['n_tracks']}")
-    _send_separate_hotkey(win)
+    if _send_separate_hotkey(win) < 0:
+        return _fail('分离音频已中止：键盘焦点守卫前后剪映窗口 rect 变化（坐标失配），未发送 Ctrl+Shift+S')
     time.sleep(1)
 
     # --- Step 4: 终态校验：持续采样到稳定态后再对账（不看界面现象）---
@@ -688,7 +808,7 @@ def run_extract_audio(workdir: str = ".", timeout_sec: float = TERMINAL_TIMEOUT_
                    f"（steps={pre.get('steps')}，ambiguous={pre.get('ambiguous')}），"
                    '未达到全量覆盖，已按约定一次都不点（请人工滚动时间线后复跑）')
         elif reason == 'scroll_unavailable':
-            err = ('恢复轨道失败：仍有轨道在时间线可视区外，滚轮/滚动条/键盘均无法滚动，'
+            err = ('恢复轨道失败：仍有轨道在时间线可视区外，滚轮/滚动条均无法滚动，'
                    '无法判定是锁定还是不可见（请人工滚动时间线后复跑）')
         else:
             err = '恢复轨道失败：仍有轨道锁定或隐藏'
@@ -702,7 +822,7 @@ def run_extract_audio(workdir: str = ".", timeout_sec: float = TERMINAL_TIMEOUT_
     dprint("\n[6/6] 回顶层 → 隐藏中文字幕轨（从上到下第二条）")
     # 为什么必须先回顶：分离音频后时间线可能停在下方轨道，复用分离前的旧 ymid 会点到
     # 别的行（上一轮点到了 sticker 轨）。这里先滚到顶，再以**当前扫描**的坐标点，一次都不猜。
-    top_ok, top_why = _scroll_to_top(win)
+    top_ok, top_why = _scroll_to_top(win, source='[6/6]')
     if not top_ok:
         return _fail(f'隐藏字幕轨失败：top_not_reached —— {top_why}；一次都不点')
     subs2, eye_x, win, cluster_why = _top_text_cluster_checked(win)

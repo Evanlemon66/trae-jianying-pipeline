@@ -261,6 +261,26 @@ def _count_blue(img, x0, y0, x1, y1):
 
 # ================= 面板滚动 =================
 
+def _wheel_panel(x, y, notches):
+    """在右侧属性面板上发滚轮（正=上滚，负=下滚，单位=1 个滚轮档）。
+
+    为什么不用 pyautogui.scroll：2026-11-15 探针实测，同一坐标下 pyautogui.scroll
+    对剪映 Qt 属性面板零位移，ctypes mouse_event(WHEEL) 立即生效；并且
+    WM_MOUSEWHEEL 走焦点窗口，必须先 SetCursorPos 把鼠标指针移进面板再发。
+    """
+    import ctypes
+    u = ctypes.windll.user32
+    u.SetCursorPos(int(x), int(y))
+    time.sleep(0.12)
+    n = int(notches)
+    if not n:
+        return
+    delta = 120 if n > 0 else -120
+    for _ in range(min(abs(n), 30)):
+        u.mouse_event(0x0800, 0, 0, delta, 0)   # MOUSEEVENTF_WHEEL
+        time.sleep(0.04)
+
+
 def _scroll_panel_to_bottom(win):
     """滚动音频面板到与准入**完全一致**的终态：先回顶部 2 轮 → 再下滚 1 轮×3。
 
@@ -273,18 +293,20 @@ def _scroll_panel_to_bottom(win):
     from ui_calibration import get_param
     wr = get_window_rect(win)
     mx = int((wr[0] + wr[2]) * float(get_param('vocal_switch', 'scroll_mx_ratio')))
-    my = int((wr[1] + wr[3]) * float(get_param('vocal_switch', 'scroll_my_ratio')))
+    # y 锚点必须落在右侧面板可视区内：面板底边≈时间线上沿（本布局 ≈0.49×H），
+    # 用 0.30×H 保证在面板内（旧值 0.48×H 会压到分界线/时间线，滚轮打空）。
+    my = int(wr[1] + wr[3] * float(get_param('vocal_switch', 'scroll_my_ratio_search')))
     rounds_top = int(get_param('vocal_switch', 'scroll_rounds_top'))
     rounds_each = int(get_param('vocal_switch', 'scroll_rounds_each'))
-    delta = int(get_param('vocal_switch', 'scroll_delta'))
+    up_notches = int(get_param('vocal_switch', 'scroll_notches_top'))
+    down_notches = int(get_param('vocal_switch', 'scroll_notches_each'))
     sleep_t = float(get_param('vocal_switch', 'scroll_sleep_after'))
     op_mark('滚轮', f'音频面板回顶部×{rounds_top}+下滚×{rounds_each}({mx},{my})')
-    pyautogui.moveTo(mx, my)
     for _ in range(rounds_top):
-        pyautogui.scroll(-delta)          # scroll_delta 为负（向下），取反即向上
+        _wheel_panel(mx, my, up_notches)
         time.sleep(sleep_t)
     for _ in range(rounds_each):
-        pyautogui.scroll(delta)
+        _wheel_panel(mx, my, -down_notches)
         time.sleep(sleep_t)
 
 
@@ -306,22 +328,20 @@ def scroll_until_vocal_visible(win, max_rounds=10):
 
     # ① 滚回顶部
     top_rounds = int(get_param('vocal_switch', 'scroll_rounds_top'))
-    up_delta = -int(get_param('vocal_switch', 'scroll_delta'))  # 负值变正值往上滚
+    up_notches = int(get_param('vocal_switch', 'scroll_notches_top'))
     sleep_t = float(get_param('vocal_switch', 'scroll_sleep_after'))
     op_mark('滚轮', f'音频面板滚回顶部({mx},{my}) ×{top_rounds}')
-    pyautogui.moveTo(mx, my)
     for _ in range(top_rounds):
-        pyautogui.scroll(up_delta)
+        _wheel_panel(mx, my, up_notches)
         time.sleep(sleep_t)
 
     # ② 逐轮向下滚 + OCR 检查
     each_rounds = int(get_param('vocal_switch', 'scroll_rounds_each'))
-    down_delta = int(get_param('vocal_switch', 'scroll_delta'))
+    down_notches = int(get_param('vocal_switch', 'scroll_notches_each'))
     for i in range(max_rounds):
         op_mark('滚轮', f'音频面板第{i + 1}轮下滚({mx},{my}) ×{each_rounds}')
-        pyautogui.moveTo(mx, my)
         for _ in range(each_rounds):
-            pyautogui.scroll(down_delta)
+            _wheel_panel(mx, my, -down_notches)
             time.sleep(sleep_t)
         pos = find_text_in_window(win, '人声分离', region=(WW // 2, 0, WW, WH))
         if pos:

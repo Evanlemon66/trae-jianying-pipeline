@@ -73,7 +73,10 @@ def ensure_foreground():
     except Exception:
         hwnd = 0
     if hwnd:
-        ctypes.windll.user32.ShowWindow(hwnd, 9)
+        # 已最大化就不碰窗口状态；未最大化才 SW_MAXIMIZE。
+        # 不用 SW_RESTORE(9)：它会把最大化窗口按还原尺寸显示=取消最大化。
+        if not ctypes.windll.user32.IsZoomed(hwnd):
+            ctypes.windll.user32.ShowWindow(hwnd, 3)
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(0.5)
 

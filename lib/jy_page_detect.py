@@ -310,7 +310,7 @@ def activate_window(ctrl, hwnd: Optional[int] = None,
     """把窗口还原（若最小化）并尝试置前，记录每一步的真实结果。
 
     置前顺序（Windows 前台锁下的常见解法）：
-      模拟一次 Alt 键 → SW_MINIMIZE → SW_RESTORE → SetActive
+      模拟一次 Alt 键 → SW_MINIMIZE → SW_MAXIMIZE → SetActive
       → SetForegroundWindow → SetTopmost(True/False)
 
     返回 {hwnd, alt, minimize, restored, setactive, setforeground, topmost,
@@ -367,7 +367,9 @@ def activate_window(ctrl, hwnd: Optional[int] = None,
 
         def _restore():
             time.sleep(0.05)
-            return u32.ShowWindow(hwnd, 9)   # SW_RESTORE
+            # 不用 SW_RESTORE(9)：它对最大化窗口的语义是"按还原尺寸显示"=取消最大化
+            # （2026-11-15 准入事故根因）。pipeline 前提是最大化态，统一 SW_MAXIMIZE 恢复。
+            return u32.ShowWindow(hwnd, 3)   # SW_MAXIMIZE
 
         _r, _e = _timed('restore', _restore)
         rec['restored'] = f'err:{_e}' if _e else bool(_r)

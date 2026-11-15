@@ -150,6 +150,50 @@ def save_calibration(data: dict, win=None):
 _CACHE = {'mtime': None, 'data': None, 'path': None}
 
 
+def _atomic_dump(path: str, data: dict):
+    """原子写 JSON：同目录临时文件 → flush/fsync → os.replace。
+    半途失败时原文件保持不变（不会写出截断的 calibration）。"""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def save_calibration_section(section: str, value, win=None) -> bool:
+    """只更新一个 section 并原子落盘；其它既有字段原样保留。
+
+    用于运行期缓存类写入（如 timeline_top 到顶签名）：
+      - 读不到匹配的 calibration / 环境指纹不匹配 → 不写，返回 False；
+      - 任何异常只 warn，不阻塞主流程；
+      - 不更新 calibrated_at（那是"准入校准时间"，缓存写入不应污染它）。
+    """
+    try:
+        calib = load_calibration(win)
+        if not calib:
+            dprint(f"  [warn] {section} 落盘跳过：读不到匹配的 calibration")
+            return False
+        if not check_env_match(calib, cur_env=env_fingerprint(win or _CURRENT_WIN)):
+            dprint(f"  [warn] {section} 落盘跳过：环境指纹不匹配")
+            return False
+        calib[section] = value
+        paths = [CALIB_PATH]
+        env = calib.get('env')
+        if env:
+            paths.append(_calib_path(env))
+        for p in paths:
+            _atomic_dump(p, calib)
+        _CACHE.clear()
+        _CACHE['mtime'] = None
+        return True
+    except Exception as e:
+        dprint(f"  [warn] {section} 原子落盘失败（不影响主流程）: "
+               f"{type(e).__name__}: {e}")
+        return False
+
+
 # 当前剪映窗口（供 load_calibration / get_param 自动识别窗口所在屏）
 # 由 click_audio_tab 等定位函数开头设置，pipeline 入口会 connect_jianying 并设一次
 _CURRENT_WIN = None
@@ -382,7 +426,11 @@ DEFAULTS = {
         'scroll_sleep_after': 0.08,     # 每次 scroll 后的 sleep(s)
         'scroll_mx_ratio': 0.86,        # 滚动鼠标锚点（窗口宽比例）
         'scroll_my_ratio': 0.48,        # 滚动鼠标锚点（窗口高比例）
-        'scroll_my_ratio_search': 0.55, # 搜索面板时的 my 比例
+        # 搜索面板时的 my 比例：必须落在右侧面板可视区内（面板底边≈时间线上沿，
+        # 本布局 ≈0.49×H）。0.55 会落到时间线上，滚轮打空 → 永远滚不出「人声分离」。
+        'scroll_my_ratio_search': 0.30,
+        'scroll_notches_top': 10,       # 回顶部滚轮档数（1 档 = WHEEL_DELTA 120）
+        'scroll_notches_each': 2,       # 每轮下滚滚轮档数
         'blue_on_min': 40,              # 蓝像素判"开关已开"的门槛
         'click_offsets': (2, 6, -2, 10, -6, 14),  # 开关点击横移覆盖序列
         'switch_y_offset_pair': (121, 87),         # 候选对勾点 y 偏移（两种状态）
