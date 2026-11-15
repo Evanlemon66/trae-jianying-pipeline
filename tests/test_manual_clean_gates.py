@@ -137,7 +137,13 @@ for name, tree in TREES.items():
     check(f"闸2 {name} 只 import 白名单", not extra, extra)
 
 # ── 闸 3：变更面（git diff）────────────────────────────────────────
-print("\n== 闸3 变更面：watcher 侧零改动，默认路径保持 HEAD ==")
+print("\n== 闸3 变更面：watcher 侧零改动，默认路径保持基线 ==")
+
+
+# 本批改动的基线 = 这批提交之前的 HEAD（2026-11-15 那批手工侧 + 准入链路）。
+# 固定到基线而不是 HEAD：提交后工作区变干净，用 HEAD 做基线会让闸3/闸4a
+# 退化成「自己比自己」的空断言。下一批改动需要把这里换成新的起点。
+BASE = "2ed4d92"
 
 
 def git(*args):
@@ -145,7 +151,7 @@ def git(*args):
                           text=True, encoding="utf-8", errors="replace").stdout
 
 
-changed = {ln.strip().replace("\\", "/") for ln in git("diff", "--name-only", "HEAD").splitlines()
+changed = {ln.strip().replace("\\", "/") for ln in git("diff", "--name-only", BASE).splitlines()
            if ln.strip()}
 WATCHER_FILES = {"lib/cover_watch.py", "pipeline/archive_job.py", "lib/freshness.py",
                  "lib/export_state.py", "lib/job_manifest.py"}
@@ -155,33 +161,37 @@ RESTORED_FILES = {"lib/export_lock.py", "pipeline/pipeline.py", "pipeline/series
 # 本批（手工清理三件套 + UI 准入链路 + 测试隔离）确认的合法改动面。
 # watcher 侧与默认路径仍由闸3.1–3.3 硬拦，这里的白名单只放行本批主题文件。
 OTHER_LINE = {"lib/failure_class.py", "lib/jy_page_detect.py", "pipeline/verify_draft.py",
-              "pipeline/jianying_ui.py",
+              "pipeline/jianying_ui.py", "pipeline/stream_manifest.py",
+              "pipeline/manual_archive.py", "pipeline/manual_clean.py",
+              "pipeline/manual_guard.py", "pipeline/manual_verify.py",
               "pipeline_ui/admission_test.py", "pipeline_ui/jianying_ui.py",
               "pipeline_ui/ui_calibration.py", "pipeline_ui/ui_core.py",
               "pipeline_ui/ui_extract_audio.py", "pipeline_ui/ui_recognize_translate.py",
               "pipeline_ui/ui_track_ops.py", "pipeline_ui/ui_vocal_separate.py",
               "specs/ui-admission-launch/spec.md", "specs/ui-admission-launch/tasks.md",
               "tests/conftest.py", "tests/test_ui_pipeline_gates.py",
+              "tests/test_manual_clean_gates.py",
+              "docs/manual-entry-real-run.md", "docs/project_status.md",
               ".gitignore"}
 
 check("闸3.1 watcher 侧文件零改动", not (changed & WATCHER_FILES), sorted(changed & WATCHER_FILES))
 check("闸3.2 export_lock.py 一个字节未动", "lib/export_lock.py" not in changed)
-check("闸3.3 默认路径的 8 个文件仍是 HEAD 原样",
+check("闸3.3 默认路径的 8 个文件仍是基线原样",
       not (changed & RESTORED_FILES), sorted(changed & RESTORED_FILES))
 check("闸3.4 变更面仅限本批已确认的文件（watcher 侧零改动）",
-      (changed - OTHER_LINE) == {"pipeline/stream_manifest.py"}, sorted(changed - OTHER_LINE))
+      not (changed - OTHER_LINE), sorted(changed - OTHER_LINE))
 
-head_src = git("show", "HEAD:pipeline/stream_manifest.py")
+head_src = git("show", f"{BASE}:pipeline/stream_manifest.py")
 head_lines = head_src.splitlines()
 cli_line = next(i + 1 for i, ln in enumerate(head_lines) if ln.startswith("def _parse_clean_args"))
 with open(os.path.join(_ROOT, "pipeline", "stream_manifest.py"), encoding="utf-8") as f:
     cur_lines = f.read().splitlines()
-check(f"闸3.5 _parse_clean_args 之前与 HEAD 逐字节相同（前 {cli_line - 1} 行）",
+check(f"闸3.5 _parse_clean_args 之前与基线逐字节相同（前 {cli_line - 1} 行）",
       cur_lines[:cli_line - 1] == head_lines[:cli_line - 1])
 head_clean = head_src[head_src.index("def clean("):head_src.index("def _manifest_names(")]
 check("闸3.6 clean() 函数体整段原样保留", head_clean in "\n".join(cur_lines))
 
-diff = git("diff", "-U0", "--", "pipeline/stream_manifest.py")
+diff = git("diff", "-U0", BASE, "--", "pipeline/stream_manifest.py")
 starts = []
 for ln in diff.splitlines():
     if ln.startswith("@@"):
@@ -195,7 +205,7 @@ check("闸3.8 默认路径零删除（只增不删）", len(removed) <= 2, remov
 
 
 # ── 闸 4a：对照测试（HEAD 实现 vs 当前默认路径）──────────────────────
-print("\n== 闸4a 对照测试：HEAD clean vs 当前默认 clean ==")
+print("\n== 闸4a 对照测试：基线 clean vs 当前默认 clean ==")
 
 
 def load_head_module(dst):
