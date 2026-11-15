@@ -8,7 +8,8 @@
 
 体检项（阻断级）：中文残留、超长(>100字符)、styles.range 失配、空文本、时间重叠、
 悬空材质引用、重复 segment/material id、中文字幕无英文覆盖、英文起点不在中文区间、
-英文字幕残缺集、音频素材缺失或时长与人声轨不符。
+英文字幕残缺集、音频素材缺失或时长与人声轨不符、字幕成轨结构异常（零时长段 /
+同起点压堆，见 text_pack_issues）。
 仅报告级：>40 字符/秒高密度、<0.8s 碎片（ASR 压缩导致，不改视频无法解决）。
 
 修复策略：每轮 ①修 range ②只修残留行（定向回译）③拆分超长；
@@ -40,8 +41,19 @@ DRAFT_ROOT = rp.DRAFT_ROOT
 CJK_RE = rp._CJK_RE
 
 BLOCKING_KEYS = ("cjk", "long", "range", "empty", "overlap",
-                 "dangling", "dup_seg", "dup_mat", "uncovered", "missing", "audio")
+                 "dangling", "dup_seg", "dup_mat", "uncovered", "missing",
+                 "zero_dur", "stacked", "audio")
 REPORT_ONLY_KEYS = ("off_anchor", "dense", "short")
+
+# 成轨结构判据阈值（text_pack_issues）
+_TEXT_MIN_DUR_US = 50_000        # 单条字幕 <50ms：不可能读完，视作无效段（异常样例为 33ms）
+_TEXT_STACK_MIN = 3              # 同一时刻 ≥3 条字幕且全部短于下一行阈值 → 视为整批压堆
+_TEXT_STACK_MAX_DUR_US = 100_000 # 压堆段的时长上限（正常字幕不会这么短）
+# 零时长段不再"一条就阻断"：同一条轨上达到 _ZERO_DUR_BLOCK_COUNT 段，
+# 或占该轨总段数超过 _ZERO_DUR_BLOCK_RATIO 才阻断；否则只记 warn（写进 audit + 日志）。
+# 每条轨各算各的（中文轨、英文轨不合并计数，避免长轨稀释比例）。
+_ZERO_DUR_BLOCK_COUNT = 3
+_ZERO_DUR_BLOCK_RATIO = 0.01     # 1%
 
 _DEMUCS_STEMS = ("vocals.wav", "no_vocals.wav", "vocal.wav")
 _FFPROBE_PATH = "unset"
@@ -147,6 +159,130 @@ def save_draft(draft, path, writer=None):
 
 # ────────────────────────── 体检 ──────────────────────────
 
+def _text_track_kind(track):
+    """字幕轨角色标签（只用于报错/日志定位）：中文轨 attr=2，英文轨 attr=0。"""
+    attr = track.get("attribute", 0)
+    if attr == 2:
+        return "中文"
+    if attr == 0:
+        return "英文"
+    return f"attr{attr}"
+
+
+def text_pack_issues(draft):
+    """识别/翻译成轨结构判据（只读，与草稿写入无关）。
+
+    针对剪映「识别+翻译」偶发把整批译文压到同一时刻、每条各自单独成轨的异常
+    （实测样例：25 条英文译文同落 647.733s、每条 33ms、25 条轨 → 草稿 32 轨/629 条 text）。
+    只数字幕条数增量的验收看不出这种产出，必须在结构上拦。
+
+    两条判据（都按轨分别统计，中/英不合并计数）：
+      stacked   同一 start 上 ≥3 条且全部 <100ms 的压堆（≥3 照旧直接阻断）
+      zero_dur  单条时长 ≤0 或 <50ms。**不再一条就阻断**：同一条轨上达到
+                _ZERO_DUR_BLOCK_COUNT 段，或占该轨总段数超过 _ZERO_DUR_BLOCK_RATIO
+                才阻断；达不到只记 warn（zero_dur_warn），照样写进 audit 与日志。
+
+    返回 {"zero_dur": [...], "zero_dur_warn": [...], "zero_dur_stats": [...],
+          "stacked": [...], "text_tracks": n}：
+      zero_dur       阻断轨上的零时长段（逐段，含 ep/start/dur_ms/track/kind）
+      zero_dur_warn  未达阈值的轨级统计（track/kind/total/count/ratio/first_*）
+      zero_dur_stats 所有命中零时长的轨级统计（含 blocking/reason，便于复查）
+
+    注：不按中/英总段数差判失败——长句拆分后英文轨合法地多于中文轨
+    （实测生产草稿 CN 3687 / EN 3815、CN 2950 / EN 3839），该方向由
+    missing（逐集 EN 少于 CN）与 uncovered 负责。
+    """
+    tracks = [(ti, t) for ti, t in enumerate(draft.get("tracks", []) or [])
+              if t.get("type") == "text"]
+
+    ep_starts = [a for a, _ in rp._episode_ranges(draft)]
+
+    def _ep_at(us):
+        if not ep_starts:
+            return 1
+        return max(1, bisect.bisect_right(ep_starts, us))
+
+    zero_dur, zero_dur_warn, stats, by_start = [], [], [], {}
+    for ti, t in tracks:
+        segs = t.get("segments", []) or []
+        kind = _text_track_kind(t)
+        hits = []
+        for s in segs:
+            tr = s.get("target_timerange") or {}
+            st, dur = tr.get("start", 0), tr.get("duration", 0)
+            if dur <= 0 or dur < _TEXT_MIN_DUR_US:
+                hits.append({"ep": _ep_at(st), "start": st,
+                             "dur_ms": int(round(dur / 1000)),
+                             "track": ti, "kind": kind})
+            by_start.setdefault(st, []).append((dur, ti))
+        if not hits:
+            continue
+        total = len(segs)
+        ratio = (len(hits) / total) if total else 1.0
+        by_count = len(hits) >= _ZERO_DUR_BLOCK_COUNT
+        by_ratio = ratio > _ZERO_DUR_BLOCK_RATIO
+        blocking = by_count or by_ratio
+        info = {"track": ti, "kind": kind, "total": total,
+                "count": len(hits), "ratio": round(ratio, 4),
+                "ratio_pct": round(ratio * 100, 2),
+                "first_start": hits[0]["start"],
+                "first_dur_ms": hits[0]["dur_ms"],
+                "blocking": blocking,
+                "reason": (f"段数≥{_ZERO_DUR_BLOCK_COUNT}" if by_count
+                           else (f"占比>{_ZERO_DUR_BLOCK_RATIO:.0%}" if by_ratio
+                                 else "warn"))}
+        stats.append(info)
+        if blocking:
+            zero_dur.extend(hits)
+        else:
+            zero_dur_warn.append(info)
+
+    stacked = []
+    for st, segs in sorted(by_start.items()):
+        if len(segs) >= _TEXT_STACK_MIN and \
+                all(d < _TEXT_STACK_MAX_DUR_US for d, _ in segs):
+            stacked.append({"ep": _ep_at(st), "start": st, "count": len(segs),
+                            "tracks": len({ti for _, ti in segs}),
+                            "dur_ms": int(round(min(d for d, _ in segs) / 1000))})
+
+    return {"zero_dur": zero_dur, "zero_dur_warn": zero_dur_warn,
+            "zero_dur_stats": stats, "stacked": stacked,
+            "text_tracks": len(tracks)}
+
+
+def pack_brief(pack):
+    """text_pack_issues 的阻断摘要（命中哪条判据、涉及多少段/哪条轨）；无阻断返回空串。"""
+    if not pack or pack.get("error"):
+        return ""
+    parts = []
+    if pack.get("stacked"):
+        total = sum(x["count"] for x in pack["stacked"])
+        x = pack["stacked"][0]
+        parts.append(f"同起点堆叠{len(pack['stacked'])}处/{total}段"
+                     f"(首处 {x['start'] / 1e6:.3f}s ×{x['count']}条/{x['tracks']}轨)")
+    bad = [s for s in (pack.get("zero_dur_stats") or []) if s.get("blocking")]
+    if bad:
+        total = sum(s["count"] for s in bad)
+        z = bad[0]
+        parts.append(f"零时长超标{len(bad)}轨/{total}段"
+                     f"（{z['kind']}轨#{z['track']} {z['count']}/{z['total']}"
+                     f"={z['ratio_pct']:.2f}%，{z['reason']}，"
+                     f"首条 {z['first_start'] / 1e6:.3f}s {z['first_dur_ms']}ms）")
+    return " ".join(parts)
+
+
+def pack_warn_brief(pack):
+    """零时长未达阻断阈值时的告警明细（必须进日志，不许静默）；无告警返回空串。"""
+    if not pack or pack.get("error"):
+        return ""
+    ws = pack.get("zero_dur_warn") or []
+    return "；".join(
+        f"{w['kind']}轨#{w['track']} 零时长{w['count']}/{w['total']}段"
+        f"={w['ratio_pct']:.2f}%，首条 {w['first_start'] / 1e6:.3f}s {w['first_dur_ms']}ms"
+        for w in ws)
+
+
+
 def audit(draft):
     """只读体检，返回结构化报告 dict。"""
     eps = rp._episode_ranges(draft)
@@ -157,7 +293,7 @@ def audit(draft):
     texts = draft.get("materials", {}).get("texts", [])
     mid_set = {m["id"] for m in texts}
 
-    issues = {k: [] for k in BLOCKING_KEYS + ("off_anchor",)}
+    issues = {k: [] for k in BLOCKING_KEYS + ("off_anchor", "zero_dur_warn")}
     dense, short = [], []
     all_ids = []
     for t in draft.get("tracks", []):
@@ -236,6 +372,13 @@ def audit(draft):
         if nc > 0 and ne < nc - 2:
             issues["missing"].append({"ep": i, "cn": nc, "en": ne})
 
+    # 成轨结构（识别/翻译异常：零时长、同起点压堆）
+    # 零时长已改为「按轨计数/占比超阈值才阻断」，未达阈值落 zero_dur_warn（仅告警，不阻断）
+    pack = text_pack_issues(draft)
+    issues["zero_dur"] = pack["zero_dur"]
+    issues["zero_dur_warn"] = pack["zero_dur_warn"]
+    issues["stacked"] = pack["stacked"]
+
     # 音频素材一致性（防共享 workdir 被别的任务覆盖）
     issues["audio"] = _audit_audio(draft, ep_at)
 
@@ -270,6 +413,8 @@ def brief(rep):
             f"空{len(it['empty'])} 重叠{len(it['overlap'])} 悬空{it['dangling']} "
             f"重复{it['dup_seg']}/{it['dup_mat']} 未覆盖{len(it['uncovered'])} "
             f"错位{len(it['off_anchor'])} 残缺{len(it['missing'])} "
+            f"零时长{len(it['zero_dur'])} 堆叠{len(it['stacked'])} "
+            f"零时长告警{len(it.get('zero_dur_warn') or [])} "
             f"音频{len(it['audio'])}")
 
 
@@ -285,9 +430,16 @@ def format_report(rep):
         f"  悬空引用 {it['dangling']} | 重复 segment {it['dup_seg']} / 材质 {it['dup_mat']} | "
         f"中文段无英文 {len(it['uncovered'])} | 起点错位 {len(it['off_anchor'])} | "
         f"残缺集 {len(it['missing'])} | 音频素材 {len(it['audio'])}",
+        f"  成轨结构：零时长 {len(it['zero_dur'])} | 同起点堆叠 {len(it['stacked'])} | "
+        f"零时长告警(不阻断) {len(it.get('zero_dur_warn') or [])}",
         f"  仅报告：高密度 {len(rep['dense'])} | <0.8s {len(rep['short'])}",
     ]
+    for w in it.get("zero_dur_warn") or []:
+        lines.append(f"    [零时长告警] {w['kind']}轨#{w['track']} "
+                     f"{w['count']}/{w['total']}段={w['ratio_pct']:.2f}% "
+                     f"首条 {w['first_start']/1e6:.3f}s {w['first_dur_ms']}ms（不阻断）")
     for key, label in (("cjk", "残留"), ("long", "超长"), ("missing", "残缺"),
+                       ("zero_dur", "零时长"), ("stacked", "堆叠"),
                        ("audio", "音频"), ("off_anchor", "起点错位(仅报告)"), ("range", "range")):
         for x in it[key][:5]:
             if key == "cjk":
@@ -296,6 +448,12 @@ def format_report(rep):
                 lines.append(f"    [{label}] EP{x['ep']} {x['start']/1e6:.2f}s  {x['chars']}字符")
             elif key == "missing":
                 lines.append(f"    [{label}] 第{x['ep']}集 CN{x['cn']} / EN{x['en']}")
+            elif key == "zero_dur":
+                lines.append(f"    [{label}] EP{x['ep']} {x['start']/1e6:.3f}s  "
+                             f"{x['dur_ms']}ms")
+            elif key == "stacked":
+                lines.append(f"    [{label}] EP{x['ep']} {x['start']/1e6:.3f}s  "
+                             f"{x['count']}条同起点/{x['tracks']}轨（{x['dur_ms']}ms）")
             elif key == "audio":
                 lines.append(f"    [{label}] EP{x['ep']} 轨{x['track']} {x['why']}  "
                              f"实际{x['actual']}s / 需要{x['need']}s  {os.path.basename(x['path'])}")

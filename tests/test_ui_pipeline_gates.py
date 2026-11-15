@@ -112,17 +112,26 @@ def test_extract_audio_propagates_restore_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(ui_extract_audio, 'dprint', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio, '_ensure_edit_page', lambda _win: (win, True))
     monkeypatch.setattr(ui_extract_audio, 'ensure_maximized', lambda value: value)
-    monkeypatch.setattr(ui_extract_audio, '_top_text_cluster', lambda _win: ([], 75, win))
+    # [1/6] 回顶后能看到顶部两条字幕轨（新版少于此数会直接拒绝继续）
+    monkeypatch.setattr(ui_extract_audio, '_top_text_cluster',
+                        lambda _win: ([{'type': 'text', 'ymid': 80},
+                                       {'type': 'text', 'ymid': 40}], 75, win))
+    monkeypatch.setattr(ui_extract_audio, 'lock_track', lambda *args, **kwargs: None)
     monkeypatch.setattr(ui_extract_audio, '_safe_scan', lambda _win: next(scans))
     monkeypatch.setattr(ui_extract_audio, 'find_main_track', lambda *args: (main, True))
-    monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda: None)
+    monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda **kwargs: True)
+    # 分离前复检依赖真实 UI 扫描，不在流程用例覆盖范围内，直接放行
+    monkeypatch.setattr(ui_extract_audio, '_pre_separation_recheck', lambda _win, _subs: '')
     monkeypatch.setattr(ui_extract_audio.pyautogui, 'hotkey', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio.time, 'sleep', lambda _seconds: None)
+    # 回顶依赖真实窗口几何，流程用例里直接放行
+    monkeypatch.setattr(ui_extract_audio, '_scroll_to_top', lambda *args, **kwargs: (True, ''))
     _patch_extract_draft(monkeypatch)
     monkeypatch.setattr(ui_extract_audio, 'restore_all_tracks',
                         lambda *args, **kwargs: {'ok': False})
+    hides = []
     monkeypatch.setattr(ui_extract_audio, '_set_row_hidden',
-                        lambda *args: forbidden_calls.append('hide_chinese'))
+                        lambda _win, _eye, ymid, _want, _tag: hides.append(ymid))
     monkeypatch.setattr(ui_extract_audio, '_write_final_layout',
                         lambda *args: forbidden_calls.append('write_layout'))
 
@@ -136,7 +145,8 @@ def test_extract_audio_propagates_restore_failure(monkeypatch, tmp_path):
 
     assert result['ok'] is False
     assert '恢复轨道失败' in result['error']
-    assert forbidden_calls == []
+    assert sorted(hides) == [40, 80]        # [1/6] 只隐藏顶部两条字幕轨
+    assert forbidden_calls == []            # 恢复失败后不再落盘/进时间线
 
 
 def _wait_for_artifacts(monkeypatch, video_segments, file_count):
@@ -276,12 +286,12 @@ def test_scroll_all_modes_fail_is_reported(monkeypatch):
 
     assert r['ok'] is False
     assert r['reason'] == 'all_modes_failed'
-    assert [t['mode'] for t in r['tried']] == ['keyboard', 'wheel', 'scrollbar']
+    assert [t['mode'] for t in r['tried']] == ['wheel', 'scrollbar']
     assert all(t['ok'] is False for t in r['tried'])
 
-    # 模态无固定优先级：全失败后起手索引后移，下一轮换 wheel 先试
+    # 模态无固定优先级：全失败后起手索引后移，下一轮换 scrollbar 先试
     r2 = ui_track_ops.scroll_timeline_vertical(win)
-    assert [t['mode'] for t in r2['tried']] == ['wheel', 'scrollbar', 'keyboard']
+    assert [t['mode'] for t in r2['tried']] == ['scrollbar', 'wheel']
 
 
 def test_restore_marks_scroll_unavailable_instead_of_still_locked(monkeypatch):
@@ -317,7 +327,8 @@ def test_restore_reflows_stale_hint_before_unlock(monkeypatch):
     win = object()
     stale = {'type': 'video', 'ymid': 855, 'hidden': False}   # 插入新轨前的旧坐标
     fresh = {'type': 'unknown', 'y_top': 590, 'y_bot': 616, 'ymid': 603, 'hidden': False}
-    img = object()
+    # 真实数组：锁列取证（_strip_mean/_strip_blue_count）要读 img.shape 与像素切片
+    img = np.zeros((900, 200, 3), dtype=np.uint8)
     clicks = []
 
     monkeypatch.setattr(ui_track_ops, 'get_window_rect', lambda _w: (0, 0, 200, 900))
@@ -358,16 +369,25 @@ def test_extract_audio_reports_scroll_unavailable_distinctly(monkeypatch, tmp_pa
     monkeypatch.setattr(ui_extract_audio, 'dprint', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio, '_ensure_edit_page', lambda _win: (win, True))
     monkeypatch.setattr(ui_extract_audio, 'ensure_maximized', lambda value: value)
-    monkeypatch.setattr(ui_extract_audio, '_top_text_cluster', lambda _win: ([], 75, win))
+    # [1/6] 回顶后能看到顶部两条字幕轨（新版少于此数会直接拒绝继续）
+    monkeypatch.setattr(ui_extract_audio, '_top_text_cluster',
+                        lambda _win: ([{'type': 'text', 'ymid': 80},
+                                       {'type': 'text', 'ymid': 40}], 75, win))
+    monkeypatch.setattr(ui_extract_audio, 'lock_track', lambda *args, **kwargs: None)
     monkeypatch.setattr(ui_extract_audio, '_safe_scan', lambda _win: next(scans))
     monkeypatch.setattr(ui_extract_audio, 'find_main_track', lambda *args: (main, True))
-    monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda: None)
+    monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda **kwargs: True)
+    # 分离前复检依赖真实 UI 扫描，不在流程用例覆盖范围内，直接放行
+    monkeypatch.setattr(ui_extract_audio, '_pre_separation_recheck', lambda _win, _subs: '')
     monkeypatch.setattr(ui_extract_audio.pyautogui, 'hotkey', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio.time, 'sleep', lambda _seconds: None)
+    # 本用例只验证 restore 的 scroll_unavailable 与回顶失败区分开，回顶本身放行
+    monkeypatch.setattr(ui_extract_audio, '_scroll_to_top', lambda *args, **kwargs: (True, ''))
     _patch_extract_draft(monkeypatch)
     monkeypatch.setattr(ui_extract_audio, 'restore_all_tracks',
                         lambda *args, **kwargs: {'ok': False, 'reason': 'scroll_unavailable',
                                                  'still_locked': [], 'still_hidden': []})
+    monkeypatch.setattr(ui_extract_audio, '_set_row_hidden', lambda *args: None)
 
     result = ui_extract_audio.run_extract_audio(workdir=str(tmp_path))
 
@@ -435,16 +455,25 @@ def test_extract_audio_fails_when_separation_check_rejects(monkeypatch, tmp_path
     monkeypatch.setattr(ui_extract_audio, 'dprint', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio, '_ensure_edit_page', lambda _win: (win, True))
     monkeypatch.setattr(ui_extract_audio, 'ensure_maximized', lambda value: value)
-    monkeypatch.setattr(ui_extract_audio, '_top_text_cluster', lambda _win: ([], 75, win))
+    # [1/6] 回顶后能看到顶部两条字幕轨（新版少于此数会直接拒绝继续）
+    monkeypatch.setattr(ui_extract_audio, '_top_text_cluster',
+                        lambda _win: ([{'type': 'text', 'ymid': 80},
+                                       {'type': 'text', 'ymid': 40}], 75, win))
+    monkeypatch.setattr(ui_extract_audio, 'lock_track', lambda *args, **kwargs: None)
     monkeypatch.setattr(ui_extract_audio, '_safe_scan', lambda _win: next(scans))
     monkeypatch.setattr(ui_extract_audio, 'find_main_track', lambda *args: (main, True))
-    monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda: None)
+    monkeypatch.setattr(ui_extract_audio, 'select_main_track', lambda **kwargs: True)
+    # 分离前复检依赖真实 UI 扫描，不在流程用例覆盖范围内，直接放行
+    monkeypatch.setattr(ui_extract_audio, '_pre_separation_recheck', lambda _win, _subs: '')
     monkeypatch.setattr(ui_extract_audio.pyautogui, 'hotkey', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio.time, 'sleep', lambda _seconds: None)
+    # 回顶依赖真实窗口几何，流程用例里直接放行
+    monkeypatch.setattr(ui_extract_audio, '_scroll_to_top', lambda *args, **kwargs: (True, ''))
     _patch_extract_draft(monkeypatch, after_sig=damaged)
     monkeypatch.setattr(ui_core, 'save_screenshot', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio, 'restore_all_tracks',
                         lambda *args, **kwargs: forbidden.append('restore'))
+    monkeypatch.setattr(ui_extract_audio, '_set_row_hidden', lambda *args: None)
     monkeypatch.setattr(ui_extract_audio, '_write_final_layout',
                         lambda *args: forbidden.append('layout'))
 
@@ -545,3 +574,259 @@ def test_recognize_timeout_rejects_only_one_added_chinese_track(monkeypatch, tmp
     assert result['text_tracks_delta'] == 1
     assert result['english_texts_added'] == 1
     assert record_calls == []
+
+
+# ── 识别/翻译成轨结构闸门（异常样例：25 条译文压在同一点 → 32 轨/629 条 text）──
+
+def _text_mat(mid, text):
+    return {'id': mid, 'content': json.dumps({'text': text}, ensure_ascii=False)}
+
+
+def _seg(sid, mid, start, dur):
+    return {'id': sid, 'material_id': mid,
+            'target_timerange': {'start': start, 'duration': dur}}
+
+
+def _recognized_draft(strays=25):
+    """cn/en 各 300 段正常成两轨；strays 条 33ms 译文全落在 647.733s、各自单独成轨。"""
+    import verify_draft
+
+    tracks, texts, cn_segs, en_segs = [], [], [], []
+    for i in range(300):
+        st = i * 1_000_000
+        cn_segs.append(_seg(f'cn{i}', f'cnm{i}', st, 900_000))
+        en_segs.append(_seg(f'en{i}', f'enm{i}', st, 900_000))
+        texts += [_text_mat(f'cnm{i}', f'中文字幕{i}'), _text_mat(f'enm{i}', f'subtitle {i}')]
+    tracks.append({'type': 'text', 'attribute': 2, 'segments': cn_segs})
+    tracks.append({'type': 'text', 'attribute': 0, 'segments': en_segs})
+    for i in range(strays):
+        tracks.append({'type': 'text', 'attribute': 0,
+                       'segments': [_seg(f'st{i}', f'stm{i}', 647_733_000, 33_000)]})
+        texts.append(_text_mat(f'stm{i}', f'stray {i}'))
+    tracks.append({'type': 'video', 'segments': [_seg('v0', 'vm0', 0, 682_100_000)]})
+    return verify_draft, {'tracks': tracks, 'materials': {'texts': texts, 'videos': []}}
+
+
+def _dur_track(attr, prefix, durs):
+    """按给定时长序列造一条 text 轨（起点间隔 1s，保证不触发同起点堆叠）。"""
+    return {'type': 'text', 'attribute': attr, 'segments': [
+        _seg(f'{prefix}{i}', f'{prefix}m{i}', i * 1_000_000, d)
+        for i, d in enumerate(durs)]}
+
+
+def _two_track_draft(cn_durs, en_durs):
+    texts = []
+    for prefix, durs in (('cn', cn_durs), ('en', en_durs)):
+        texts += [_text_mat(f'{prefix}m{i}', f'{prefix} {i}') for i in range(len(durs))]
+    return {'tracks': [_dur_track(2, 'cn', cn_durs), _dur_track(0, 'en', en_durs)],
+            'materials': {'texts': texts, 'videos': []}}
+
+
+def test_text_pack_issues_passes_normal_two_track_draft():
+    vd, draft = _recognized_draft(strays=0)
+
+    pack = vd.text_pack_issues(draft)
+
+    assert pack['zero_dur'] == []
+    assert pack['zero_dur_warn'] == []
+    assert pack['stacked'] == []
+    assert vd.pack_brief(pack) == ''
+    assert vd.pack_warn_brief(pack) == ''
+
+
+def test_text_pack_issues_allows_english_split_and_flag_text_tracks():
+    """生产草稿的真实形态：英文轨因长句拆分多于中文轨、另有 1~16 段的预设文字轨。"""
+    import verify_draft
+
+    tracks, texts, cn_segs, en_segs = [], [], [], []
+    for i in range(100):
+        st = i * 2_000_000
+        cn_segs.append(_seg(f'cn{i}', f'cnm{i}', st, 1_800_000))
+        texts.append(_text_mat(f'cnm{i}', f'中文字幕{i}'))
+    for i in range(135):                       # 英文拆分后段数合法地多于中文
+        st = i * 1_500_000
+        en_segs.append(_seg(f'en{i}', f'enm{i}', st, 1_300_000))
+        texts.append(_text_mat(f'enm{i}', f'subtitle {i}'))
+    tracks.append({'type': 'text', 'attribute': 2, 'segments': cn_segs})
+    tracks.append({'type': 'text', 'attribute': 0, 'segments': en_segs})
+    for k, (start, n) in enumerate(((0, 1), (30_000_000, 5))):
+        tracks.append({'type': 'text', 'attribute': 0, 'segments': [
+            _seg(f'p{k}_{j}', f'pm{k}_{j}', start + j * 3_000_000, 2_000_000)
+            for j in range(n)]})
+        texts += [_text_mat(f'pm{k}_{j}', f'预设文字{k}{j}') for j in range(n)]
+    tracks.append({'type': 'video', 'segments': [_seg('v0', 'vm0', 0, 200_000_000)]})
+
+    pack = verify_draft.text_pack_issues(
+        {'tracks': tracks, 'materials': {'texts': texts, 'videos': []}})
+
+    assert pack['text_tracks'] == 4
+    assert pack['zero_dur'] == [] and pack['stacked'] == []
+    assert verify_draft.pack_brief(pack) == ''
+
+
+def test_text_pack_issues_catches_piled_stray_tracks():
+    vd, draft = _recognized_draft(strays=25)
+
+    pack = vd.text_pack_issues(draft)
+
+    assert len(pack['zero_dur']) == 25
+    assert pack['zero_dur'][0]['dur_ms'] == 33
+    assert len(pack['stacked']) == 1
+    assert pack['stacked'][0]['count'] == 25
+    assert pack['stacked'][0]['tracks'] == 25
+    brief = vd.pack_brief(pack)
+    assert '堆叠1处/25段' in brief and '零时长超标25轨/25段' in brief
+
+
+def test_text_pack_issues_single_zero_dur_is_warn_not_fail():
+    """单条一帧（33ms）不再一条就阻断 → warn，且告警明细必须可打印（不静默）。"""
+    vd, _ = _recognized_draft(strays=0)
+    durs = [900_000] * 300
+    durs[7] = 33_000
+
+    pack = vd.text_pack_issues(_two_track_draft(durs, [900_000] * 300))
+
+    assert pack['zero_dur'] == []
+    assert len(pack['zero_dur_warn']) == 1
+    w = pack['zero_dur_warn'][0]
+    assert w['kind'] == '中文' and w['count'] == 1 and w['total'] == 300
+    assert w['first_dur_ms'] == 33 and w['first_start'] == 7_000_000
+    assert vd.pack_brief(pack) == ''
+    warn = vd.pack_warn_brief(pack)
+    assert '中文轨#0 零时长1/300段' in warn and '0.33%' in warn
+
+
+def test_text_pack_issues_two_zero_dur_is_still_warn():
+    vd, _ = _recognized_draft(strays=0)
+    durs = [900_000] * 300
+    durs[3] = durs[9] = 33_000
+
+    pack = vd.text_pack_issues(_two_track_draft(durs, [900_000] * 300))
+
+    assert pack['zero_dur'] == []
+    assert len(pack['zero_dur_warn']) == 1
+    assert pack['zero_dur_warn'][0]['count'] == 2
+    assert vd.pack_brief(pack) == ''
+
+
+def test_text_pack_issues_three_zero_dur_blocks_by_count():
+    vd, _ = _recognized_draft(strays=0)
+    durs = [900_000] * 300
+    durs[3] = durs[9] = durs[20] = 33_000
+
+    pack = vd.text_pack_issues(_two_track_draft(durs, [900_000] * 300))
+
+    assert len(pack['zero_dur']) == 3
+    assert pack['zero_dur_warn'] == []
+    st = pack['zero_dur_stats'][0]
+    assert st['blocking'] is True and st['reason'] == '段数≥3'
+    brief = vd.pack_brief(pack)
+    assert '零时长超标1轨/3段' in brief and '中文轨#0 3/300=1.00%' in brief
+
+
+def test_text_pack_issues_blocks_when_zero_dur_ratio_over_one_percent():
+    """段数不到 3，但占该轨总段数 >1% → 阻断（短轨里 1 条就超标）。"""
+    vd, _ = _recognized_draft(strays=0)
+    en_durs = [900_000] * 50
+    en_durs[4] = 33_000
+
+    pack = vd.text_pack_issues(_two_track_draft([900_000] * 300, en_durs))
+
+    st = pack['zero_dur_stats'][0]
+    assert st['kind'] == '英文' and st['count'] == 1 and st['total'] == 50
+    assert st['blocking'] is True and st['reason'] == '占比>1%'
+    assert len(pack['zero_dur']) == 1
+    assert '英文轨#1 1/50=2.00%' in vd.pack_brief(pack)
+
+
+def test_text_pack_issues_zero_dur_counted_per_track_not_merged():
+    """中/英各算各的：CN 2/1000=0.2% 只告警，EN 2/100=2% 阻断，不因合并成 4/1100 互相稀释。"""
+    vd, _ = _recognized_draft(strays=0)
+    cn_durs = [900_000] * 1000
+    cn_durs[10] = cn_durs[500] = 33_000
+    en_durs = [900_000] * 100
+    en_durs[2] = en_durs[60] = 33_000
+
+    pack = vd.text_pack_issues(_two_track_draft(cn_durs, en_durs))
+
+    by_kind = {s['kind']: s for s in pack['zero_dur_stats']}
+    assert by_kind['中文']['blocking'] is False
+    assert by_kind['英文']['blocking'] is True
+    assert len(pack['zero_dur']) == 2
+    assert {x['kind'] for x in pack['zero_dur']} == {'英文'}
+    assert len(pack['zero_dur_warn']) == 1 and pack['zero_dur_warn'][0]['kind'] == '中文'
+    brief = vd.pack_brief(pack)
+    assert '零时长超标1轨/2段' in brief and '英文轨#1 2/100=2.00%' in brief
+    assert '中文轨#0 零时长2/1000段' in vd.pack_warn_brief(pack)
+
+
+def test_text_pack_issues_ignores_short_pair_at_same_start():
+    """同一时刻 2 条（中英对照）是正常形态，不能误判为压堆。"""
+    vd, draft = _recognized_draft(strays=0)
+    # 把第二段英文挪到与第一段中文同起点
+    en0 = draft['tracks'][1]['segments'][0]
+    en0['target_timerange']['start'] = draft['tracks'][0]['segments'][1]['target_timerange']['start']
+
+    pack = vd.text_pack_issues(draft)
+
+    assert pack['stacked'] == []
+
+
+def _recognize_success_env(monkeypatch):
+    """把一轮「条数增量达标」的识别流程搭起来（文本轨 +1、texts 10→12、英文 300）。"""
+    clock = _FakeClock()
+    win = object()
+    existing = {'type': 'text', 'ymid': 100}
+    scans = iter([([existing],), ([existing],)])
+    text_counts = iter([10, 12])
+    english_counts = iter([0, 300])
+    monkeypatch.setattr(ui_recognize_translate, 'time', clock)
+    monkeypatch.setattr(ui_recognize_translate, 'op_stage', lambda *args: None)
+    monkeypatch.setattr(ui_recognize_translate, 'dprint', lambda *args: None)
+    monkeypatch.setattr(ui_recognize_translate, 'connect_jianying',
+                        lambda *args, **kwargs: (win, 'edit'))
+    monkeypatch.setattr(ui_recognize_translate, 'ensure_maximized', lambda value: value)
+    monkeypatch.setattr(ui_recognize_translate, 'scan_tracks', lambda _win: next(scans))
+    monkeypatch.setattr(ui_recognize_translate, '_draft_texts_count',
+                        lambda: next(text_counts))
+    monkeypatch.setattr(ui_recognize_translate, '_draft_english_text_count',
+                        lambda: next(english_counts))
+    monkeypatch.setattr(ui_recognize_translate, '_cal', lambda _key, default: default)
+    monkeypatch.setattr(ui_recognize_translate, '_record_subtitle_tracks',
+                        lambda *args: None)
+    monkeypatch.setattr(ui_recognize_translate, 'op_timeline', lambda *args: False)
+    deselected = []
+    monkeypatch.setattr(ui_recognize_translate, 'deselect_all',
+                        lambda _win: deselected.append(True) or {'ok': True})
+    return deselected
+
+
+def test_recognize_rejects_piled_translation_even_if_counts_pass(monkeypatch, tmp_path):
+    deselected = _recognize_success_env(monkeypatch)
+    vd, draft = _recognized_draft(strays=25)
+    pack = vd.text_pack_issues(draft)
+    monkeypatch.setattr(ui_recognize_translate, '_draft_text_pack', lambda: pack)
+
+    result = ui_recognize_translate.run_recognize_translate(
+        workdir=str(tmp_path), timeout_sec=1, wait_only=True)
+
+    assert result['ok'] is False
+    assert '字幕成轨结构异常' in result['error']
+    assert '同起点堆叠1处/25段' in result['error']
+    assert '零时长超标25轨/25段' in result['error']
+    assert result['text_pack'] is pack
+    assert deselected == [True]     # 判失败也要清掉全选
+
+
+def test_recognize_accepts_normal_draft_after_pack_gate(monkeypatch, tmp_path):
+    deselected = _recognize_success_env(monkeypatch)
+    vd, draft = _recognized_draft(strays=0)
+    monkeypatch.setattr(ui_recognize_translate, '_draft_text_pack',
+                        lambda: vd.text_pack_issues(draft))
+
+    result = ui_recognize_translate.run_recognize_translate(
+        workdir=str(tmp_path), timeout_sec=1, wait_only=True)
+
+    assert result['ok'] is True
+    assert result['error'] is None
+    assert deselected == [True]
