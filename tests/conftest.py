@@ -54,6 +54,24 @@ if pytest is not None:
         install_toast_recorder(calls, monkeypatch.setattr)
         return calls
 
+    @pytest.fixture(autouse=True)
+    def isolated_stream_manifests(tmp_path, monkeypatch):
+        """所有用例的串流清单一律写进 tmp_path，绝不落真实
+        pipeline/_stream_manifests（用例跑完真实目录条目数必须不变）。
+
+        覆盖两条实际写入路径：
+          - stream_manifest.MANIFEST_DIR：record / clean / list 的读写根
+          - job_manifest.STREAM_MANIFEST_DIR：record_video 的清单回写根
+        都是函数内按模块全局取值，运行时 monkeypatch 即可生效。
+        """
+        import job_manifest as jm
+        import stream_manifest as sm
+
+        d = str(tmp_path / "stream_manifests")
+        monkeypatch.setattr(sm, "MANIFEST_DIR", d)
+        monkeypatch.setattr(jm, "STREAM_MANIFEST_DIR", d)
+        return d
+
 
 # ── 脚本式测试收集 ────────────────────────────────────────────────
 # 仓库里多数 test_*.py 是「脚本式」：模块级直接执行断言，末尾 sys.exit()。
