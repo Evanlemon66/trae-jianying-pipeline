@@ -18,7 +18,7 @@ expected_track_count（应校验的轨道总数）分开命名，两者不是同
   3) 整轮跑完才看 admission.open.close_on_exit（true=正常关闭并清理临时文件，false=保留）。
 收尾日志会明确打印本次是"中途停点保留窗口"还是"跑完按配置关闭/保留"。
 
-阶段（--stop-after，默认 locate）：
+阶段（--stop-after，默认 export）：
   fullscreen  Ctrl+F 进全屏基准态 → 记录 fullscreen_rect + 四象限
               （此后所有坐标均以该态为参照；每阶段前 ensure_fullscreen 守卫）
   tracks      先重置全 visible（排除遗留状态）→ 主轨双重校验(M1最底video + M2封面按钮)
@@ -32,7 +32,12 @@ expected_track_count（应校验的轨道总数）分开命名，两者不是同
               ⚠️ stop_after=wait 时收尾恢复所有轨道；后续还有阶段则保持预设隐藏
   recognize   识别中文字幕+翻译英文（= pipeline [4]，调 ui_recognize_translate）
   extract     分离音频+字幕轨收尾+布局落盘（= pipeline [5]，调 ui_extract_audio）
+  verify      UI 终检三态对账（= pipeline [5] 尾部 run_verify，调 ui_verify）
   export      导出 MP4（= pipeline [6]，调 ui_pipeline.step_export）
+
+收尾回滚口径：只有检测到草稿结构被破坏（主轨段数下降/主轨消失/videos 减少/
+字幕归零）才按本轮起点快照回滚；纯业务失败只留证、不动草稿。回滚前会确认
+剪映已退出（--keep-window 时跳过回滚），回滚后复检结构并写入报告。
 
 输出：pipeline_ui/ui_calibration.json（所有已校准点位，环境指纹绑定）
 """
@@ -88,7 +93,7 @@ REPORT_PARTIAL_PATH = os.path.join(OUT_DIR, '_admission_report.partial.json')
 # 准入草稿的结构基线：建稿成功后写入；复用前比对，判定草稿是否已被上一轮跑脏
 BASELINE_PATH = os.path.join(OUT_DIR, '_admission_draft_baseline.json')
 STAGES = ['fullscreen', 'tracks', 'select', 'audio_tab', 'locate', 'enable', 'wait',
-          'recognize', 'extract', 'export']
+          'recognize', 'extract', 'verify', 'export']
 
 # ===== 逻辑偏移常量（相对基准，100% DPI 口径；读取方按 ×dpi_scale 换算）=====
 # 这些不是"1920 绝对像素"，而是跨 DPI 复用的逻辑量：
@@ -166,16 +171,41 @@ def _dump_report(ui_params, results, calib, marks, final=False,
                 'error': r.get('error'),
                 'metrics': r.get('metrics', {}),
             }
-        if error and not failed_stage:
-            # 阶段内显式声明优先（如 enable 勾选不通过），其次才是打点推断
-            failed_stage = _RUN_STATE.get('failed_stage') or _infer_failed_stage(marks, results)
+        # 阶段三态：True=通过 / False=显式失败 / None（缺失）=unknown（该阶段未参与本轮，
+        # 如仅被读取入参或未到达）。unknown 单列统计，不折算成失败。
+        # 只统计 STAGES 里的真实阶段：start/audio/cleanup 等打点键只是过程记录，
+        # 不能因为它们没有 ok 就把整轮判成 unknown。
+        stage_names = [n for n in stages if n in STAGES]
+        passed_stages = [n for n in stage_names if stages[n]['ok'] is True]
+        failed_stages = [n for n in stage_names if stages[n]['ok'] is False]
+        unknown_stages = [n for n in stage_names if stages[n]['ok'] is None]
+        if error or failed_stages:
+            overall_ok = False
+        elif unknown_stages:
+            overall_ok = None
+        elif passed_stages:
+            overall_ok = True
+        else:
+            overall_ok = False
+        if not failed_stage:
+            # 归属优先级：阶段自己写的 ok=False（本轮实测）> 阶段内显式声明
+            # （如 enable 勾选不通过）> 打点推断（仅在确实抛错时）。
+            if failed_stages:
+                failed_stage = failed_stages[0]
+            elif _RUN_STATE.get('failed_stage'):
+                failed_stage = _RUN_STATE['failed_stage']
+            elif error:
+                failed_stage = _infer_failed_stage(marks, results)
         t_base = marks[0][1] if marks else time.time()
         rec = {
             'generated_by': 'admission_test',
             'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'ok': bool(stages) and all(s.get('ok') is True for s in stages.values())
-                  and not error,
-            'failed_stage': failed_stage if error else None,
+            'ok': overall_ok,
+            'stage_counts': {'pass': len(passed_stages), 'fail': len(failed_stages),
+                             'unknown': len(unknown_stages)},
+            'failed_stages': failed_stages,
+            'unknown_stages': unknown_stages,
+            'failed_stage': failed_stage,
             'failure_class': _classify_failure(error, failed_stage),
             'error': error,
             'env': calib.get('env', {}),
@@ -245,11 +275,11 @@ SNAPSHOT_DIR = os.path.join(OUT_DIR, '_draft_snapshots')
 
 
 def _snapshot_draft(draft_dir):
-    """本轮准入开始前给 draft_content.json 存快照（失败退出时自动回滚用）。
+    """本轮准入开始前给 draft_content.json 存快照（结构被破坏时回滚用）。
 
     快照点在「草稿已按三层判据就绪、任何点击/按键之前」，即本轮唯一的可信起点。
     存到 pipeline_ui/_draft_snapshots（独立目录，剪映不会读写这里）。
-    返回快照路径；存不了返回 None（不阻塞准入，失败时退化为不回滚）。
+    返回快照路径；存不了返回 None（不阻塞准入，结构被破坏时退化为不回滚）。
     """
     src = os.path.join(draft_dir, 'draft_content.json')
     if not os.path.isfile(src):
@@ -264,32 +294,212 @@ def _snapshot_draft(draft_dir):
         dprint(f'  📸 本轮草稿快照: {dst}')
         return dst
     except Exception as e:
-        dprint(f'  ⚠️ 草稿快照失败（继续准入，失败时无法自动回滚）: {e}')
+        dprint(f'  ⚠️ 草稿快照失败（继续准入，结构被破坏时无法自动回滚）: {e}')
         return None
 
 
-def _rollback_draft(snapshot, draft_dir):
-    """失败退出时用本轮起点快照覆盖 draft_content.json，避免把跑脏的草稿留给用户。
+def _draft_struct(path):
+    """回滚判据用的草稿结构：复用 _draft_sig，补一个字幕条数。"""
+    from ui_extract_audio import _draft_sig
+    sig = _draft_sig(path)
+    with open(path, encoding='utf-8') as f:
+        d = json.load(f)
+    texts = (d.get('materials') or {}).get('texts') or []
+    if not texts:   # 兼容字幕只存在 text 轨片段里的草稿
+        texts = [s for t in d.get('tracks') or [] if t.get('type') == 'text'
+                 for s in t.get('segments') or []]
+    sig['n_texts'] = len(texts)
+    return sig
 
-    必须在剪映关闭之后调用（_finalize_jianying 之后），否则内存态会在退出时覆盖。
+
+_STRUCT_KEYS = ('n_tracks', 'main_id', 'main_segments', 'n_videos', 'n_texts')
+
+
+def _struct_summary(sig):
+    return {k: sig.get(k) for k in _STRUCT_KEYS}
+
+
+def _destruction_reason(snapshot, draft_dir):
+    """当前草稿相对本轮起点快照是否被结构性破坏 → (原因串|None, 证据)。
+
+    复用 ui_extract_audio 的破坏签名（主轨消失/变类型/段数减少/videos 减少/
+    原声顶替），再加一条「字幕归零」。业务失败（导出失败、verify 不过、
+    子进程非 0）不会命中这些判据，因此不会被回滚覆盖。
     """
-    if not snapshot or not draft_dir or not os.path.isfile(snapshot):
-        dprint('  ⚠️ 无本轮草稿快照，跳过自动回滚')
-        return False
-    dst = os.path.join(draft_dir, 'draft_content.json')
+    cur = os.path.join(draft_dir, 'draft_content.json')
+    if not os.path.isfile(cur):
+        return 'draft_content.json 不存在（被删除或改名）', {}
     try:
-        shutil.copy2(snapshot, dst)
-        dprint(f'  ↩️ 已把草稿回滚到本轮起点快照: {dst}')
+        before, after = _draft_struct(snapshot), _draft_struct(cur)
     except Exception as e:
-        dprint(f'  ❌ 草稿自动回滚失败: {e}')
-        return False
+        return f'结构比对失败（{type(e).__name__}: {e}）', {}
+    ev = {'before': _struct_summary(before), 'after': _struct_summary(after)}
+    from ui_extract_audio import _destroyed_reason
+    why = _destroyed_reason(before, after)
+    if why:
+        return why, ev
+    if before.get('n_texts', 0) > 0 and after.get('n_texts', 0) == 0:
+        return f'字幕归零（texts {before["n_texts"]}→0）', ev
+    return None, ev
+
+
+def _jianying_running():
+    """剪映进程是否仍在运行（查不到按"未运行"处理，避免永久跳过回滚）。"""
     try:
         out = os.popen('tasklist /FI "IMAGENAME eq JianyingPro.exe" /NH').read()
-        if 'JianyingPro.exe' in out:
-            dprint('  ⚠️ 剪映仍在运行：回滚可能被其内存态覆盖，请关闭草稿后确认磁盘版本')
+        return 'JianyingPro.exe' in out
     except Exception:
-        pass
-    return True
+        return False
+
+
+def _close_jianying_for_rollback():
+    """回滚前确保剪映已退出：先回首页再正常关闭，最后复核进程。
+
+    只接管本轮自己拉起的实例；用户实例不关闭（沿用 _finalize_jianying 的归属口径）。
+    """
+    import ui_nav
+    if not getattr(ui_nav, 'JIANYING_LAUNCHED', False):
+        return 'not_launched'
+    if not _jianying_running():
+        return 'already_exited'
+    try:
+        ui_nav.switch_to_home(max_wait=15)
+    except Exception as e:
+        dprint(f'  [warn] 回滚前回首页失败（忽略，继续关闭）: {e}')
+    try:
+        ui_nav.close_jianying()
+    except Exception as e:
+        dprint(f'  [warn] 回滚前关闭剪映失败（忽略）: {e}')
+    for _ in range(10):
+        if not _jianying_running():
+            return 'closed'
+        time.sleep(1)
+    return 'still_running'
+
+
+def _restore_snapshot(snapshot, draft_dir):
+    """快照写回 draft_content.json，并重置同目录已存在的 .bak / template*.tmp。
+
+    只覆盖已存在的文件：不存在就不新建，避免凭空造出剪映不认识的临时文件。
+    """
+    with open(snapshot, 'rb') as f:
+        data = f.read()
+    targets = [os.path.join(draft_dir, 'draft_content.json'),
+               os.path.join(draft_dir, 'draft_content.json.bak')]
+    try:
+        for name in os.listdir(draft_dir):
+            if name.startswith('template') and name.endswith('.tmp'):
+                targets.append(os.path.join(draft_dir, name))
+    except Exception as e:
+        dprint(f'  [warn] 枚举 template*.tmp 失败（忽略）: {e}')
+    synced, failed = [], []
+    for p in targets:
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, 'wb') as f:
+                f.write(data)
+            synced.append(os.path.basename(p))
+        except Exception as e:
+            failed.append(f'{os.path.basename(p)}: {e}')
+    return (not failed), synced, failed
+
+
+def _verify_restored(snapshot, draft_dir):
+    """回滚复检：恢复后的结构与快照一致（逐键比对 + 字节一致）。"""
+    cur = os.path.join(draft_dir, 'draft_content.json')
+    try:
+        snap, now = _draft_struct(snapshot), _draft_struct(cur)
+    except Exception as e:
+        return {'ok': False, 'why': f'复检读取失败: {type(e).__name__}: {e}'}
+    diff = {k: [snap.get(k), now.get(k)] for k in _STRUCT_KEYS
+            if snap.get(k) != now.get(k)}
+    try:
+        with open(snapshot, 'rb') as f1, open(cur, 'rb') as f2:
+            same_bytes = f1.read() == f2.read()
+    except Exception:
+        same_bytes = None
+    return {'ok': not diff and bool(same_bytes), 'diff': diff,
+            'same_bytes': same_bytes, 'after': _struct_summary(now)}
+
+
+def _write_rollback_report(info):
+    """回滚结论写入正式准入报告（日志 + _admission_report.json 的 rollback 段）。"""
+    _RUN_STATE['rollback'] = info
+    try:
+        with open(REPORT_PATH, encoding='utf-8') as f:
+            rec = json.load(f)
+        rec['rollback'] = info
+        with open(REPORT_PATH, 'w', encoding='utf-8') as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        dprint(f'  [warn] 回滚结论写报告失败: {e}')
+
+
+def _maybe_rollback(draft_dir, snapshot, keep_window=False):
+    """仅当草稿结构真被破坏才回滚；其余失败只留证、不动草稿。
+
+    回滚三步（缺一不可）：剪映确认退出 → 覆盖 draft_content.json（已存在的
+    .bak / template*.tmp 一并重置）→ 复检结构回到快照。结论写日志与报告。
+    """
+    info = {'snapshot': snapshot, 'draft_dir': draft_dir, 'destroyed': None,
+            'reason': None, 'rolled_back': False, 'synced': [], 'failed': [],
+            'verified': None, 'skipped': None, 'exit': None}
+    if not snapshot or not draft_dir or not os.path.isfile(snapshot):
+        dprint('  ⚠️ 无本轮草稿快照：结构回滚不可用（仅留证）')
+        info['skipped'] = 'no_snapshot'
+        _write_rollback_report(info)
+        return info
+
+    reason, ev = _destruction_reason(snapshot, draft_dir)
+    info.update(ev)
+    info['reason'] = reason
+    if not reason:
+        dprint('  ✅ 草稿结构完好：仅留证，不回滚（业务失败不覆盖草稿）')
+        info['destroyed'] = False
+        _write_rollback_report(info)
+        return info
+    info['destroyed'] = True
+    dprint(f'  ⛔ 检测到草稿结构被破坏：{reason}')
+
+    if keep_window:
+        dprint('  ⚠️ --keep-window 指定保留窗口：跳过回滚'
+               '（内存态仍在，回滚会被覆盖）')
+        info['skipped'] = 'keep_window'
+        _write_rollback_report(info)
+        return info
+
+    exit_state = _close_jianying_for_rollback()
+    info['exit'] = exit_state
+    if exit_state in ('not_launched', 'still_running'):
+        why = ('本轮未拉起剪映（不接管用户实例）' if exit_state == 'not_launched'
+               else '剪映未能在 10s 内退出')
+        dprint(f'  ⚠️ 回滚前确认剪映已退出：{why} → 跳过回滚（回滚会被内存态覆盖）')
+        info['skipped'] = exit_state
+        _write_rollback_report(info)
+        return info
+    dprint(f'  ✅ 回滚前确认剪映已退出（{exit_state}）')
+
+    ok, synced, failed = _restore_snapshot(snapshot, draft_dir)
+    info['rolled_back'] = ok
+    info['synced'] = synced
+    info['failed'] = failed
+    if not ok:
+        dprint(f'  ❌ 草稿回滚部分失败: {failed}')
+        _write_rollback_report(info)
+        return info
+    dprint(f'  ↩️ 已按本轮起点快照回滚: {synced}')
+
+    time.sleep(0.3)   # 给剪映不存在的写盘竞争留一点观察窗（已确认退出）
+    ver = _verify_restored(snapshot, draft_dir)
+    info['verified'] = ver
+    if ver.get('ok'):
+        dprint(f'  ✅ 回滚复检通过：结构回到快照 {ver.get("after")}')
+    else:
+        dprint(f'  ❌ 回滚复检未通过：diff={ver.get("diff")} '
+               f'same_bytes={ver.get("same_bytes")} why={ver.get("why")}')
+    _write_rollback_report(info)
+    return info
 
 
 def _resolve_preset_plan(cfg):
@@ -412,7 +622,7 @@ def _ensure_draft(cfg, presets):
         _open_admission_draft(cfg, after_build=True)
 
 
-def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
+def calibrate(stop_after='export', vocal_mode='vocal', target_screen=None):
     assert vocal_mode in ('none', 'vocal', 'background'), \
         f"vocal_mode 必须是 none/vocal/background，Got {vocal_mode!r}"
     # S1-2：env 占位——实际值在 connect_jianying（内含放置补丁，窗口已挪主屏）
@@ -465,7 +675,7 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
     }
     # 三层判据 → 复用/打开/重建（可能要冷启动重开剪映）
     _ensure_draft(_adm_cfg, _presets)
-    # 本轮起点快照：必须在任何点击/按键之前，失败退出时据此自动回滚
+    # 本轮起点快照：必须在任何点击/按键之前，检测到结构被破坏时据此回滚
     _RUN_STATE['draft_dir'] = _admission_draft_dir(_adm_cfg)
     _RUN_STATE['draft_snapshot'] = _snapshot_draft(_RUN_STATE['draft_dir'])
     # 可能刚冷启动重开过，旧 win 句柄已失效：重新取当前编辑页窗口后再算 env
@@ -531,6 +741,10 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
     dprint(f"  全屏基准态 rect={rect}  screen={calib['env']['screen']}")
     dprint("  象限: Q2=右上(Tab区)  Q4=右下(人声分离开关区)")
     _shot(win, '_admission_fullscreen.png')
+    stage_results['fullscreen'] = {
+        'ok': True, 'duration_s': round(time.time() - t0, 1),
+        'metrics': {'rect': list(rect), 'screen': calib['env'].get('screen'),
+                    'dpi_scale': calib['env'].get('dpi_scale'), 'page_type': _pt}}
     _mark('fullscreen')
 
     # ---------- 阶段 tracks：双重校验主轨 + 预设轨锁定隐藏 ----------
@@ -590,6 +804,7 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
 
     # ---------- 阶段 select：Home 回首帧 + Ctrl+A ----------
     if _reached('select'):
+        _sel_t0 = time.time()
         dprint('\n[select] Home 回首帧 → Ctrl+A（不点轨道，避免固定坐标）')
         win = ensure_fullscreen(win)
         op_mark('按键', 'Home（播放头回第一帧）')
@@ -599,11 +814,16 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         pyautogui.hotkey('ctrl', 'a')
         time.sleep(1.0)                          # 等面板懒加载
         dprint('  已 Home + Ctrl+A 全选')
+        stage_results['select'] = {
+            'ok': True, 'duration_s': round(time.time() - _sel_t0, 1),
+            'metrics': {'keys': ['Home', 'Ctrl+A'], 'settle_s': 1.4}}
         _mark('select')
 
     # ---------- 阶段 audio_tab：Q2 点Tab + 滚到「人声分离」+ 面板校验 ----------
     audio_pos, switch = None, None
+    _tab_src = None
     if _reached('audio_tab'):
+        _aud_t0 = time.time()
         op_stage('3 人声分离')
         dprint('\n[audio_tab] Q2 OCR 点「音频」Tab → 滚轮下滚看见完整人声分离 → 面板校验')
         from ocr_locate import find_text_in_window
@@ -621,6 +841,7 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
                                   region=(WW // 2, 0, WW, int(round(120 * _rs))))
         if hit:
             audio_pos = (int(hit[0]), int(hit[1]))
+            _tab_src = 'ocr'
             dprint(f'  Q2 音频Tab = {audio_pos}（OCR 命中）')
             from ui_calibration import update_param
             update_param('audio_tab', 'coord', [audio_pos[0], audio_pos[1]])
@@ -629,6 +850,7 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
             coord = get_param('audio_tab', 'coord', None)
             if coord:
                 audio_pos = (int(coord[0]), int(coord[1]))
+                _tab_src = 'json_fallback'
                 dprint(f'  ⚠️ Q2 音频Tab OCR 未命中，用 JSON 兜底 {audio_pos}')
             else:
                 # 兜底 = 窗口右缘 - 逻辑偏移×dpi_scale（不再写死 1920 绝对点）
@@ -636,6 +858,7 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
                 _sc = ui_track_ops._ui_scale(win)
                 audio_pos = (int(_wr[2]) - int(round(AUDIO_TAB_FALLBACK_FROM_RIGHT_LOGICAL[0] * _sc)),
                              int(_wr[1]) + int(round(AUDIO_TAB_FALLBACK_FROM_RIGHT_LOGICAL[1] * _sc)))
+                _tab_src = 'derived'
                 dprint(f'  ⚠️ OCR 未命中音频Tab，用相对推导 {audio_pos}（scale={_sc}）')
         _mark('audio.locate_tab')
 
@@ -656,6 +879,11 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
                     audio_pos = (int(audio_pos[0]) + dx, int(audio_pos[1]))
                     break
             else:
+                stage_results['audio_tab'] = {
+                    'ok': False, 'duration_s': round(time.time() - _aud_t0, 1),
+                    'error': '点「音频」Tab（含横移重试）后仍未切到音频面板',
+                    'metrics': {'audio_pos': [int(audio_pos[0]), int(audio_pos[1])],
+                                'coord_source': _tab_src, 'panel_is_audio': False}}
                 raise RuntimeError('点「音频」Tab 后仍未切到音频面板')
         _mark('audio.click_tab')
 
@@ -669,7 +897,18 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         # 滚轮往下滚，直到真正看见完整「人声分离」
         win, found = scroll_until_vocal_visible(win, max_rounds=20)
         if not found:
+            stage_results['audio_tab'] = {
+                'ok': False, 'duration_s': round(time.time() - _aud_t0, 1),
+                'error': '滚动 20 轮仍未在右半看到「人声分离」',
+                'metrics': {'audio_pos': [int(audio_pos[0]), int(audio_pos[1])],
+                            'coord_source': _tab_src, 'panel_is_audio': True,
+                            'scroll_vocal_found': False}}
             raise RuntimeError('滚动 20 轮仍未在右半看到「人声分离」')
+        stage_results['audio_tab'] = {
+            'ok': True, 'duration_s': round(time.time() - _aud_t0, 1),
+            'metrics': {'audio_pos': [int(audio_pos[0]), int(audio_pos[1])],
+                        'coord_source': _tab_src, 'panel_is_audio': True,
+                        'scroll_vocal_found': bool(found)}}
         _mark('audio.scroll_to_vocal')
         # ⚠️ 已删除重复的 panel_is_audio 校验（click_tab 处已校验过一次）
 
@@ -725,6 +964,7 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
 
     # ---------- 阶段 enable：勾选人声分离 → 立即选下拉模式 ----------
     if _reached('enable'):
+        _ena_t0 = time.time()
         dprint(f'\n[enable] 勾选「人声分离」（vocal_mode={vocal_mode}）')
         from ui_vocal_separate import ensure_vocal_on, select_vocal_mode
         win = ensure_fullscreen(win)
@@ -736,24 +976,40 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         # 勾选验证不通过 = 失败，不往下走（单次点击 + 20s 轮询未确认就继续跑是假成功）。
         # 注意：失败时不能打 enable.check_switch 点，否则 failed_stage 会被推成 wait。
         if not enabled:
+            stage_results['enable'] = {
+                'ok': False, 'duration_s': round(time.time() - _ena_t0, 1),
+                'error': '人声分离开关未确认开启（蓝勾/处理中/百分比三判据均未命中）',
+                'metrics': {'enabled': False, 'vocal_mode': vocal_mode,
+                            'mode_selected': None}}
             _RUN_STATE['failed_stage'] = 'enable'
             raise RuntimeError('enable 失败：人声分离开关单次点击后 20s 轮询未确认开启'
                                '（勾选验证=False，蓝勾/该行处理中/百分比三判据都未命中）')
         _mark('enable.check_switch')
 
         # 用户明确：勾选后立刻选下拉模式，再等分离完成；只有一次分离
+        mode_selected = None
         if vocal_mode != 'none' and enabled:
             label = '仅保留人声' if vocal_mode == 'vocal' else '仅保留背景声'
             dprint(f'  立即下拉选「{label}」')
             win, _ = connect_jianying()
             selected = select_vocal_mode(win, mode=vocal_mode)
+            mode_selected = bool(selected)
             calib['vocal_switch']['mode_selected'] = bool(selected)
             dprint(f'  下拉选择 = {selected}')
             _shot(win, '_admission_mode_selected.png')
             _mark('enable.select_mode')
+        # 勾选已真实执行 → ok=勾选结果；下拉模式也执行过时并入判定（未选 none 则不参与）
+        _mode_ok = mode_selected is not False
+        stage_results['enable'] = {
+            'ok': bool(enabled) and _mode_ok,
+            'duration_s': round(time.time() - _ena_t0, 1),
+            'error': None if _mode_ok else f'下拉模式「{vocal_mode}」未选中',
+            'metrics': {'enabled': bool(enabled), 'vocal_mode': vocal_mode,
+                        'mode_selected': mode_selected}}
 
     # ---------- 阶段 wait：End 跳末帧 → 等这次分离完成（唯一一次） ----------
     if _reached('wait'):
+        _wai_t0 = time.time()
         dprint('\n[wait] End 跳末帧 → 等分离完成')
         from ui_vocal_separate import wait_vocal_done
         win, _ = connect_jianying()
@@ -762,10 +1018,18 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
         dprint(f'  分离等待结果: {res}')
         # 整个过程没见到"处理中" = 从没开始处理，不能当已完成（也不打点，保持 failed_stage=wait）
         if not res.get('ok'):
+            stage_results['wait'] = {
+                'ok': False, 'duration_s': round(time.time() - _wai_t0, 1),
+                'error': (f"人声分离未完成（reason={res.get('reason')}，"
+                          f"seen_processing={res.get('seen_processing')}）"),
+                'metrics': {k: v for k, v in res.items() if k != 'ok'}}
             _RUN_STATE['failed_stage'] = 'wait'
             raise RuntimeError(
                 f"wait 失败: 人声分离未完成（reason={res.get('reason')}，"
                 f"seen_processing={res.get('seen_processing')}）")
+        stage_results['wait'] = {
+            'ok': True, 'duration_s': round(time.time() - _wai_t0, 1),
+            'metrics': {k: v for k, v in res.items() if k != 'ok'}}
         _mark('wait.separation_done')
 
         calib['processing_keywords'] = ['人声分离等待处理', '等待处理', '处理中', '正在处理']
@@ -831,6 +1095,24 @@ def calibrate(stop_after='locate', vocal_mode='none', target_screen=None):
             'metrics': {k: v for k, v in r.items()
                         if k not in ('ok', 'duration_s', 'error', 'inputs')}}
         _mark('extract')
+
+    # ---------- 阶段 verify：UI 终检三态对账（对齐 pipeline [5] 尾部 run_verify） ----------
+    if _reached('verify'):
+        op_stage('7 终检')
+        dprint('\n[verify] UI 终检（对齐 pipeline [5] 的 run_verify）')
+        win = ensure_fullscreen(win)
+        from ui_verify import run_verify
+        r = run_verify(workdir=OUT_DIR)
+        dprint(f"  verify 结果: ok={r.get('ok')} state={r.get('state')} "
+               f"error={r.get('error')}")
+        if not r.get('ok'):
+            raise RuntimeError(f"verify 失败: state={r.get('state')} "
+                               f"error={r.get('error')}")
+        stage_results['verify'] = {
+            'ok': r.get('ok'), 'duration_s': r.get('duration_s'), 'error': r.get('error'),
+            'metrics': {k: v for k, v in r.items()
+                        if k not in ('ok', 'duration_s', 'error', 'inputs', 'results')}}
+        _mark('verify')
 
     # ---------- 阶段 export：导出 MP4（走通 pipeline [6]） ----------
     if _reached('export'):
@@ -961,8 +1243,8 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='准入测试（分阶段校准）')
     ap.add_argument('--stop-after', default='export', choices=STAGES,
                     help='跑到哪个阶段停（默认 export：全程跑完含导出）')
-    ap.add_argument('--vocal-mode', default='none', choices=['none', 'vocal', 'background'],
-                    help='二次分离模式：none=不选下拉（默认），vocal=仅保留人声，background=仅保留背景声')
+    ap.add_argument('--vocal-mode', default='vocal', choices=['none', 'vocal', 'background'],
+                    help='二次分离模式：vocal=仅保留人声（默认），none=不选下拉，background=仅保留背景声')
     ap.add_argument('--target-screen', default=None,
                     help='目标屏：primary|secondary|<index>（S3-A2；不给=主屏，现状）')
     _win_group = ap.add_mutually_exclusive_group()
@@ -999,7 +1281,9 @@ if __name__ == '__main__':
         _finalize_jianying(stop_after=args.stop_after, completed=completed,
                            keep_window=args.keep_window, close_window=args.close_window)
         if not completed:
-            # 失败/中断：剪映已按收尾策略处理完，再用本轮起点快照回滚草稿，
-            # 不把跑脏的草稿留在磁盘上等人工还原
-            _rollback_draft(_RUN_STATE.get('draft_snapshot'),
-                            _RUN_STATE.get('draft_dir'))
+            # 失败/中断：仅当草稿结构真被破坏（主轨段数下降/主轨消失/videos 减少/
+            # 字幕归零）才回滚；纯业务失败（导出失败、verify 不过等）只留证不动草稿。
+            # 回滚前会确认剪映已退出，回滚后复检结构并写入报告。
+            _maybe_rollback(_RUN_STATE.get('draft_dir'),
+                            _RUN_STATE.get('draft_snapshot'),
+                            keep_window=args.keep_window)
