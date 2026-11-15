@@ -39,12 +39,13 @@ VERSION_DIALOG = "version_dialog"  # 版本更新/公告弹窗挡路
 ARTIFACTS_INCOMPLETE = "artifacts_incomplete"  # 导出返回成功但 mp4/封面/progress 不全
 VERIFY_FAILED = "verify_failed"    # 导出后质检（帧对齐）未通过
 TRACK_RESTORE_FAILED = "track_restore_failed"  # 轨道恢复失败（轨道在可视区外/点后仍脏）
+UI_STEP_FAILED = "ui_step_failed"  # 人声分离链路业务失败（音频面板/开关/等待分离完成）
 VERSION_UNSUPPORTED = "version_unsupported"  # 剪映版本不在支持范围（预检拒绝）
 UNKNOWN = "unknown"
 
 CATEGORIES = (UI_HANG, WINDOW_MISSING, WINDOW_NOT_CREATED, WINDOW_ACTIVATE_TIMEOUT,
               LAUNCH_FAILED, ASSET_MISSING, DISK_FULL, EXPORT_TIMEOUT, VERSION_DIALOG,
-              ARTIFACTS_INCOMPLETE, VERIFY_FAILED, TRACK_RESTORE_FAILED,
+              ARTIFACTS_INCOMPLETE, VERIFY_FAILED, TRACK_RESTORE_FAILED, UI_STEP_FAILED,
               VERSION_UNSUPPORTED, UNKNOWN)
 
 # 跨轮重拉只对"拉起本身失败"生效：这类失败与草稿/素材无关，重新拉起有实质意义。
@@ -71,7 +72,7 @@ STRATEGY = {
     WINDOW_NOT_CREATED: {"retryable": True, "action": RESTART,    "counts": True},
     # 找到窗口但激活超时 = 窗口在却不可交互（常是假死）：杀进程重建，别在旧实例上重试。
     WINDOW_ACTIVATE_TIMEOUT: {"retryable": True, "action": KILL_RETRY, "counts": True},
-    # 拉起失败：本轮不追加同轮重试（EARLY_DEATH_RETRIES=1 不动），交给 cover_watch
+    # 拉起失败：本轮不追加同轮重试（EARLY_DEATH_RETRIES=2 不动），交给 cover_watch
     # 的跨轮兜底——下一轮扫描优先重拉，连续多轮失败由 RELAUNCH_MAX_ROUNDS 截断。
     LAUNCH_FAILED:  {"retryable": True,  "action": RESTART,       "counts": True},
     ASSET_MISSING:  {"retryable": False, "action": FAIL_TERMINAL, "counts": False},
@@ -84,6 +85,9 @@ STRATEGY = {
     # 轨道恢复失败（可视区外/解锁或恢复可见后复检仍脏）：不是导出本身的问题，
     # 准入可重跑；重启回首页后重新定位轨道再试，不能落 unknown 静默放弃。
     TRACK_RESTORE_FAILED: {"retryable": True, "action": RESTART, "counts": True},
+    # 人声分离链路的业务失败（音频面板没切过去 / 开关没勾上 / 分离没跑完）：
+    # 原因明确、可重跑，不能落 unknown（unknown 的语义是"未知错误保守重启"）。
+    UI_STEP_FAILED: {"retryable": True, "action": RESTART, "counts": True},
     # 版本不符是环境问题：重试不会改变版本，直接拒绝并提示支持版本
     VERSION_UNSUPPORTED: {"retryable": False, "action": REFUSE_LAUNCH, "counts": False},
     UNKNOWN:        {"retryable": True,  "action": RESTART,       "counts": True},
@@ -131,6 +135,16 @@ def classify(error: Optional[str], phase: Optional[str] = None) -> tuple[str, st
     if _has(e, "恢复轨道失败", "可视区外", "无法判定是锁定还是不可见",
             "轨道锁定或隐藏"):
         return TRACK_RESTORE_FAILED, STRATEGY[TRACK_RESTORE_FAILED]["action"]
+
+    # 0.65 人声分离链路的业务失败：音频面板没切过去 / 人声分离开关没勾上 /
+    #      等待分离完成超时 / 分离前复检不通过（字幕轨未锁定+隐藏、选中范围不对）。
+    #      这几处文案稳定，单列一类，不落 unknown。
+    if _has(e, "人声分离开关", "人声分离未完成", "看到「人声分离」", "音频面板",
+            "滚动 20 轮", "分离前复检", "拒绝发送 Ctrl+Shift+S",
+            "未保持锁定+隐藏", "主轨之外仍有可被选中的轨道", "选中主轨失败",
+            "时间码未回到 00:00:00", "未全部白描边", "分离音频已中止",
+            "坐标已失配"):
+        return UI_STEP_FAILED, STRATEGY[UI_STEP_FAILED]["action"]
 
     # 0.7 导出后门禁（子进程 rc=3 回传的 brief）：先判质检，再判产物不全。
     #     两者都必须早于「文件不存在 / 超时」等宽泛规则，否则会被 asset_missing 抢走。
