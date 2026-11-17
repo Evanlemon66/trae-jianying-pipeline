@@ -17,6 +17,10 @@ import os, sys, json, uuid, shutil, subprocess, glob
 # pythonw 托管下没有控制台，ffmpeg 子进程必须显式隐藏，否则每次抽帧弹窗
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# 剪映固定的草稿内路径占位符（所有草稿一致）：写到草稿里的自身资源一律用它，
+# 草稿搬家/改名/发布后仍能解析；写绝对路径会在暂存区被清理后变成「媒体丢失」。
+DRAFTPATH_PLACEHOLDER = "##_draftpath_placeholder_0E685133-18CE-45ED-8CB8-2904A212EC80_##"
+
 
 def gen_uuid():
     return str(uuid.uuid4()).upper()
@@ -191,9 +195,9 @@ def set_cover_composition(draft, draft_dir, cover_image):
     scm_id = gen_uuid()
     vs_id = gen_uuid()
 
-    # 用绝对路径（正斜杠）：与草稿内其它已能正常加载的素材保持一致，
-    # 避免 ##_draftpath_placeholder## 解析不到导致封面渲染成黑帧
-    rel_path = os.path.abspath(dst_path).replace("\\", "/")
+    # 草稿内资源用占位符（随草稿移动/重命名），不写暂存区绝对路径：
+    # 暂存区发布后会被清理，绝对路径会留下「媒体丢失」封面
+    rel_path = f"{DRAFTPATH_PLACEHOLDER}/Resources/cover/{dst_name}"
 
     # 内嵌 photo 视频材质
     photo_mat = {

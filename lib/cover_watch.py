@@ -133,6 +133,22 @@ RELAUNCH_MAX_ROUNDS = 3
 
 _WORK_DIR = os.path.join(_REPO, "pipeline", "_work")
 HEARTBEAT_NAME = "watcher_heartbeat.json"
+STOP_NAME = "watcher.stop"
+
+
+def take_stop_request(work_dir: Optional[str] = None) -> bool:
+    """消费优雅停止请求（哨兵存在则删除并返回 True）。
+
+    只在两轮之间调用（cmd_watch 每轮开头），保证不会砍断正在跑的编辑/导出：
+    当前这一轮的任务跑完后，下一轮开头才退出。
+    """
+    path = os.path.join(work_dir or _WORK_DIR, STOP_NAME)
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    return True
+
 HEARTBEAT_INTERVAL_S = 30.0
 # 心跳超过 3 个周期未刷新 → 认为 watcher 已不在运行（放行语义按「没跑」处理）
 HEARTBEAT_STALE_S = HEARTBEAT_INTERVAL_S * 3
@@ -1180,7 +1196,9 @@ def _available_preset_profiles() -> set[str]:
     if not isinstance(data, dict):
         return set()
     keys = [str(k) for k in data]
-    out = {k[len("presets_"):].lower() for k in keys if k.startswith("presets_")}
+    # 只有「数组」才是预设组；presets_root（剪映预设库目录）等字符串键不是组
+    out = {k[len("presets_"):].lower()
+           for k in keys if k.startswith("presets_") and isinstance(data.get(k), list)}
     if "presets" in keys and "a" not in out:
         out.add("a")
     return out
@@ -3277,9 +3295,20 @@ def _discover_jobs(roots: list[str], exclude: list[str]) -> list[str]:
 
 
 def _collect_jobs(args: argparse.Namespace, cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """显式 --job / 配置 jobs + roots 自动发现，去重。"""
+    """显式 --job / 配置 jobs + 有效扫描根自动发现，去重。
+
+    有效扫描根 = [series_root] + watch.roots；显式 --root 可作为临时覆盖，
+    但不再从 watch.roots 反推 series_root。
+    """
     explicit = args.job or cfg.get("jobs") or []
-    roots = list(args.root or []) + list(cfg.get("roots") or [])
+    cli_roots = list(args.root or [])
+    try:
+        effective = pc.get_watch_roots()
+    except Exception:
+        if not cli_roots:
+            raise
+        effective = []
+    roots = cli_roots + effective
     merged = [_norm_job_dir(j) for j in explicit]
     merged += _discover_jobs(roots, cfg.get("exclude") or [])
     uniq: list[str] = []
@@ -3497,6 +3526,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
     round_no = 0
     empty_logged = False
     while True:
+        # 优雅停止：Console 写入 watcher.stop 后，本轮任务跑完、下一轮开头消费并退出。
+        # 放在循环最顶端是刻意的——绝不在编辑/导出中途退出。
+        if take_stop_request():
+            print("[stop] 收到优雅停止请求（pipeline/_work/watcher.stop），"
+                  "本轮任务已结束，watcher 退出")
+            hb.stop()
+            return 0
         round_no += 1
         hb.update(stage="scan", job=None, phase=None, round=round_no)
         # 配置热加载

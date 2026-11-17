@@ -13,9 +13,9 @@
   ⑨ 移动失败后重跑：stage 已 archived，源仍在、目标不存在 → 续做成功，不重复记事件
   ⑩ archive_root 等于/嵌在 roots 下 → 拒绝，报错指明命中的 root
   ⑪ 盘符根 root 的分隔符守卫
-  ⑫ roots 为空 fail-closed
+  ⑫ 有效扫描根为空 fail-closed（显式 roots=[] / 解析报错）
   ⑬ job_dir 不是 <剧名>/cover_job → 拒绝（--force 也不行）
-  ⑭ 剧集目录不是 watch.roots 的直接子级 → 拒绝
+  ⑭ 剧集目录不是有效扫描根的直接子级 → 拒绝
   ⑮ 剧集目录是盘符根 → 拒绝
 
 运行：python tests\\test_archive_job.py（纯临时目录，不碰真实剧）
@@ -225,18 +225,33 @@ check("拒绝文案指明命中 root", "命中 root" in out and "D:/" in out, ou
 check("stage 未变", read_job(jd)["stage"] == "video_ready")
 check("目录原地", os.path.isdir(os.path.join(series, "cover_job")))
 
-print("\n== ⑫ roots 为空 fail-closed ==")
+print("\n== ⑫ 有效扫描根为空 fail-closed ==")
 series, jd = make_job("noroots", export_state="cleaned")
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     rc = aj.archive(jd, ARCH, MF, roots=[])
 out = buf.getvalue()
 check("roots 为空返回 2", rc == 2, rc)
-check("文案说明未配置 watch.roots 且已拒绝",
-      "未配置 watch.roots" in out and "已拒绝执行" in out, out.strip())
+check("文案说明有效扫描根为空且已拒绝",
+      "有效扫描根为空" in out and "已拒绝执行" in out, out.strip())
 check("stage 未变", read_job(jd)["stage"] == "video_ready")
 check("目录原地", os.path.isdir(os.path.join(series, "cover_job")))
 check("归档目录未创建", not os.path.exists(os.path.join(ARCH, "noroots")))
+
+# 未显式传 roots 时由 get_watch_roots() 解析；解析失败必须 fail-closed，不能当“无根可用”
+series, jd = make_job("noroots_cfg", export_state="cleaned")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf), \
+        mock.patch.object(aj.pc, "get_watch_roots",
+                          side_effect=aj.pc.ConfigError("series_root", "缺少 series_root",
+                                                        "请在 presets.json 填写 series_root")):
+    rc = aj.archive(jd, ARCH, MF)
+out = buf.getvalue()
+check("配置解析失败返回 2", rc == 2, rc)
+check("文案带出 ConfigError 与修复提示",
+      "series_root" in out and "请在 presets.json 填写" in out, out.strip())
+check("配置失败目录原地", os.path.isdir(os.path.join(series, "cover_job")))
+check("配置失败 stage 未变", read_job(jd)["stage"] == "video_ready")
 
 print("\n== ⑬ job_dir 不是 <剧名>/cover_job → 拒绝 ==")
 series = os.path.join(ROOT, "notcover")

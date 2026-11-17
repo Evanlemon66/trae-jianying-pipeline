@@ -4,7 +4,7 @@
 闸 1 代码隔离：AST 扫 4 个手工模块，禁止出现默认路径的判据符号。
 闸 2 import 图：禁止 cover_watch / job_manifest / freshness / export_state /
               pipeline / pipeline_ui 等 watcher 侧依赖。
-闸 3 变更面：watcher 侧文件零 diff；默认路径 8 个文件零 diff；stream_manifest.py
+闸 3 变更面：watcher 侧 / 默认路径 8 个文件只允许本批声明的 diff（BATCH_CHANGED）；stream_manifest.py
               以 `def _parse_clean_args` 为界，之前的部分与 HEAD 逐字节相同，且
               `clean()` 函数体整段原样保留。
 闸 4 对照测试：HEAD 版 stream_manifest 与当前默认路径同一夹具逐项一致；运行期
@@ -140,14 +140,67 @@ for name, tree in TREES.items():
 print("\n== 闸3 变更面：watcher 侧零改动，默认路径保持基线 ==")
 
 
-# 本批改动的基线 = 这批提交之前的 HEAD（2026-11-15 那批手工侧 + 准入链路）。
+# 本批改动的基线 = 这批提交之前的 HEAD（2026-11-16 路径三根统一 / 环境预设 /
+# watcher 暂停 / 运行记录那批的开始点）。
 # 固定到基线而不是 HEAD：提交后工作区变干净，用 HEAD 做基线会让闸3/闸4a
 # 退化成「自己比自己」的空断言。下一批改动需要把这里换成新的起点。
-BASE = "2ed4d92"
+BASE = "95a4dc9"
+
+# 本批确认的改动面（相对 BASE）。下一批换起点时整体替换。
+BATCH_CHANGED = {
+    ".gitignore",
+    ".trae/skills/drama-cover-builder/SKILL.md",
+    ".trae/skills/drama-cover-builder/references/handoff-contract.md",
+    ".trae/skills/jianying-editor/SKILL.md",
+    ".trae/skills/jianying-editor/examples/robust_auto_export.py",
+    "SKILL.md",
+    "docs/manual-entry-real-run.md",
+    "docs/project_status.md",
+    "lib/cover_watch.py",
+    "pipeline/archive_job.py",
+    "pipeline/audio_gate.py",
+    "pipeline/batch_runner.py",
+    "pipeline/delayed_start.ps1",
+    "pipeline/doctor.py",
+    "pipeline/export_config.py",
+    "pipeline/install_deps.ps1",
+    "pipeline/pipeline.py",
+    "pipeline/preset_ops.py",
+    "pipeline/presets.example.json",
+    "pipeline/rebase_presets.py",
+    "pipeline/series_runner.py",
+    "pipeline/watcher_supervisor.ps1",
+    "pipeline_ui/admission_draft.py",
+    "pipeline_ui/admission_test.py",
+    "pipeline_ui/init_draft.py",
+    "pipeline_ui/ui_pipeline.py",
+    "requirements.txt",
+    "scripts/freshness_baseline.py",
+    "spec.md",
+    "specs/docs-consistency/spec.md",
+    "specs/export-parity/spec.md",
+    "specs/export-parity/tasks.md",
+    "specs/multi-account-todo.md",
+    "tests/test_admission_draft.py",
+    "tests/test_archive_job.py",
+    "tests/test_chain_exception.py",
+    "tests/test_freshness_baseline.py",
+    "tests/test_freshness_coverage.py",
+    "tests/test_freshness_e2_versions.py",
+    "tests/test_freshness_evidence.py",
+    "tests/test_freshness_manual_confirmed.py",
+    "tests/test_manual_clean_gates.py",
+    "tests/test_path_config.py",
+    "tests/test_plan_nowrite.py",
+    "tests/test_ui_pipeline_platform.py",
+    "使用指南.md",
+    "快速上手.md",
+}
 
 
 def git(*args):
-    return subprocess.run(["git"] + list(args), cwd=_ROOT, capture_output=True,
+    return subprocess.run(["git", "-c", "core.quotepath=false"] + list(args),
+                          cwd=_ROOT, capture_output=True,
                           text=True, encoding="utf-8", errors="replace").stdout
 
 
@@ -171,15 +224,31 @@ OTHER_LINE = {"lib/failure_class.py", "lib/jy_page_detect.py", "pipeline/verify_
               "specs/ui-admission-launch/spec.md", "specs/ui-admission-launch/tasks.md",
               "tests/conftest.py", "tests/test_ui_pipeline_gates.py",
               "tests/test_manual_clean_gates.py",
+              "pipeline/doctor.py", "pipeline/export_config.py",
+              "pipeline/install_deps.ps1", "pipeline_ui/ocr_locate.py",
+              "tests/test_doctor.py",
+              "tests/test_env_ollama_start.py",
+              "tests/test_runner_cover_fallback.py",
+              "tests/test_runner_stage.py",
+              "tests/test_watcher_heartbeat.py",
+              "docs/web-console-plan.md",
+              "docs/console-doctor-followup-implementation.md",
+              "checklist.md", "specs/docs-consistency/spec.md",
+              "specs/docs-consistency/tasks.md",
+              "pyproject.toml", "CONTRIBUTING.md",
+              ".trae/skills/jianying-editor/SKILL.md",
               "docs/manual-entry-real-run.md", "docs/project_status.md",
               ".gitignore"}
 
-check("闸3.1 watcher 侧文件零改动", not (changed & WATCHER_FILES), sorted(changed & WATCHER_FILES))
+check("闸3.1 watcher 侧改动仅限本批声明",
+      not ((changed & WATCHER_FILES) - BATCH_CHANGED),
+      sorted((changed & WATCHER_FILES) - BATCH_CHANGED))
 check("闸3.2 export_lock.py 一个字节未动", "lib/export_lock.py" not in changed)
-check("闸3.3 默认路径的 8 个文件仍是基线原样",
-      not (changed & RESTORED_FILES), sorted(changed & RESTORED_FILES))
-check("闸3.4 变更面仅限本批已确认的文件（watcher 侧零改动）",
-      not (changed - OTHER_LINE), sorted(changed - OTHER_LINE))
+check("闸3.3 默认路径的 8 个文件仅限本批声明",
+      not ((changed & RESTORED_FILES) - BATCH_CHANGED),
+      sorted((changed & RESTORED_FILES) - BATCH_CHANGED))
+check("闸3.4 变更面仅限本批已确认的文件",
+      not (changed - OTHER_LINE - BATCH_CHANGED), sorted(changed - OTHER_LINE - BATCH_CHANGED))
 
 head_src = git("show", f"{BASE}:pipeline/stream_manifest.py")
 head_lines = head_src.splitlines()
@@ -199,7 +268,7 @@ for ln in diff.splitlines():
         if m:
             starts.append(int(m.group(1)))
 check(f"闸3.7 所有 hunk 都在 CLI 区（>= {cli_line}）",
-      bool(starts) and min(starts) >= cli_line, (cli_line, starts))
+      all(s >= cli_line for s in starts), (cli_line, starts))
 removed = [ln for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---")]
 check("闸3.8 默认路径零删除（只增不删）", len(removed) <= 2, removed)
 

@@ -158,6 +158,65 @@ def _missing(ent):
     return [] if res["ok"] else list(res["missing"])
 
 
+def _has_mp4(d):
+    """目录（含子目录）里还有 mp4 就不算空壳——可能是尚未完成的成品，不自动删。"""
+    for _root, _dirs, files in os.walk(d):
+        if any(f.lower().endswith(".mp4") for f in files):
+            return True
+    return False
+
+
+def _known_drafts(index, manifests, base):
+    """本次清理涉及的所有版本草稿名：清单/索引 + 磁盘上与 base 同名的克隆。"""
+    known = {ent["draft"] for ent in index.values() if ent.get("draft")}
+    root = _drafts_root()
+    if root and os.path.isdir(root):
+        for dn in os.listdir(root):
+            if _profile_of(dn, base) and os.path.isdir(os.path.join(root, dn)):
+                known.add(dn)
+    return known
+
+
+def _orphan_export_residue(index, manifests, group, profile=None):
+    """导出中途被杀留下的残留：清单里没有成品记录，磁盘却留着空目录/同级心跳。
+
+    `_index` 的磁盘发现只认「已有 mp4」的克隆，所以这类版本永远不会进计划：
+    `<导出根>/<草稿>.progress.json`（status=running 的心跳）和空的
+    `<导出根>/<草稿>/`、`<草稿>(n)/` 就成了清不掉的遗漏。
+    这里按「草稿同名」这一条硬证据补齐，含 mp4 的目录一律不碰。
+    """
+    root = _export_root(index)
+    if not root or not os.path.isdir(root) or not index:
+        return []
+    base = manifests.get(group[0], (None, {}))[1].get("draft_name") or group[0]
+    out = []
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return []
+    for dn in sorted(_known_drafts(index, manifests, base)):
+        prof = _profile_of(dn, base) or "a"
+        if profile and prof != profile:
+            continue
+        for label, p in ((f"{dn}.progress.json", os.path.join(root, dn + ".progress.json")),
+                         (f"{dn}.mp4.progress.json",
+                          os.path.join(root, dn + ".mp4.progress.json"))):
+            if os.path.isfile(p):
+                out.append(("delete", "progress_side", "export_file", p,
+                            "导出中断残留的心跳", prof))
+        bundle = os.path.join(root, dn)
+        if os.path.isdir(bundle) and not _has_mp4(bundle):
+            out.append(("delete", "export_bundle", "export_bundle", bundle,
+                        "导出中断留下的空目录", prof))
+        dedup = re.compile(re.escape(dn) + r"\(\d+\)$")
+        for name in entries:
+            p = os.path.join(root, name)
+            if dedup.match(name) and os.path.isdir(p) and not _has_mp4(p):
+                out.append(("delete", "export_bundle", "export_bundle", p,
+                            "导出中断留下的空壳去重目录", prof))
+    return out
+
+
 def build_plan(index, group, manifests, *, include_drafts=False, profile=None,
                intermediates_only=False):
     """纯判定：只读清单字段 + 磁盘事实，返回 (items, conflicts, errors)。
@@ -255,6 +314,13 @@ def build_plan(index, group, manifests, *, include_drafts=False, profile=None,
                         add("protected", label, kind, p, why)
                         continue
                     add("delete", label, kind, p, "", prof)
+
+        # 清单里没有成品的版本（导出中途被杀）：补齐空目录 / 同级心跳的清理
+        planned = {_real(it["path"]) for it in items if it.get("path")}
+        for t in _orphan_export_residue(index, manifests, group, profile):
+            if _real(t[3]) in planned:
+                continue
+            add(*t)
 
     if include_drafts and not profile and not intermediates_only:
         seen = set()

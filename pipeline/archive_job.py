@@ -16,9 +16,10 @@ video.status=done 挡住已导出剧，但剧目录仍留在公共 roots；本�
 成品三件套校验未通过（exported 版本缺 mp4 / progress.done / 封面，或封面非竖版 9:16）；
 新鲜度判定 stale/evidence_missing（已 clean 的版本除外：export_state=cleaned 或
 outputs[*].state=cleaned 视作合法已清理状态，不参与阻断）；
-归档目标已存在；archive_root 等于或位于任一 watch.roots 之下（规范化真实路径比较）；
-watch.roots 未配置（fail-closed，无法校验位置时拒绝执行）；
-job_dir 不是 <剧名>/cover_job；剧集目录是盘符根；剧集目录不是 watch.roots 的直接子级。
+归档目标已存在；archive_root 等于或位于任一有效扫描根之下（规范化真实路径比较）；
+有效扫描根为空（fail-closed，无法校验位置时拒绝执行；series_root 必填后正常不会为空）；
+job_dir 不是 <剧名>/cover_job；剧集目录是盘符根；剧集目录不是有效扫描根的直接子级。
+有效扫描根 = pipeline/export_config.get_watch_roots()（series_root + watch.roots 额外根）。
 以上路径相关拒绝不受 --force 影响（搬错目录不可逆）。
 
 断点可重入：stage 已是 archived 时，只要源目录仍在、归档目标不存在，就继续移动；
@@ -29,7 +30,8 @@ job_dir 不是 <剧名>/cover_job；剧集目录是盘符根；剧集目录不�
   2. 整个剧集目录 <root>/<剧名> 移动到 <archive_root>/<剧名>（同盘为改名）
   3. pipeline/_stream_manifests/*.json 中 paths.source_dir 指向旧目录的记录改写为新路径
   --dry-run 只打印计划，不写盘、不移动。
-archive_root 未传时读 pipeline/presets.json 的 watch.archive_root。
+archive_root 未传时读 export_config.get_archive_root()
+（JY_ARCHIVE_ROOT > presets.json archive_root > watch.archive_root 兼容）。
 """
 import argparse
 import json
@@ -39,8 +41,6 @@ import shutil
 import subprocess
 import sys
 import time
-
-sys.stdout.reconfigure(encoding="utf-8")
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "lib"))
@@ -103,8 +103,8 @@ def _real(path: str) -> str:
 
 
 def _watch_roots() -> list[str]:
-    roots = (pc.get_watch_config() or {}).get("roots") or []
-    return [r for r in roots if isinstance(r, str) and r.strip()]
+    """有效扫描根：series_root + watch.roots 额外根（统一走 export_config）。"""
+    return pc.get_watch_roots()
 
 
 def _root_hit(archive_root: str, roots: list[str]) -> str | None:
@@ -122,7 +122,7 @@ def _series_dir_guard(job_dir: str, series_dir: str, roots: list[str]) -> str | 
 
     - job_dir 必须是 <剧集目录>/cover_job（out_dir 覆盖后仍必须是这个名字）
     - 剧集目录不能是盘符根/文件系统根（dirname(root) == root）
-    - 剧集目录必须是某个 watch.roots 的直接子级（不是更深层，也不是 root 本身）
+    - 剧集目录必须是某个有效扫描根的直接子级（不是更深层，也不是 root 本身）
 
     缺这层校验时，out_dir 一旦指到共享父目录，归档会把整层目录（甚至 D:\\）
     搬进归档池，而 shutil.move 不可逆。
@@ -138,7 +138,7 @@ def _series_dir_guard(job_dir: str, series_dir: str, roots: list[str]) -> str | 
         rr = os.path.realpath(root).rstrip("\\/")
         if os.path.normcase(parent) == os.path.normcase(rr):
             return None
-    return (f"剧集目录必须是某个 watch.roots 的直接子级"
+    return (f"剧集目录必须是某个有效扫描根的直接子级"
             f"（实际: {series_dir}；roots: {', '.join(roots)}）")
 
 
@@ -306,15 +306,24 @@ def archive(job_dir: str, archive_root: str, manifest_dir: str, *,
     print(f"归档 [{name}] stage={job.get('stage')}")
 
     archive_root = os.path.abspath(archive_root)
-    roots_list = _watch_roots() if roots is None else roots
+    if roots is None:
+        try:
+            roots_list = _watch_roots()
+        except pc.ConfigError as exc:
+            print(f"  [FAIL] 无法解析有效扫描根（{exc.key}）：{exc}")
+            if exc.hint:
+                print(f"          {exc.hint}")
+            return 2
+    else:
+        roots_list = roots
     if not roots_list:
-        # fail-closed：没有 roots 就无法判断归档池是否落在公共区，宁可不搬
-        print("  [FAIL] 未配置 watch.roots，无法校验归档池位置，已拒绝执行；"
-              "请检查 pipeline/presets.json 的 watch 段 roots")
+        # fail-closed：没有扫描根就无法判断归档池是否落在公共区，宁可不搬
+        print("  [FAIL] 有效扫描根为空，无法校验归档池位置，已拒绝执行；"
+              "请检查 pipeline/presets.json 的 series_root")
         return 2
     hit = _root_hit(archive_root, roots_list)
     if hit:
-        print(f"  [FAIL] archive_root 不能等于或位于 watch.roots 之下"
+        print(f"  [FAIL] archive_root 不能等于或位于有效扫描根之下"
               f"（命中 root: {hit}）: {archive_root}")
         return 2
 
@@ -489,7 +498,7 @@ def main(argv=None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--job", required=True, help="cover_job 目录或其中的 job.json")
     ap.add_argument("--archive-root", default=None,
-                    help="归档池根目录（默认读 presets.json 的 watch.archive_root）")
+                    help="归档池根目录（默认读 export_config.get_archive_root()）")
     ap.add_argument("--manifest-dir", default=os.path.join(_REPO, "pipeline", "_stream_manifests"),
                     help="串流产物清单位置（默认 pipeline/_stream_manifests）")
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不写盘、不移动")
@@ -499,9 +508,10 @@ def main(argv=None) -> int:
                     help="人工放行 stale/evidence_missing 成品归档；理由写入快照")
     args = ap.parse_args(argv)
 
-    root = args.archive_root or (pc.get_watch_config() or {}).get("archive_root")
+    root = args.archive_root or pc.get_archive_root()
     if not root:
-        print("[FAIL] 未指定 --archive-root，且 presets.json watch 段无 archive_root")
+        print("[FAIL] 未指定 --archive-root，且配置中没有 archive_root"
+              "（JY_ARCHIVE_ROOT / presets.json archive_root / watch.archive_root）")
         return 2
     return archive(args.job, root, args.manifest_dir,
                    dry_run=args.dry_run, force=args.force,
@@ -509,4 +519,5 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     sys.exit(main())
