@@ -140,62 +140,15 @@ for name, tree in TREES.items():
 print("\n== 闸3 变更面：watcher 侧零改动，默认路径保持基线 ==")
 
 
-# 本批改动的基线 = 这批提交之前的 HEAD（2026-11-16 路径三根统一 / 环境预设 /
-# watcher 暂停 / 运行记录那批的开始点）。
+# 本批改动的基线 = 这批提交之前的 HEAD（2026-11-17 路径三根统一 / 环境预设 /
+# watcher 暂停 / 运行记录 / Console 进度那批的开始点）。
 # 固定到基线而不是 HEAD：提交后工作区变干净，用 HEAD 做基线会让闸3/闸4a
 # 退化成「自己比自己」的空断言。下一批改动需要把这里换成新的起点。
-BASE = "95a4dc9"
+BASE = "608a227"
 
 # 本批确认的改动面（相对 BASE）。下一批换起点时整体替换。
-BATCH_CHANGED = {
-    ".gitignore",
-    ".trae/skills/drama-cover-builder/SKILL.md",
-    ".trae/skills/drama-cover-builder/references/handoff-contract.md",
-    ".trae/skills/jianying-editor/SKILL.md",
-    ".trae/skills/jianying-editor/examples/robust_auto_export.py",
-    "SKILL.md",
-    "docs/manual-entry-real-run.md",
-    "docs/project_status.md",
-    "lib/cover_watch.py",
-    "pipeline/archive_job.py",
-    "pipeline/audio_gate.py",
-    "pipeline/batch_runner.py",
-    "pipeline/delayed_start.ps1",
-    "pipeline/doctor.py",
-    "pipeline/export_config.py",
-    "pipeline/install_deps.ps1",
-    "pipeline/pipeline.py",
-    "pipeline/preset_ops.py",
-    "pipeline/presets.example.json",
-    "pipeline/rebase_presets.py",
-    "pipeline/series_runner.py",
-    "pipeline/watcher_supervisor.ps1",
-    "pipeline_ui/admission_draft.py",
-    "pipeline_ui/admission_test.py",
-    "pipeline_ui/init_draft.py",
-    "pipeline_ui/ui_pipeline.py",
-    "requirements.txt",
-    "scripts/freshness_baseline.py",
-    "spec.md",
-    "specs/docs-consistency/spec.md",
-    "specs/export-parity/spec.md",
-    "specs/export-parity/tasks.md",
-    "specs/multi-account-todo.md",
-    "tests/test_admission_draft.py",
-    "tests/test_archive_job.py",
-    "tests/test_chain_exception.py",
-    "tests/test_freshness_baseline.py",
-    "tests/test_freshness_coverage.py",
-    "tests/test_freshness_e2_versions.py",
-    "tests/test_freshness_evidence.py",
-    "tests/test_freshness_manual_confirmed.py",
-    "tests/test_manual_clean_gates.py",
-    "tests/test_path_config.py",
-    "tests/test_plan_nowrite.py",
-    "tests/test_ui_pipeline_platform.py",
-    "使用指南.md",
-    "快速上手.md",
-}
+# 上一批的清单已随提交清空：新改动必须显式登记，否则闸3.4 直接报错。
+BATCH_CHANGED = set()
 
 
 def git(*args):
