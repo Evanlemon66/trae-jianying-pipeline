@@ -26,8 +26,6 @@ import sys
 import time
 import uuid
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import pipeline as pl  # noqa: E402
@@ -257,4 +255,5 @@ def _set_seg_text(draft, seg, new_text, template_seg):
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     main()

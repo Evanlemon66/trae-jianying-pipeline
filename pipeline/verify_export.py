@@ -16,12 +16,6 @@
 import json, os, re, subprocess, sys
 import numpy as np
 
-if sys.stdout is not None:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except (AttributeError, ValueError):
-        pass
-
 from export_config import get_ffmpeg, get_projects_root  # noqa: E402
 from no_window import NO_WINDOW  # noqa: E402
 
@@ -152,6 +146,11 @@ def _infer_norm_root(draft_dir):
 
 
 def main():
+    if sys.stdout is not None:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
     if len(sys.argv) < 2:
         print("用法: python verify_export.py <草稿名> [成品mp4路径] [norm视频根目录]")
         sys.exit(2)

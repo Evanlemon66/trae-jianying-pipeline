@@ -7,7 +7,6 @@ import os
 import re
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import vc_bridge  # noqa: E402
@@ -112,4 +111,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     main()

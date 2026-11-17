@@ -5,7 +5,7 @@
   2. 没有确认记录时仍然拦（externally_modified 照旧）；
   3. 确认后产物 size 变了 → 失效（manual_confirmed_artifact_changed）。
 
-只读/临时目录自检，不碰 D:\\短剧、不启动剪映。
+只读/临时目录自检，不碰 <素材根>、不启动剪映。
 """
 
 import json

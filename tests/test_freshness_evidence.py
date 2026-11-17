@@ -1,6 +1,6 @@
 """产物新鲜度：反向检测 evidence_missing 与 legacy 的边界。
 
-只读/临时目录自检，不碰 D:\\短剧、不启动剪映。
+只读/临时目录自检，不碰 <素材根>、不启动剪映。
 直接运行：python tests/test_freshness_evidence.py
 """
 

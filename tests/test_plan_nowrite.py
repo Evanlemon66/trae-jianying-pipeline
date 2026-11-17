@@ -74,7 +74,8 @@ def main():
         # ② 跑 plan：有草稿 + 可导出，但 plan 只读
         with mock.patch.object(cw, "find_stream_draft", return_value=draft), \
                 mock.patch.object(cw.pc, "export_mp4_path", return_value=mp4), \
-                mock.patch.object(cw.pc, "get_export_dir", return_value=tmp):
+                mock.patch.object(cw.pc, "get_export_dir", return_value=tmp), \
+                mock.patch.object(cw.pc, "get_watch_roots", return_value=[tmp]):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = cw.main(["plan", "--job", jd, "--config", cfg])

@@ -28,8 +28,6 @@ import sys
 import time
 import uuid
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import draft_io  # noqa: E402  草稿写盘唯一原语
@@ -240,4 +238,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     main()

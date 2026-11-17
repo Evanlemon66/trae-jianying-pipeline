@@ -19,8 +19,6 @@ import json, os, re, shutil, subprocess, sys
 
 from no_window import NO_WINDOW
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import draft_io  # noqa: E402  草稿写盘唯一原语
 from export_config import get_projects_root  # noqa: E402
@@ -515,6 +513,7 @@ def _expected_delta(old_start, old_start_ep, old_durs, delta):
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     if len(sys.argv) < 2:
         print("用法: python _framefix_draft.py <草稿名> [drafts根目录]\n"
               "      python _framefix_draft.py --tailfix <草稿名|all> [drafts根目录]  # 只修叠加轨片尾")

@@ -35,8 +35,6 @@ pipeline/_work 旧状态文件）命中即跳过；manifest 记录本身永不�
 """
 import json, os, sys, time, shutil
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 MANIFEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_stream_manifests")
 
 _LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")
@@ -909,4 +907,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     sys.exit(main())

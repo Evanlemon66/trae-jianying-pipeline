@@ -1,5 +1,4 @@
 import sys, os, time, json
-sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, os.path.abspath(".trae/skills/jianying-editor/scripts"))
 sys.path.insert(0, os.path.abspath(".trae/skills/jianying-editor/examples"))
 

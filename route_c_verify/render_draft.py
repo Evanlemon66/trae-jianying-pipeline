@@ -19,8 +19,6 @@ import shutil
 import subprocess
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(HERE, "work")
 OUT = os.path.join(HERE, "out")
@@ -276,4 +274,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     main()

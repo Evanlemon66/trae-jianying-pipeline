@@ -8,7 +8,7 @@
 做法：AST 静态扫描 lib/ 与 pipeline/，对每个含导出成功标记的函数，
 要求它自身或其直接调用的同文件助手里有 record_export。
 
-只读源码，不碰 D:\\短剧、不启动剪映、不跑导出。
+只读源码，不碰 <素材根>、不启动剪映、不跑导出。
 直接运行：python tests/test_freshness_coverage.py
 """
 

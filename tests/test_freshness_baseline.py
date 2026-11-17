@@ -1,6 +1,6 @@
 """产物新鲜度：一次性上线基线（legacy(baseline)）与 evidence_missing 的边界。
 
-只读/临时目录自检，不碰 D:\\短剧、不启动剪映、不跑导出。
+只读/临时目录自检，不碰 <素材根>、不启动剪映、不跑导出。
 直接运行：python tests/test_freshness_baseline.py
 """
 

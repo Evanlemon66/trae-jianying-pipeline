@@ -41,7 +41,7 @@ REPORT_NAME = "_vad_gate_report.json"
 
 
 def _deps_root():
-    """依赖根目录：环境变量 JY_DEPS_ROOT → _env_profile.json → D:\\AI_Deps。"""
+    """依赖根目录：环境变量 JY_DEPS_ROOT → _env_profile.json → export_config.get_deps_root()。"""
     env = os.environ.get("JY_DEPS_ROOT", "").strip()
     if env:
         return env
