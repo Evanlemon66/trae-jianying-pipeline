@@ -4,6 +4,12 @@
 前置约束：`pipeline/pipeline.py`、`pipeline/preset_ops.py` 正由另一会话修改，本轮任务全部避开这两个文件。
 状态：未开始（等待批准 §8）
 
+## 路径契约更新（已收口）
+
+- 路径唯一入口是 `pipeline/export_config.resolve_paths()`；`<导出根>` = `export_dir`，`<素材根>` = `series_root`。
+- `series_root` 是唯一素材根；`watch.roots` 仅 watcher 的额外扫描根（为空只扫 `series_root`）。
+- 业务根 `series_root`/`export_dir`/`deps_root` 无默认值，缺失或无效直接 `ConfigError`（fail-closed）。
+
 ## T0 只读审计脚本（不依赖批准，可先做）
 - [ ] 新增 `tools/audit_export_parity.py`（只读，不写任何被审计目录）
   - 输入：`<cover_job>` 或 `<export_dir>`；输出：每个版本的 `PASS/FAIL` + 缺失项。

@@ -206,7 +206,7 @@ def build_payload(entries, roots, report, command):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="生成 sidecar 上线前的一次性冻结基线")
     ap.add_argument("--root", action="append", default=None,
-                    help="只读扫描根目录，可重复；默认按统一配置解析（series_root → watch.roots[0] → D:\\短剧）")
+                    help="只读扫描根目录，可重复；默认按统一配置解析 series_root（未配置直接报错）")
     ap.add_argument("--out", default=None,
                     help="基线文件路径；默认 data/freshness_legacy_baseline.json")
     ap.add_argument("--write", action="store_true", help="真正落盘（默认 dry-run）")

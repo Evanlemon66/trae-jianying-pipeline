@@ -3,6 +3,12 @@
 > 本文件只记录**尚未完成**的事项，便于后续排期。已完成部分见文末「已完成」。
 > 改动涉及 watcher 常驻进程时，改完必须重启 watcher 才生效（`check_release_safe` 会用代码指纹拒绝旧的 `--phase` 放行）。
 
+## 路径契约更新（已收口）
+
+- 路径唯一入口是 `pipeline/export_config.resolve_paths()`（`validate_config()` 返回 `ok/paths/sources/issues`）。
+- `series_root` 是唯一素材根；`watch.roots` 仅 watcher 的额外扫描根（为空只扫 `series_root`）。
+- 业务根 `series_root`/`export_dir`/`deps_root` 无默认值，缺失或无效直接 `ConfigError`（fail-closed）。
+
 ## 待办
 
 ### P1-1 账号封面目前只做门禁校验，没有真正被使用

@@ -164,18 +164,28 @@ def decide_window_action(completed_all, stop_after, close_on_exit,
     return 'keep', '整轮跑完，close_on_exit=false'
 
 
-def _root_of(video_cfg, watch_roots):
-    root = video_cfg.get('root') or ''
+def _root_of(video_cfg, watch_roots=None):
+    """素材根：admission.video.root 显式优先，否则 series_root。
+
+    watch_roots 仅用于测试/临时覆盖；生产调用不再读取 watch.roots。
+    """
+    root = str(video_cfg.get('root') or '').strip()
     if root:
         return root
-    roots = [str(r) for r in (watch_roots or []) if str(r).strip()]
-    idx = video_cfg.get('root_index', 0)
-    if idx >= len(roots):
-        raise ValueError(f'watch.roots 只有 {len(roots)} 个，admission.video.root_index={idx} 越界')
-    return roots[idx]
+    try:
+        idx = int(video_cfg.get('root_index', 0) or 0)
+    except (TypeError, ValueError):
+        raise ValueError('admission.video.root_index 必须是整数')
+    if idx != 0:
+        raise ValueError('admission.video.root_index 已废弃（>0 不再支持）；'
+                         '请改用 admission.video.root 显式指定素材根')
+    if watch_roots:
+        return str(watch_roots[0])
+    from export_config import get_series_root
+    return get_series_root()
 
 
-def resolve_series_dir(video_cfg, watch_roots):
+def resolve_series_dir(video_cfg, watch_roots=None):
     """解析素材剧集目录，返回 (目录, 匹配视频数)。
 
     顺序：显式 series 优先；否则 root 下 sorted(os.listdir()) 的第 series_index 个目录起，

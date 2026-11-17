@@ -20,7 +20,7 @@
 - [ ] 重写 doctor 退出码规则，补齐 3 个检查项（两份文档）
 - [ ] 修正 batch_runner "新鲜度记录" 措辞
 - [ ] `presets.example.json` `_说明` 的 `--profile` 逗号表述
-- [ ] `ui_pylibs` 补第一候选路径（两份文档）
+- [x] ~~`ui_pylibs` 补第一候选路径（两份文档）~~（该目录已整体移除，条目作废）
 - [ ] 修正 `✅ 导出完成!` 日志文本
 
 验收：每条改动都能在代码里指到对应实现（函数名/行号）。
@@ -37,6 +37,6 @@
 
 ## T4 文档自检
 
-- [ ] `grep -n "export_stale\|verify.json\|export_console\|ui_pylibs\|WATCHER"` 两份文档，逐条比对
+- [ ] `grep -n "export_stale\|verify.json\|export_console\|WATCHER"` 两份文档，逐条比对
 - [ ] 实跑 `python pipeline\doctor.py` 与 `python pipeline\pipeline.py --list-presets`，把输出与文档描述对照
 - [ ] 汇报：改了哪些文件、每条对应哪个 ID

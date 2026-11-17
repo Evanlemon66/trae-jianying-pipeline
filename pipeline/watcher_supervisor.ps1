@@ -24,6 +24,7 @@ $logDir     = Join-Path $repoRoot 'pipeline\_work'
 $logFile    = Join-Path $logDir 'watcher_supervisor.log'
 $consoleLog = Join-Path $logDir 'watcher_console.log'
 $heartbeatFile = Join-Path $logDir 'watcher_heartbeat.json'
+$pauseFile  = Join-Path $logDir 'watcher.pause'
 $watcherPy  = Join-Path $repoRoot 'lib\cover_watch.py'
 
 # 隐藏本进程的控制台窗口（计划任务每 5 分钟唤起一次，避免窗口闪烁）
@@ -111,6 +112,18 @@ function Invoke-Supervisor {
     if (-not (Test-Path -LiteralPath $watcherPy)) {
         Write-Log "启动失败: 未找到脚本 $watcherPy"
         return 2
+    }
+
+    # 暂停哨兵（Console 暂停 / 手工 touch）：存在即彻底停住，不拉起、也不做卡死重启。
+    # 文件内容可作为暂停原因，仅记日志。
+    if (Test-Path -LiteralPath $pauseFile) {
+        $reason = ''
+        try {
+            $reason = (Get-Content -LiteralPath $pauseFile -Raw -Encoding UTF8).Trim()
+        } catch { }
+        if ($reason) { $reason = '（原因: ' + $reason + '）' }
+        Write-Log ("已暂停: 发现 $pauseFile$reason，本次不拉起 watcher；删除该文件即恢复")
+        return 0
     }
 
     $pythonExe = $null

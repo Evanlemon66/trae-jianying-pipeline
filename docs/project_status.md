@@ -117,6 +117,19 @@
 
 ---
 
+### 1.8 路径三根统一（工作区已实现）
+
+**结论**：路径已收口到 `pipeline/export_config.py` 单一真源。`resolve_paths(mode)` 返回 `{paths, sources, issues}`，`validate_config(mode)` 额外给 `ok`，业务代码与 Console 都只读这一层。
+
+**契约**：
+
+- `series_root`（唯一素材根）、`export_dir`（导出根）、`deps_root`（依赖根）**业务根 fail-closed**：环境变量 > `presets.json` > 系统派生根探测 > `ConfigError`；三者都没有默认值，`D:\短剧` / `D:\成片导出` / `D:\AI_Deps` 一类兜底已全部删除。
+- `watch.roots` 降级为 watcher 的**额外扫描根**：为空只扫 `series_root`；非空时每项须存在、是目录、且含 `*/cover_job`。有效扫描根 = `[series_root] + watch.roots`（`get_watch_roots()`）。
+- `archive_root` 留空 = 禁用归档（`JY_ARCHIVE_ROOT` > 顶层 `archive_root` > 兼容 `watch.archive_root`）。
+- 旧配置迁移工具：`python pipeline/migrate_config.py --dry-run|--write`（写回前备份 `presets.json.bak-<时间戳>`）；Console 自检里有 `config.migrate` 项。
+
+---
+
 ## 2. 已否决
 
 | 方向 | 结论 | 证据 |
@@ -163,8 +176,8 @@
 
 | 事项 | 现状 | 仓库内证据 |
 |---|---|---|
-| 4 条脏清单记录（`剧A串流`、`剧A串流_b`、`A_b`、`迷你验证剧B_第01集串流`）建议删记录、不修指向 | 待定 | 无。job 台账在 `D:\短剧` 数据目录，不在仓库内，本次未核 |
-| 3 部剧约 53GB：删 or 先归档到 `D:\短剧_存档` | 待定 | 无。同上 |
+| 4 条脏清单记录（`剧A串流`、`剧A串流_b`、`A_b`、`迷你验证剧B_第01集串流`）建议删记录、不修指向 | 待定 | 无。job 台账在 `<素材根>`（`series_root`）数据目录，不在仓库内，本次未核 |
+| 3 部剧约 53GB：删 or 先归档到 `<归档根>`（`archive_root`） | 待定 | 无。同上 |
 | 半截行识别何时插队 | 已排期、未开始 | 无载体：`specs/` 无对应 spec/tasks（见 §5 I6） |
 | 零时长正面回归 + 滚动条 thumb 高度分布 + 导出耗时稳定性，三项合批观察 | 待启动 | `tests/` 无对应用例 |
 
@@ -180,7 +193,7 @@
 | I4 | `tests/test_manual_clean_gates.py` 是脚本式用例（模块尾部 `sys.exit`），文件名却匹配 pytest 收集规则 | `pyproject.toml` 只有 `testpaths = ["tests"]`，未排除该文件 | 需确认 `pytest tests/` 是否在收集期被 `SystemExit` 打断（未实测）；若会，按仓库既有「脚本式用例改子进程执行」约定包一层 |
 | I5 | `presets.json` 已加 `admission.open.ready_timeout=120`，`presets.example.json` 未同步 | 示例文件搜不到该键；代码默认值 120，新机器不影响行为 | 补示例键，避免「示例即配置」的误读 |
 | I6 | 「半截行已排期」在仓库里没有落点 | `specs/` 无对应目录 | 要么建 spec，要么在本文 §4 保留为未排期 |
-| I7 | 4 条脏清单 / 53GB 两部剧的处置写进了状态，但仓库内无证据 | 数据在 `D:\短剧`，本次未核 | 保持「待定」，不得写成已核对 |
+| I7 | 4 条脏清单 / 53GB 两部剧的处置写进了状态，但仓库内无证据 | 数据在 `<素材根>`（`series_root`），本次未核 | 保持「待定」，不得写成已核对 |
 | I8 | 工作区残留现场产物未处置 | 未跟踪：`pipeline_ui.progress.json`（`ui_pipeline_ac`，`status=failed`，`attempt=3`）、`workdir_r10_20/`、`pipeline_ui/_evidence_20261115/`、`pipeline_ui/_draft_snapshots/`、`pipeline_ui/verify_timeline.png`、`pipeline_ui/ui_pipeline_ac.mp4.verify.log` | 提交时明确哪些入库（证据）、哪些不入库（运行残留） |
 
 ---
@@ -203,6 +216,6 @@
 
 1. 新条目必须写「结论 / 证据 / 尚未验证」；证据指到 `文件:行` 或产物路径，不写「应该」「大概」。
 2. 未提交的改动只能写「工作区已实现」，不得写「已交付」。
-3. 仓库外数据（`D:\短剧`、剪映草稿根等）一律标注「未在仓库内复核」。
+3. 仓库外数据（`series_root` 素材根、`archive_root` 归档根、剪映草稿根等）一律标注「未在仓库内复核」。
 4. 状态变化时改本文，不同步改写 `specs/*/spec.md` 的验收口径；spec 只补自身状态行。
 5. 本文不记录排查过程，只记录可复核的结论与证据。

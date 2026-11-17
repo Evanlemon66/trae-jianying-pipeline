@@ -1,0 +1,4 @@
+# 开发/测试依赖（终端用户无需安装；pipeline/install_deps.ps1 不会读取本文件）
+# 用法: py -3.12 -m pip install -r requirements-dev.txt
+-r requirements.txt
+pytest==9.2.0

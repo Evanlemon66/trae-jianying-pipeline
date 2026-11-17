@@ -163,22 +163,29 @@ def test_resolve_series_explicit_override(tmp_path):
 
 
 def test_resolve_series_root_index(tmp_path):
+    """root_index 只允许 0（series_root）；>0 已废弃，显式指定请用 video.root。"""
     r0 = tmp_path / 'r0'
     r1 = tmp_path / 'r1'
     os.makedirs(str(r0))
     os.makedirs(str(r1))
     _mk_series(r1, 'B_有视频', 1)
-    cfg = ad.normalize_config({'draft_name': 'ac', 'video': {'root_index': 1}})['video']
-    series, hits = ad.resolve_series_dir(cfg, [str(r0), str(r1)])
-    assert series.startswith(str(r1)) and hits == 1
 
-    cfg_bad = ad.normalize_config({'draft_name': 'ac', 'video': {'root_index': 5}})['video']
-    try:
-        ad.resolve_series_dir(cfg_bad, [str(r0), str(r1)])
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('root_index 越界应失败')
+    for bad_idx in (1, 5):
+        cfg_bad = ad.normalize_config(
+            {'draft_name': 'ac', 'video': {'root_index': bad_idx}})['video']
+        try:
+            ad.resolve_series_dir(cfg_bad, [str(r0), str(r1)])
+        except ValueError as e:
+            assert 'root_index' in str(e)
+        else:
+            raise AssertionError(f'root_index={bad_idx} 应失败')
+
+    # video.root 显式指定优先于 watch_roots
+    cfg = ad.normalize_config(
+        {'draft_name': 'ac', 'video': {'root': str(r1)}})['video']
+    series, hits = ad.resolve_series_dir(cfg, [str(r0)])
+    assert series.startswith(str(r1)) and hits == 1
+    assert cfg['root_index'] == 0
 
 
 def test_draft_fs_state(tmp_path):

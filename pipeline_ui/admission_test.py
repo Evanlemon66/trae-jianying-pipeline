@@ -58,18 +58,11 @@ _PIPELINE_DIR = os.path.normpath(os.path.join(_UI_DIR, '..', 'pipeline'))
 if _PIPELINE_DIR not in sys.path:
     sys.path.insert(0, _PIPELINE_DIR)
 
-from export_config import get_ui_pylibs_dir
-
-# UI OCR 依赖目录由统一配置解析；目录不存在时插入不报错，缺包在首次 OCR 时给出可读错误
-_UI_PYLIBS = get_ui_pylibs_dir()
-if _UI_PYLIBS not in sys.path:
-    sys.path.insert(0, _UI_PYLIBS)
-
 from admission_draft import (active_draft_name, baseline_mismatch, decide_action,
                              decide_window_action, draft_fs_state, expected_track_count,
                              normalize_config, read_baseline, read_draft_structure,
                              resolve_series_dir, write_baseline)
-from export_config import get_admission_config, get_watch_config
+from export_config import get_admission_config
 
 import pyautogui
 pyautogui.FAILSAFE = False
@@ -529,8 +522,7 @@ def _build_admission_draft(cfg, presets):
     模板候选顺序 default → pipeline_test → demo_test 由 create_empty_draft 内部保证。
     presets 与预期轨道数由同一份解析结果传入，避免记录口径与实际合并不一致。
     """
-    roots = get_watch_config().get('roots') or []
-    series_dir, hits = resolve_series_dir(cfg['video'], roots)
+    series_dir, hits = resolve_series_dir(cfg['video'])
     dprint(f"  素材来源: {series_dir}（匹配 {hits} 个视频）")
     from init_draft import init_draft
     r = init_draft(draft_name=cfg['draft_name'], video_dir=series_dir,

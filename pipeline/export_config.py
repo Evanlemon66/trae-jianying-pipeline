@@ -1,24 +1,17 @@
 # -*- coding: utf-8 -*-
-"""pipeline 公共配置：统一从 pipeline/presets.json 读，不再在各脚本里硬编码。
+"""pipeline 公共配置：唯一真源是 pipeline/presets.json，代码里不写死业务路径。
 
-路径统一解析顺序（所有 *路径* 配置都遵守）：
-  环境变量 > presets.json 对应字段 > 自动探测 > 内置默认值（最后一层保持仓库现状）
+路径解析规则（三根统一后）：
+  环境变量（显式覆盖）> presets.json 对应字段 > 系统派生根自动探测 > 报错
 
-新机器/新用户：复制 pipeline/presets.example.json 为 pipeline/presets.json，改成自己的路径。
-不想建配置文件时，也可以只设环境变量（键名见各函数 docstring）。
+关键约束：
+  - 业务根 series_root / export_dir / deps_root 必须显式配置；缺失或无效直接抛 ConfigError。
+  - archive_root 可留空表示禁用归档；配置了但无效同样抛 ConfigError。
+  - watch.roots 只是 watcher 的“额外扫描根”，不参与 series_root 解析；
+    有效扫描根 = [series_root] + watch.roots（去重），额外根必须存在且含 */cover_job。
+  - 系统派生根（剪映安装/草稿根/预设库/日志）允许自动探测，但必须显示来源；探测失败报错。
 
-可配置项：
-  export_dir       成品默认导出根目录。成品按「一部剧一个文件夹」归置：
-                     <export_dir>/<草稿名>/<草稿名>.mp4（封面/进度文件同目录）
-  deps_root        统一依赖根目录（ffmpeg/ffprobe/模型缓存都在其下）
-  jianying_dir     剪映安装目录（字幕字体等内置资源从这儿取）
-  projects_root    剪映草稿根目录（默认 %LOCALAPPDATA%\\JianyingPro\\User Data\\Projects\\com.lveditor.draft）
-  presets_root     剪映组合预设库（默认 %LOCALAPPDATA%\\JianyingPro\\User Data\\Presets\\Combination\\Presets）
-  jianying_log_dir 剪映日志目录（启动取证用）
-  series_root      短剧素材根目录（默认取 watch.roots[0]，再退回 D:\\短剧）
-  archive_root     归档/备份池根目录（默认取 watch.archive_root，再退回 D:\\短剧_存档）
-  ui_pylibs        pipeline_ui UI 自动化 OCR 依赖目录（默认 <依赖根>\\ui_pylibs）
-  watch            cover_watch 落盘监听的默认参数（roots/jobs/exclude/settle/interval/derive）
+新机器/新用户：复制 pipeline/presets.example.json 为 pipeline/presets.json，填好自己的路径。
 """
 import json
 import os
@@ -28,17 +21,23 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(_HERE, "presets.json")
 
-# 内置兜底值（presets.json 缺失或字段为空时使用；这是本机现有默认，保持不变）
-DEFAULT_EXPORT_DIR = r"D:\油管打猎\L"
-DEFAULT_DEPS_ROOT = r"D:\AI_Deps"
-DEFAULT_JIANYING_DIR = r"D:\剪映5.9\剪映5.9版+jianying-skill\剪映5.9(win+mac)\剪映5.9Windows\JianyingPro\5.9.0.11632"
-DEFAULT_SERIES_ROOT = r"D:\短剧"
-DEFAULT_ARCHIVE_ROOT = r"D:\短剧_存档"
+# 系统派生根只允许来自 LOCALAPPDATA / 注册表探测，不再保留任何开发机字面量。
 # UI 自动化 OCR 依赖（rapidocr 等）与依赖根同层，源码目录不再自带 pylibs
-DEFAULT_UI_PYLIBS = os.path.join(DEFAULT_DEPS_ROOT, "ui_pylibs")
 
 # 同一条提示每进程只打一次，避免 watcher 每轮轮询刷屏
 _WARNED = set()
+
+
+class ConfigError(ValueError):
+    """配置缺失或无效：带 key、当前值与修复提示。"""
+
+    def __init__(self, key, message, hint=""):
+        self.key = key
+        self.hint = hint
+        text = f"{message}"
+        if hint:
+            text += f"；{hint}"
+        super().__init__(text)
 
 
 def _warn(message):
@@ -67,45 +66,79 @@ def _cfg_text(key):
     return value.strip() if isinstance(value, str) else ""
 
 
-def _resolve_dir(config_key, env_name, default, candidates=(), label="目录"):
-    """输入型路径解析：env > presets.json > 自动探测 > 默认。
+def _hint_for(config_key, env_name):
+    return (f"请在 pipeline/presets.json 填写 {config_key}，"
+            f"或设置环境变量 {env_name}（必须指向有效目录）")
 
-    显式配置但目录不可用时打一句可读提示并继续下一级，绝不静默使用错误路径。
-    自动探测只在候选目录真实存在时命中；最后一层永远返回 default（保持现状）。
-    """
+
+def _resolve_required_dir(config_key, env_name, label):
+    """业务输入根：env > presets.json > 报错；无效配置不再回退。"""
     env_value = (os.environ.get(env_name) or "").strip()
     if env_value:
         path = _expand(env_value)
         if os.path.isdir(path):
-            return path
-        _warn(f"{env_name}={env_value} 不是可用的{label}，已回退到下一级")
+            return path, "env"
+        raise ConfigError(config_key, f"{env_name}={env_value} 不是可用的{label}",
+                          _hint_for(config_key, env_name))
     cfg_value = _cfg_text(config_key)
     if cfg_value:
         path = _expand(cfg_value)
         if os.path.isdir(path):
-            return path
-        _warn(f"pipeline/presets.json 的 {config_key}={cfg_value} 不是可用的{label}，已回退到下一级")
-    for candidate in candidates:
-        if candidate and os.path.isdir(candidate):
-            return _expand(candidate)
-    return default
+            return path, "presets.json"
+        raise ConfigError(config_key,
+                          f"pipeline/presets.json 的 {config_key}={cfg_value} 不是可用的{label}",
+                          _hint_for(config_key, env_name))
+    raise ConfigError(config_key, f"未配置{label}",
+                      _hint_for(config_key, env_name))
 
 
-def _resolve_target(config_key, env_name, default, label="目录"):
-    """输出型路径解析：env > presets.json > 默认（不要求已存在，缺失只提示不丢弃）。"""
+def _resolve_output_root(config_key, env_name, label):
+    """业务输出根：env > presets.json > 报错；允许尚不存在（首次使用时创建）。"""
     env_value = (os.environ.get(env_name) or "").strip()
     if env_value:
         path = _expand(env_value)
         if not os.path.isdir(path):
             _warn(f"{env_name}={env_value} 指向的{label}尚不存在，将在首次使用时创建")
-        return path
+        return path, "env"
     cfg_value = _cfg_text(config_key)
     if cfg_value:
         path = _expand(cfg_value)
         if not os.path.isdir(path):
             _warn(f"pipeline/presets.json 的 {config_key}={cfg_value} 指向的{label}尚不存在，将在首次使用时创建")
-        return path
-    return default
+        return path, "presets.json"
+    raise ConfigError(config_key, f"未配置{label}",
+                      _hint_for(config_key, env_name))
+
+
+def _resolve_dir(config_key, env_name, default, candidates=(), label="目录", allow_missing=False):
+    """系统派生根：env > presets.json > 自动探测 > 派生默认；显式配置无效直接报错。"""
+    env_value = (os.environ.get(env_name) or "").strip()
+    if env_value:
+        path = _expand(env_value)
+        if os.path.isdir(path) or allow_missing:
+            return path, "env"
+        raise ConfigError(config_key, f"{env_name}={env_value} 不是可用的{label}",
+                          _hint_for(config_key, env_name))
+    cfg_value = _cfg_text(config_key)
+    if cfg_value:
+        path = _expand(cfg_value)
+        if os.path.isdir(path) or allow_missing:
+            return path, "presets.json"
+        raise ConfigError(config_key,
+                          f"pipeline/presets.json 的 {config_key}={cfg_value} 不是可用的{label}",
+                          _hint_for(config_key, env_name))
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return _expand(candidate), "autodetect"
+    if default:
+        return _expand(default), "system"
+    raise ConfigError(config_key, f"未能定位{label}",
+                      _hint_for(config_key, env_name))
+
+
+def _resolve_target(config_key, env_name, label="目录"):
+    """输出型路径：env > presets.json > 报错（不要求已存在）。"""
+    return _resolve_output_root(config_key, env_name, label)[0]
 
 
 def _local_appdata():
@@ -220,87 +253,199 @@ def _autodetect_jianying_dirs():
 
 
 def get_export_dir():
-    """成品导出根目录：JY_EXPORT_DIR > presets.json export_dir > 内置默认值。"""
-    return _resolve_target("export_dir", "JY_EXPORT_DIR", DEFAULT_EXPORT_DIR, "成品导出目录")
+    """成品导出根目录：JY_EXPORT_DIR > presets.json export_dir；未配置报错。"""
+    return _resolve_target("export_dir", "JY_EXPORT_DIR", "成品导出目录")
 
 
 def get_deps_root():
-    """统一依赖根目录：JY_DEPS_ROOT > presets.json deps_root > 内置默认值。"""
-    return _resolve_dir("deps_root", "JY_DEPS_ROOT", DEFAULT_DEPS_ROOT,
-                        candidates=(DEFAULT_DEPS_ROOT,), label="依赖根目录")
-
-
-def _ui_pylibs_candidates():
-    """UI OCR 依赖目录的自动探测候选：旧仓库内自包含目录、依赖根同层目录。"""
-    return [
-        os.path.join(os.path.dirname(_HERE), "pipeline_ui", "pylibs"),
-        os.path.join(get_deps_root(), "ui_pylibs"),
-    ]
-
-
-def get_ui_pylibs_dir():
-    """UI 自动化 OCR 依赖目录：JY_UI_PYLIBS > presets.json ui_pylibs > 自动探测 > 内置默认。
-
-    与其它输入型目录不同：环境变量/presets.json 显式指定的路径即使尚不存在也原样返回，
-    便于 install_deps.ps1 首次安装到该位置；doctor 会单独报告"缺失"。
-    """
-    env_value = (os.environ.get("JY_UI_PYLIBS") or "").strip()
-    if env_value:
-        return _expand(env_value)
-    cfg_value = _cfg_text("ui_pylibs")
-    if cfg_value:
-        return _expand(cfg_value)
-    for candidate in _ui_pylibs_candidates():
-        if candidate and os.path.isdir(candidate):
-            return _expand(candidate)
-    return DEFAULT_UI_PYLIBS
+    """统一依赖根目录：JY_DEPS_ROOT > presets.json deps_root；未配置报错。"""
+    return _resolve_dir("deps_root", "JY_DEPS_ROOT", None, label="依赖根目录")[0]
 
 
 def get_jianying_dir():
-    """剪映安装目录：JY_JIANYING_DIR > presets.json jianying_dir > 自动探测 > 内置默认值。"""
-    return _resolve_dir("jianying_dir", "JY_JIANYING_DIR", DEFAULT_JIANYING_DIR,
-                        candidates=_autodetect_jianying_dirs(), label="剪映安装目录")
+    """剪映安装目录：JY_JIANYING_DIR > presets.json jianying_dir > 注册表探测；都失败报错。"""
+    return _resolve_dir("jianying_dir", "JY_JIANYING_DIR", None,
+                        candidates=_autodetect_jianying_dirs(), label="剪映安装目录")[0]
 
 
 def get_projects_root():
-    """剪映草稿根目录：JY_PROJECTS_ROOT > presets.json projects_root > 自动探测 > 默认。"""
+    """剪映草稿根目录：JY_PROJECTS_ROOT > presets.json projects_root > 系统派生根。"""
     return _resolve_dir("projects_root", "JY_PROJECTS_ROOT", DEFAULT_PROJECTS_ROOT,
-                        candidates=_projects_candidates(), label="剪映草稿根目录")
+                        candidates=_projects_candidates(), label="剪映草稿根目录",
+                        allow_missing=True)[0]
 
 
 def get_presets_root():
-    """剪映组合预设库：JY_PRESETS_ROOT > presets.json presets_root > 自动探测 > 默认。"""
+    """剪映组合预设库：JY_PRESETS_ROOT > presets.json presets_root > 系统派生根。"""
     return _resolve_dir("presets_root", "JY_PRESETS_ROOT", DEFAULT_PRESETS_ROOT,
-                        candidates=_presets_candidates(), label="剪映预设库")
+                        candidates=_presets_candidates(), label="剪映预设库",
+                        allow_missing=True)[0]
 
 
 def get_jianying_log_dir():
-    """剪映日志目录：JY_JIANYING_LOG_DIR > presets.json jianying_log_dir > 自动探测 > 默认。"""
+    """剪映日志目录：JY_JIANYING_LOG_DIR > presets.json jianying_log_dir > 系统派生根。"""
     return _resolve_dir("jianying_log_dir", "JY_JIANYING_LOG_DIR", DEFAULT_JIANYING_LOG_DIR,
-                        candidates=_log_candidates(), label="剪映日志目录")
+                        candidates=_log_candidates(), label="剪映日志目录",
+                        allow_missing=True)[0]
+
+
+def _series_root_detail():
+    return _resolve_required_dir("series_root", "JY_SERIES_ROOT", "短剧素材根目录")
 
 
 def get_series_root():
-    """短剧素材根目录：JY_SERIES_ROOT > presets.json series_root > watch.roots[0] > 默认。"""
-    roots = []
-    try:
-        raw = (_cfg().get("watch") or {}).get("roots") or []
-        if isinstance(raw, list):
-            roots = [str(r).strip() for r in raw if isinstance(r, str) and str(r).strip()]
-    except Exception:
-        roots = []
-    return _resolve_dir("series_root", "JY_SERIES_ROOT", DEFAULT_SERIES_ROOT,
-                        candidates=roots, label="短剧素材根目录")
+    """短剧素材根目录：JY_SERIES_ROOT > presets.json series_root；不再读 watch.roots。"""
+    return _series_root_detail()[0]
+
+
+def _watch_extra_roots():
+    """watch.roots：仅 watcher 额外扫描根；每项必须存在且下面有 */cover_job。"""
+    raw = get_watch_config().get("roots")
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError("watch.roots", "watch.roots 必须是目录列表",
+                          "请把 presets.json 的 watch.roots 改成 [] 或 [\"<额外素材根>\"]")
+    out = []
+    seen = set()
+    for index, item in enumerate(raw, 1):
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError("watch.roots", f"watch.roots 第 {index} 项为空或不是字符串",
+                              "请删除空项，或填写有效的额外素材根")
+        path = _expand(item)
+        key = os.path.normcase(path)
+        if key in seen:
+            continue
+        if not os.path.isdir(path):
+            raise ConfigError("watch.roots", f"watch.roots 第 {index} 项不存在: {path}",
+                              "请修正路径，或从 watch.roots 中删除；主素材根请写在 series_root")
+        try:
+            has_job = any(os.path.isdir(os.path.join(entry.path, "cover_job"))
+                          for entry in os.scandir(path) if entry.is_dir())
+        except OSError as exc:
+            raise ConfigError("watch.roots", f"watch.roots 第 {index} 项无法读取: {path}（{exc}）",
+                              "请检查目录权限，或从 watch.roots 中删除")
+        if not has_job:
+            raise ConfigError("watch.roots",
+                              f"watch.roots 第 {index} 项目录下没有 */cover_job: {path}",
+                              "watcher 扫不到任务；请放入剧集目录，或从 watch.roots 中删除")
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def get_watch_roots():
+    """watcher 有效扫描根：[series_root] + watch.roots（去重）。"""
+    roots = [get_series_root()]
+    seen = {os.path.normcase(roots[0])}
+    for path in _watch_extra_roots():
+        key = os.path.normcase(path)
+        if key not in seen:
+            seen.add(key)
+            roots.append(path)
+    return roots
 
 
 def get_archive_root():
-    """归档/备份池根目录：JY_ARCHIVE_ROOT > presets.json archive_root > watch.archive_root > 默认。"""
-    watch = get_watch_config()
-    candidates = []
-    if isinstance(watch.get("archive_root"), str) and watch["archive_root"].strip():
-        candidates.append(watch["archive_root"].strip())
-    return _resolve_dir("archive_root", "JY_ARCHIVE_ROOT", DEFAULT_ARCHIVE_ROOT,
-                        candidates=candidates, label="归档/备份根目录")
+    """归档根：JY_ARCHIVE_ROOT > presets.json archive_root > watch.archive_root（兼容）。
+
+    未配置返回空串，表示禁用归档；显式配置但无效的路径由输出根规则处理（允许尚未创建）。
+    """
+    env_value = (os.environ.get("JY_ARCHIVE_ROOT") or "").strip()
+    if env_value:
+        return _expand(env_value)
+    cfg_value = _cfg_text("archive_root")
+    if cfg_value:
+        return _expand(cfg_value)
+    legacy = get_watch_config().get("archive_root")
+    if isinstance(legacy, str) and legacy.strip():
+        return _expand(legacy)
+    return ""
+
+
+def _archive_root_detail():
+    """归档根 + 真实来源（Console 展示用）：env > presets.json > watch.archive_root。"""
+    env_value = (os.environ.get("JY_ARCHIVE_ROOT") or "").strip()
+    if env_value:
+        return _expand(env_value), "env:JY_ARCHIVE_ROOT"
+    cfg_value = _cfg_text("archive_root")
+    if cfg_value:
+        return _expand(cfg_value), "presets.json"
+    legacy = get_watch_config().get("archive_root")
+    if isinstance(legacy, str) and legacy.strip():
+        return _expand(legacy), "presets.json:watch.archive_root"
+    return "", "未配置"
+
+
+def resolve_paths(mode="run"):
+    """统一路径快照：所有调用方只读这里，不再自行拼路径。
+
+    mode 目前用于标记调用场景（run/export/install/console），不改变解析优先级；
+    缺失项不抛出，而是进入 issues，由 doctor/Console 统一展示。
+    """
+    paths = {}
+    sources = {}
+    issues = []
+
+    def take(key, getter, source_key=None):
+        try:
+            value = getter()
+            paths[key] = value
+            sources[key] = source_key or "derived"
+            return value
+        except ConfigError as exc:
+            paths[key] = ""
+            sources[key] = "error"
+            issues.append({"key": exc.key, "message": str(exc), "hint": exc.hint})
+            return ""
+
+    def take_detail(key, detail):
+        try:
+            value, source = detail()
+            paths[key] = value
+            sources[key] = source
+            return value
+        except ConfigError as exc:
+            paths[key] = ""
+            sources[key] = "error"
+            issues.append({"key": exc.key, "message": str(exc), "hint": exc.hint})
+            return ""
+
+    take_detail("series_root", _series_root_detail)
+    take_detail("export_dir", lambda: _resolve_output_root(
+        "export_dir", "JY_EXPORT_DIR", "成品导出目录"))
+    take_detail("deps_root", lambda: _resolve_dir(
+        "deps_root", "JY_DEPS_ROOT", None, label="依赖根目录"))
+    take_detail("archive_root", _archive_root_detail)
+    try:
+        paths["watch_extra_roots"] = _watch_extra_roots()
+        sources["watch_extra_roots"] = "presets.json" if paths["watch_extra_roots"] else "empty"
+    except ConfigError as exc:
+        paths["watch_extra_roots"] = []
+        sources["watch_extra_roots"] = "error"
+        issues.append({"key": exc.key, "message": str(exc), "hint": exc.hint})
+    try:
+        paths["watch_roots"] = get_watch_roots()
+        sources["watch_roots"] = "derived"
+    except ConfigError:
+        paths["watch_roots"] = [paths.get("series_root")] if paths.get("series_root") else []
+    take("jianying_dir", get_jianying_dir)
+    take("projects_root", get_projects_root)
+    take("presets_root", get_presets_root)
+    take("jianying_log_dir", get_jianying_log_dir)
+    paths["mode"] = mode
+    return {"paths": paths, "sources": sources, "issues": issues}
+
+
+def validate_config(mode="run"):
+    """只读校验：返回 {ok, paths, sources, issues}，不抛异常。"""
+    snapshot = resolve_paths(mode)
+    return {
+        "ok": not snapshot["issues"],
+        "paths": snapshot["paths"],
+        "sources": snapshot["sources"],
+        "issues": snapshot["issues"],
+    }
 
 
 def get_watch_config():

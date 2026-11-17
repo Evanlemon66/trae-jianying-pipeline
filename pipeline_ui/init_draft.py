@@ -33,6 +33,7 @@ from pipeline import (
     find_preset_by_name,
     resolve_presets,
     save_draft,
+    set_draft_cover,
     write_preset_manifest,
     DRAFT_ROOT,
 )
@@ -50,12 +51,12 @@ VIDEO_LIMIT = 5                          # 取前 N 集，None 表示全部
 def admission_defaults(need_video=True, need_name=True):
     """独立 CLI 的默认值来源：presets.json 的 admission 段（唯一真源）。
 
-    素材：admission.video → watch.roots[root_index] 下第 series_index 个剧集目录
+    素材：admission.video.root 显式优先；否则 series_root 下第 series_index 个剧集目录
           （没有匹配视频就顺延下一个），glob/limit/range 原样复用既有解析；
     草稿名：admission.draft_name。
     推导不出来抛 ValueError，不回落任何写死的剧名/路径。
     """
-    from export_config import get_admission_config, get_watch_config
+    from export_config import get_admission_config
     from admission_draft import normalize_config, resolve_series_dir
     raw = get_admission_config()
     if not need_name and not str(raw.get('draft_name') or '').strip():
@@ -70,8 +71,7 @@ def admission_defaults(need_video=True, need_name=True):
         'video_range': cfg['video']['range'],
     }
     if need_video:
-        out['video_dir'], _hits = resolve_series_dir(
-            cfg['video'], get_watch_config().get('roots') or [])
+        out['video_dir'], _hits = resolve_series_dir(cfg['video'])
     return out
 
 
@@ -174,6 +174,7 @@ def init_draft(draft_name: str = None,
                video_limit=VIDEO_LIMIT,
                video_range: str = None,
                cut_s: float = None,
+               cover_image: str = None,
                normalize: bool = False,
                open_after: bool = True) -> dict:
     """构建并（可选）打开测试草稿。返回 {'ok': bool, 'episodes': int, 'duration_s': float, 'error': str|None}
@@ -306,6 +307,19 @@ def init_draft(draft_name: str = None,
         print(f"  ✂️ 发布前裁剪 {float(cut_s):g}s：裁段 {len(cut_segs)} 条，左移 {moved} 段，"
               f"总时长 → {total_us/1e6:.1f}s")
         _phase('发布前时间线裁剪')
+
+    # ── Step 3.6: 自定义封面（发布前写入暂存区，随草稿一起发布）──
+    if cover_image:
+        try:
+            cover_ok = set_draft_cover(stage_dir, cover_image=cover_image)
+        except Exception as e:
+            cover_ok = False
+            print(f"  ⚠️ 封面写入异常（已忽略，继续发布）: {e}")
+        if cover_ok:
+            print(f"  🖼️ 已写入自定义封面: {os.path.basename(cover_image)}")
+        else:
+            print("  ⚠️ 封面写入失败，继续（导出将用剪映默认首帧封面）")
+        _phase('写入封面')
 
     # ── Step 4: 保存到暂存区 ──
     save_draft(draft, jp_new)

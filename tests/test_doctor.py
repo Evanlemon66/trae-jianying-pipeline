@@ -87,34 +87,13 @@ def test_ffmpeg_present_passes(tmp_path):
     assert str(ff) in r.detail and str(fp) in r.detail
 
 
-def test_ui_pylibs_missing_is_nonblocking(tmp_path):
-    r = doctor.check_ui_pylibs(str(tmp_path / "missing-ui"))
-    assert r.status == "fail"
-    assert r.blocking is False
-    assert "admission_test" in r.detail and "ui_vocal_separate" in r.detail
-    report = doctor.DoctorReport("X", [r])
-    assert report.failed == []
-    text = doctor.format_report(report)
-    assert "[缺失·非阻断] UI OCR 依赖" in text
-    assert "不阻断主链路" in text
-
-
-def test_ui_pylibs_present_but_incomplete_warns(tmp_path):
-    d = tmp_path / "ui"
-    d.mkdir()
-    r = doctor.check_ui_pylibs(str(d))
+def test_test_deps_missing_is_warn(monkeypatch):
+    import doctor_core
+    monkeypatch.setattr(doctor_core.importlib.util, "find_spec", lambda name: None)
+    r = doctor.check_test_deps()
     assert r.status == "warn"
-    assert "rapidocr_onnxruntime" in r.detail
-
-
-def test_ui_pylibs_ok(tmp_path):
-    d = tmp_path / "ui"
-    pkg = d / "rapidocr_onnxruntime"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    r = doctor.check_ui_pylibs(str(d))
-    assert r.status == "pass"
-    assert str(d) in r.detail
+    assert "requirements-dev.txt" in r.fix
+    assert doctor.DoctorReport("X", [r]).failed == []
 
 
 def test_config_path_missing_input_is_fail_with_env_hint(tmp_path):
@@ -213,22 +192,34 @@ def _task_runner(returncode, stdout=""):
     return lambda _script: SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
 
 
-def test_watcher_task_unregistered_warns_without_blocking():
-    r = doctor.check_watcher_task(runner=_task_runner(1))
+def test_watcher_task_unregistered_warns_without_blocking(tmp_path):
+    r = doctor.check_watcher_task(runner=_task_runner(1),
+                                  pause_path=str(tmp_path / "no.pause"))
     assert r.status == "warn"
     assert "未注册" in r.detail
     assert "本机运维信息" in r.detail
     assert doctor.DoctorReport("X", [r]).failed == []
 
 
-def test_watcher_task_registered_and_enabled_passes():
-    r = doctor.check_watcher_task(runner=_task_runner(0, "Ready|True"))
+def test_watcher_task_registered_and_enabled_passes(tmp_path):
+    r = doctor.check_watcher_task(runner=_task_runner(0, "Ready|True"),
+                                  pause_path=str(tmp_path / "no.pause"))
     assert r.status == "pass"
     assert "已注册并启用" in r.detail and "本机运维信息" in r.detail
 
 
-def test_watcher_task_disabled_warns():
-    r = doctor.check_watcher_task(runner=_task_runner(0, "Disabled|False"))
+def test_watcher_task_notes_pause_sentinel(tmp_path):
+    pause = tmp_path / "watcher.pause"
+    pause.write_text("paused", encoding="utf-8")
+    r = doctor.check_watcher_task(runner=_task_runner(0, "Ready|True"),
+                                  pause_path=str(pause))
+    assert r.status == "pass"
+    assert "自动拉起已暂停" in r.detail
+
+
+def test_watcher_task_disabled_warns(tmp_path):
+    r = doctor.check_watcher_task(runner=_task_runner(0, "Disabled|False"),
+                                  pause_path=str(tmp_path / "no.pause"))
     assert r.status == "warn"
     assert "已禁用" in r.detail
 
@@ -237,6 +228,8 @@ def test_watcher_runtime_fresh_heartbeat_passes(tmp_path):
     hb = tmp_path / "watcher_heartbeat.json"
     hb.write_text(json.dumps({"pid": 123, "updated_ts": 1000.0}), encoding="utf-8")
     r = doctor.check_watcher_runtime(heartbeat_path=str(hb), lock_paths=[],
+                                     pause_path=str(tmp_path / "no.pause"),
+                                     stop_path=str(tmp_path / "no.stop"),
                                      now=1030.0, pid_alive=lambda pid: pid == 123,
                                      stall_seconds=900)
     assert r.status == "pass"
@@ -247,6 +240,8 @@ def test_watcher_runtime_stale_heartbeat_warns(tmp_path):
     hb = tmp_path / "watcher_heartbeat.json"
     hb.write_text(json.dumps({"pid": 123, "updated_ts": 1000.0}), encoding="utf-8")
     r = doctor.check_watcher_runtime(heartbeat_path=str(hb), lock_paths=[],
+                                     pause_path=str(tmp_path / "no.pause"),
+                                     stop_path=str(tmp_path / "no.stop"),
                                      now=5000.0, pid_alive=lambda _pid: True,
                                      stall_seconds=900)
     assert r.status == "warn"
@@ -258,7 +253,10 @@ def test_watcher_runtime_missing_heartbeat_falls_back_to_lock(tmp_path):
     lock.write_text(json.dumps({"pid": 456, "phase": "export", "job": str(tmp_path)}),
                     encoding="utf-8")
     r = doctor.check_watcher_runtime(heartbeat_path=str(tmp_path / "missing.json"),
-                                     lock_paths=[str(lock)], now=5000.0,
+                                     lock_paths=[str(lock)],
+                                     pause_path=str(tmp_path / "no.pause"),
+                                     stop_path=str(tmp_path / "no.stop"),
+                                     now=5000.0,
                                      pid_alive=lambda pid: pid == 456, stall_seconds=900)
     assert r.status == "warn"
     assert "pid=456" in r.detail
@@ -267,8 +265,50 @@ def test_watcher_runtime_missing_heartbeat_falls_back_to_lock(tmp_path):
 
 def test_watcher_runtime_not_running_is_warn_only(tmp_path):
     r = doctor.check_watcher_runtime(heartbeat_path=str(tmp_path / "missing.json"),
-                                     lock_paths=[], now=5000.0,
+                                     lock_paths=[],
+                                     pause_path=str(tmp_path / "no.pause"),
+                                     stop_path=str(tmp_path / "no.stop"),
+                                     now=5000.0,
                                      pid_alive=lambda _pid: False, stall_seconds=900)
     assert r.status == "warn"
     assert "未检测到运行中的 watcher" in r.detail
     assert doctor.DoctorReport("X", [r]).failed == []
+
+
+def test_watcher_runtime_paused_but_running_warns(tmp_path):
+    hb = tmp_path / "watcher_heartbeat.json"
+    hb.write_text(json.dumps({"pid": 123, "updated_ts": 1000.0}), encoding="utf-8")
+    pause = tmp_path / "watcher.pause"
+    pause.write_text("paused", encoding="utf-8")
+    r = doctor.check_watcher_runtime(heartbeat_path=str(hb), lock_paths=[],
+                                     pause_path=str(pause), now=1030.0,
+                                     pid_alive=lambda pid: pid == 123, stall_seconds=900)
+    assert r.status == "warn"
+    assert "自动拉起已暂停" in r.detail
+    assert "不会被重新拉起" in r.detail
+
+
+def test_watcher_runtime_stop_requested_warns(tmp_path):
+    hb = tmp_path / "watcher_heartbeat.json"
+    hb.write_text(json.dumps({"pid": 123, "updated_ts": 1000.0}), encoding="utf-8")
+    stop = tmp_path / "watcher.stop"
+    stop.write_text("stop", encoding="utf-8")
+    r = doctor.check_watcher_runtime(heartbeat_path=str(hb), lock_paths=[],
+                                     pause_path=str(tmp_path / "no.pause"),
+                                     stop_path=str(stop), now=1030.0,
+                                     pid_alive=lambda pid: pid == 123, stall_seconds=900)
+    assert r.status == "warn"
+    assert "已请求优雅停止" in r.detail
+    assert "撤销停止请求" in r.fix
+
+
+def test_watcher_runtime_paused_and_stopped_points_to_resume(tmp_path):
+    pause = tmp_path / "watcher.pause"
+    pause.write_text("paused", encoding="utf-8")
+    r = doctor.check_watcher_runtime(heartbeat_path=str(tmp_path / "missing.json"),
+                                     lock_paths=[], pause_path=str(pause),
+                                     stop_path=str(tmp_path / "no.stop"), now=5000.0,
+                                     pid_alive=lambda _pid: False, stall_seconds=900)
+    assert r.status == "warn"
+    assert "watcher.pause" in r.detail
+    assert "恢复自动拉起" in r.fix

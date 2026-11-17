@@ -304,7 +304,7 @@ Stage 0 的建目录**不在脚本里**：入口是 Trae 侧 `lib/job_manifest.p
 
 `job.json.video.export_state` 记录**整剧聚合**的成品生命周期（`null`/`exported`/`cleaned`）：版本级状态看 `video.outputs.<版本>.state`（`exported`/`cleaned`）；`record_video` 置 `exported`，clean 真正删成品后按版本回写，**全部版本都清完**才置顶层 `cleaned`（`--dry-run`/`--intermediates-only` 不回写），不改 `stage`。
 
-导出完成**不等于**归档：`job.json.stage=archived` 是合法 stage，含义为「已归档、不再参与调度」，由 `pipeline/archive_job.py` 写入（watcher 的触发判定对它硬拦，`--phase` / `--once` / `--job` 都绕不过去）。归档是显式操作：默认准入需**同时满足**——① `publish.status=published` 或 `video.export_state=cleaned`；② **所有声明版本都已完成**（`video.outputs` 里每个版本 `state` ∈ `exported`/`cleaned`，任一未导出则跳过）；`--force` 可跳过全部准入。首次归档时有活锁（`.watcher.lock`）或 `.export_state.json` `status=exporting` 则拒绝；`archive_root` 等于或位于 `watch.roots` 之下、或 `watch.roots` 为空时直接拒绝（fail-closed）。整剧目录搬到 `<archive_root>/<剧名>`，并同步改写 `pipeline/_stream_manifests/*.json` 的 `paths.source_dir`（否则后续清理按旧路径找不到源）；`stage` 已 archived 但目录未搬净时，重跑同一命令即续做。注意：自动发布链不写 `publish.status`（只有手工 `publish-record` 会置 `published`），不要依据它判断是否已发布。契约见 `references/handoff-contract.md` §7.4。
+导出完成**不等于**归档：`job.json.stage=archived` 是合法 stage，含义为「已归档、不再参与调度」，由 `pipeline/archive_job.py` 写入（watcher 的触发判定对它硬拦，`--phase` / `--once` / `--job` 都绕不过去）。归档是显式操作：默认准入需**同时满足**——① `publish.status=published` 或 `video.export_state=cleaned`；② **所有声明版本都已完成**（`video.outputs` 里每个版本 `state` ∈ `exported`/`cleaned`，任一未导出则跳过）；`--force` 可跳过全部准入。首次归档时有活锁（`.watcher.lock`）或 `.export_state.json` `status=exporting` 则拒绝；`archive_root` 等于或位于任一有效扫描根之下、或有效扫描根为空（`series_root` 未配置）时直接拒绝（fail-closed）。整剧目录搬到 `<archive_root>/<剧名>`，并同步改写 `pipeline/_stream_manifests/*.json` 的 `paths.source_dir`（否则后续清理按旧路径找不到源）；`stage` 已 archived 但目录未搬净时，重跑同一命令即续做。注意：自动发布链不写 `publish.status`（只有手工 `publish-record` 会置 `published`），不要依据它判断是否已发布。契约见 `references/handoff-contract.md` §7.4。
 
 剪映草稿封面写入（`draft_cover.jpg` + 原生 composition）已内置到本 skill，不再依赖 `lib/jy_cover.py`：
 
@@ -322,7 +322,7 @@ python scripts/drama_cover.py full --video "<mp4>" --title "<标题>" --out "<�
 豆包/手工把 Stage 2 产物（4 张契约图 + prompts.json [+ dispatch.json]）落盘后，`lib/cover_watch.py` 自动调度，**串行、每轮只推进一部**：
 
 ```powershell
-python lib/cover_watch.py                        # 读 pipeline/presets.json 的 watch 段：roots 自动发现
+python lib/cover_watch.py                        # 有效扫描根（series_root + watch.roots）自动发现
 python lib/cover_watch.py plan --root "<剧集根>"  # 只查看：各剧阶段/意图来源/下一步/被挡原因
 python lib/cover_watch.py --hold --once          # 只列计划不执行（先核对 job.json 再放行）
 python lib/cover_watch.py --phase export --once  # 单轮强制只推进导出（配合 export_policy=manual）
@@ -337,7 +337,7 @@ python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>" 
 python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>"
 ```
 
-配置 `<repo>/pipeline/presets.json` 的 `watch` 段（从 `presets.example.json` 复制起步），每轮热加载、改完不用重启：`{"watch":{"roots":["<剧集根>"],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":[],"export_policy":"immediate","hold":false}}`。`roots` 下的 `<剧集>/cover_job` 自动发现，无需登记。归档池根目录另行配置 `watch.archive_root`（仅 `pipeline/archive_job.py` 使用，必须在 `roots` 之外；`roots` 为空时归档脚本拒绝执行）。
+配置 `<repo>/pipeline/presets.json`：`series_root`（**唯一素材根，必填**）与 `watch` 段（从 `presets.example.json` 复制起步），每轮热加载、改完不用重启：`{"series_root":"<剧集根>","watch":{"roots":[],"jobs":[],"exclude":[],"settle":30,"interval":5,"derive":[],"export_policy":"immediate","hold":false}}`。`series_root` 与 `watch.roots` 下的 `<剧集>/cover_job` 自动发现，无需登记；`watch.roots` 只是额外扫描根（留空即只扫 `series_root`，非空时每项须存在且含 `*/cover_job`），有效扫描根统一由 `export_config.get_watch_roots()` 解析。归档池根目录另行配置 `archive_root`（或兼容 `watch.archive_root`；仅 `pipeline/archive_job.py` 使用，必须在所有有效扫描根之外；有效扫描根为空时归档脚本拒绝执行）。
 
 **两阶段**：无串流草稿 → **edit**（validate --fix → ingest 归并 dispatch → batch_runner --no-export 生成草稿+帧对齐）；有草稿 + `workflow.mode=full` + 策略放行 → **export**（导出 mp4 → verify 质检 → record-video → derive），但**最近一次 edit 失败/退避/暂停未修复时一律不许进导出**（`build_plan` 每轮无条件读 `.edit_state.json`）。`mode=edit_only` 永远停在草稿，等人工把 `workflow.mode` 改为 `full` 并 `intent_revision` +1。**export_policy**：`immediate`（默认，剪完即导）/ `after_edit_queue_drained`（全部剧剪完才开始导出）/ `manual`（等 `--phase export`）。**意图**：运行期只读 `job.json.workflow`；`dispatch.json` 仅在 `intent_revision==0` 时归并，人工 +1 后 job.json 永远优先（冲突记日志+桌面通知）。旧版 `export_config.json` 仍兼容。多 job 单 watcher 串行；跨进程由 `.export.lock` 互斥。进度看 Toast / `watcher.log` / `06_publish/pipeline.log` / `plan` / `status`。**多版本**：版本判定 job 优先、prompts 兜底（`job.json` 的 `titles.selected_groups` → `prompts.items` → `workflow.preset_profile`，job 没有或不完整才回落 `03_prompts/prompts.json`），派生的 `_<版本>` 草稿由 watcher 按组补克隆，克隆时同步写入该组竖版封面（见 §6.3）；缺 `presets_<组>` 的组标 blocked（写进 `video.outputs.<组>`）不阻断其余版本；清理/归档只删成品与中间产物，`04_covers/` 各组封面始终保留。
 

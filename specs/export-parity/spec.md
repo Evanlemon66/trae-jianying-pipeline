@@ -4,6 +4,12 @@
 > 约束：`pipeline/pipeline.py`、`pipeline/preset_ops.py` 正由另一会话修改，本规格的落点必须避开这两个文件（除非用户明确允许等待/合并）。
 > 反例样本：《八零猎王：赶山捕兽遇旺妻》2026-11-14 07:09–07:58 实跑。
 
+## 路径契约更新（已收口）
+
+- 路径唯一入口是 `pipeline/export_config.resolve_paths()`（`validate_config()` 返回 `ok/paths/sources/issues`）。
+- `series_root` 是唯一素材根，`<导出根>` = `export_dir`；`watch.roots` 仅 watcher 的额外扫描根（为空只扫 `series_root`）。
+- 业务根 `series_root`/`export_dir`/`deps_root` 无默认值，缺失或无效直接 `ConfigError`（fail-closed）。
+
 ## 1. 目标
 
 同一部剧的所有版本（`a` 基础版 + `_b`/`_c` 克隆版）导出后，成品目录的文件集合必须完全一致：

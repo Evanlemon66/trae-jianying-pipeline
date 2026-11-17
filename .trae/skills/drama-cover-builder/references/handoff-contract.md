@@ -93,7 +93,7 @@
 | `video.duration_s` | number \| null | 秒 |
 | `video.cut_s` | number \| null | 导出裁剪秒数（正数，≤ duration_s）；watcher/pipeline 非 null 时传 `--cut` |
 | `video.cover` | string \| null | 指向竖版封面 |
-| `video.export_dir` | string \| null | pipeline 最终导出目录（**允许绝对路径**，只记录不复制）；顶层字段是**基础版聚合**，各版本见 `video.outputs.<版本>` |
+| `video.export_dir` | string \| null | pipeline 最终导出目录（**允许绝对路径**，只记录不复制；必须位于统一配置的 `export_dir` 之下，由 `export_config.get_export_dir()` 解析）；顶层字段是**基础版聚合**，各版本见 `video.outputs.<版本>` |
 | `video.export_file` | string \| null | 最终成品 mp4 完整路径；顶层字段是**基础版聚合** |
 | `video.draft_name` | string \| null | 串流草稿名，关联 `pipeline/_stream_manifests/<名>.json`；记基础版草稿名，扩展版见 `video.outputs.<版本>.draft`（命名见 §2.1） |
 | `video.companions` | array | 成品旁的脚本产物（`.progress.json`、`-封面.jpg`） |
@@ -424,12 +424,16 @@ python lib/cover_watch.py          # 无参：读 <repo>/pipeline/presets.json �
 # 归档：置 stage=archived 并搬入独立归档池（硬拦 watcher；先 --dry-run 核对计划）
 python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>" --dry-run
 python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>"
-# watch 段：{"roots":["<剧集根>"],"jobs":[],"exclude":[],"settle":30,"interval":5,
+# watch 段：{"roots":["<额外扫描根>"],"jobs":[],"exclude":[],"settle":30,"interval":5,
 #            "derive":[],"export_policy":"immediate","hold":false,
 #            "cold_start":true,"export_stall_timeout":1800,"retry_pause_after":5,
 #            "archive_root":"<归档根>"}
+#   素材根唯一：<repo>/pipeline/presets.json 的 series_root（必填，无字面量默认值）；
+#     环境变量 JY_SERIES_ROOT 优先。watch.roots 只是 watcher 额外扫描根：
+#     为空 → 只扫 series_root；非空 → 每项必须存在且含 */cover_job，不要求位于 series_root 下。
+#     有效扫描根 = [series_root] + watch.roots（去重），统一由 export_config.get_watch_roots() 解析。
 #   export_policy: immediate（剪完即导，默认）/ after_edit_queue_drained（全部剪完才导出）/ manual（等 --phase export）
-#   archive_root: 归档池根目录，仅 pipeline/archive_job.py 使用；必须位于 roots 之外（见 §7.4）
+#   archive_root: 归档池根目录，仅 pipeline/archive_job.py 使用；必须在所有有效扫描根之外（见 §7.4）
 #   derive: 全局派生平台列表，默认 []（不派生）；剧级声明优先走 dispatch.json
 #   cold_start: 每部剧导出前冷启动剪映（杀进程→拉起→等首页），默认 true；手动同时用剪映时设 false
 #   export_stall_timeout: 导出「无进展」判定卡死的秒数，默认 1800（进度 json 每 30s 刷新，仍在写盘不误杀）
@@ -569,9 +573,9 @@ edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读�
 - **准入**（默认须同时满足；`--force` 跳过）：
   1. `publish.status=="published"` 或 `video.export_state=="cleaned"`；
   2. **所有声明版本都已完成**——`video.outputs` 里每个版本的 `state` ∈ `exported` / `cleaned`；任一版本未导出则跳过归档。
-- **拒绝/跳过**（首次归档）：`.watcher.lock` 的 pid 仍存活（活锁）；`.export_state.json` `status=exporting`（导出进行中）；归档目标已存在（不覆盖，需人工处理）；`archive_root` 等于或位于任一 `watch.roots` 之下（按规范化真实路径比较）；`watch.roots` 未配置时 **fail-closed 直接拒绝**（无法校验归档池位置）。续做（已 archived）只重复位置与目标校验，不再查活锁/导出中。
+- **拒绝/跳过**（首次归档）：`.watcher.lock` 的 pid 仍存活（活锁）；`.export_state.json` `status=exporting`（导出进行中）；归档目标已存在（不覆盖，需人工处理）；`archive_root` 等于或位于任一有效扫描根之下（按规范化真实路径比较）；有效扫描根为空（`series_root` 未配置或解析失败）时 **fail-closed 直接拒绝**（无法校验归档池位置）。续做（已 archived）只重复位置与目标校验，不再查活锁/导出中。
 - **断点可重入**：`stage` 已 `archived` 且源目录仍在、目标不存在 → 继续移动；源已不在且目标存在 → 跳过（视为完成）；两者都不存在 → 报错。因为 `stage` 先写、目录后搬，移动失败也不会再被 scheduler 选中，修复占用/空间后重跑同一命令即可续做。
-- **归档池位置**：`--archive-root` 优先，未传时读 `watch.archive_root`；建议与 `watch.roots` 同盘、独立根（如 `<归档根>`），不要放在 roots 内。
+- **归档池位置**：`--archive-root` 优先，未传时读 `export_config.get_archive_root()`（`JY_ARCHIVE_ROOT` > `presets.json archive_root` > `watch.archive_root` 兼容）；建议与素材根同盘、独立根（如 `<归档根>`），不要放在任何有效扫描根内。
 - **必须同步 manifest**：`_stream_manifests` 里的 `paths.source_dir` 是后续 `stream_manifest.py clean` / 回执定位的入口；不改写会出现「剧已搬走、清理仍按旧路径找源」的空转。脚本已自动改，手工搬目录时必须照做。
 - **回迁**：目录移回 roots 后不会自动恢复调度，仍需人工把 `job.json.stage` 改回 `video_ready`（或其他待办阶段）。
 - **`publish.status` 现状**：只有手工 `python lib/job_manifest.py publish-record ...` 会写 `published`；自动发布链**没有写入路径（暂未实现）**。因此不要依据 `publish.status` 判断「已发布」，归档准入实际以 `video.export_state=="cleaned"` 为准，或显式 `--force`。
@@ -600,5 +604,5 @@ edit（剪辑）阶段的「失败几次 / 是否退避 / 是否暂停」只读�
 | 门禁 | 只写 `job.json` + 标注 `titles.json` | `titles.selected`、`selected_by`、`cover_map` 回填；`titles.json` 选中条加 `selected/slot`、顶层记 `gate/selected_at/selected_by` | 最终选定结果只此两处（job.json 为事实源，titles.json 原位标注不复制文本） |
 | Stage 1.5 | `03_prompts/` | `prompts.json` / `prompts.md` | 4 条出图提示词，豆包/火山/Trae 三渠道共用 |
 | Stage 2 | `04_covers/` | 3 横版 + 1 竖版 + `derived/`（多账号可加 `<账号>/` 或 `<契约名>_<账号>` 组） | 平台用图；derived 放 YouTube 16:9 等派生尺寸 |
-| pipeline | 只写 `job.json` | `video.export_dir/export_file/draft_name/companions/export_state`；`derived.subtitle_missing` | 只记录导出位置（允许绝对路径），不复制 mp4；`05_video/` 留作需要副本时的可选目录。`record_video` 置 `export_state=exported`；`stream_manifest.py clean` 真正删除成品后置 `cleaned`（history 记 `export_cleaned`）。pipeline 每集统计漏字幕，整轮结束经 `update_job(event="subtitle_missing")` 一次落盘；该清单非空时不导出 |
+| pipeline | 只写 `job.json` | `video.export_dir/export_file/draft_name/companions/export_state`；`derived.subtitle_missing` | 只记录导出位置（允许绝对路径，但必须在统一配置的 `export_dir` 之下），不复制 mp4；`05_video/` 留作需要副本时的可选目录。`record_video` 置 `export_state=exported`；`stream_manifest.py clean` 真正删除成品后置 `cleaned`（history 记 `export_cleaned`）。pipeline 每集统计漏字幕，整轮结束经 `update_job(event="subtitle_missing")` 一次落盘；该清单非空时不导出 |
 | Stage 3 | `06_publish/` | `<platform>.json` + `receipts/` | 每平台状态与回执，驱动 `cleanup` 判定；`receipts/` 由 `create_job` 预建占位，内容（回执）只在 Stage 3 首次写入时落盘，缺失不阻断前序阶段 |

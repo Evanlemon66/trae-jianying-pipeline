@@ -1,247 +1,287 @@
-# Spec：无字幕策略「跑完 + 清单 + 导出前拦」（v2）
+# Spec：路径配置收口 + watcher 测试暂停 + 运行记录结构化
 
-范围：只实现无字幕策略；不跑这部剧、不启 watcher、不动 `<剧集根>` 数据。
+> 状态：待批准（本轮 Spec，取代上一轮同名文件）
+> 关联文档：`docs/console-doctor-followup-implementation.md`
+> 本轮范围：Q3 路径配置收口、Q6 环境预设分组与文档、Q7 P0+P1、Q8 P0+P1。
 
-v2 相对 v1 补齐的决策点：`job_dir` 显式传递（不再只靠向上查找）、内存兜底拦截（job.json 缺失时也不导出）、通知集中到单一模块且进程内去重、`series_runner` 被拦后的状态与通知、`robust_auto_export.py` 直调入口也设闸门、watcher 日志去重、导出闸门与 `.export_state.json` 的一致性。
+***
 
-## 1. 规则映射
+## 1. 用户决策
 
-| 规则 | 实现 |
-| --- | --- |
-| 1 记录（三档 ASR 全失败 / 最终零字幕 → 记集号；升序去重；不中断整轮） | `pipeline/pipeline.py` 逐集统计 + `job_manifest.sync_subtitle_missing` 落 `job.json` |
-| 2 清除（重剪且**字幕非空**才移除；只重跑不算） | `pipeline/pipeline.py` 本集字幕条数判定 → `repaired_eps`；`sync` 用 `(existing ∪ failed) − repaired` |
-| 3 导出前硬拦（所有导出入口） | `job_manifest.require_export_allowed` + 5 个入口：`run_pipeline(do_export)`、`cover_watch.run_export`、`batch_runner --auto-export`、`series_runner._run_export`、`robust_auto_export.py` 直调 |
-| 4 收尾通知（整轮结束清单非空只弹一条，列集号） | `lib/subtitle_guard.notify(job_dir)`（进程内按 job_dir 去重），由 `batch_runner` 两条分支与 `series_runner` 被拦时调用 |
+1. **Q3**：希望去掉所有硬编码兜底，新机器也只靠配置 JSON 入参保证可用；并保证所有调用方使用的素材根、导出根、归档根完全一致。
+2. **Q6**：环境预设负责“告诉用户该配什么”，环境依赖负责“一键拉齐”；本次只检查环境依赖相关；评估“剪映前置”是否独立；去掉“首次登录/同意协议”；模板草稿、组合预设改为环境预设提醒；计划任务可选、不强制拉起；“缺口”按“实际使用但未检查/未安装”重新核实；素材目录那条先忽略。
+3. **Q7**：按建议做 P0+P1。
+4. **Q8**：按建议执行（P0+P1）。
 
-## 2. 数据契约
+***
 
-`job.json` → `derived.subtitle_missing`：`array<int>`，正整数集号，**严格升序且去重**，缺省 `[]`。
+## 2. 结论与方案
 
-写入条件（同时满足才记该集）：
+| 项  | 结论                                                                    |
+| -- | --------------------------------------------------------------------- |
+| Q3 | 支持“去掉硬编码”，但不支持“静默兜底”。采用**唯一配置源 + 统一解析器 + 缺失即报错 + 一次性迁移**              |
+| Q6 | 环境预设与环境依赖分栏；剪映相关独立成“剪映前置”；安装脚本拆分 D+B 留到下一轮                            |
+| Q7 | 哨兵 `pipeline/_work/watcher.pause` + Console 暂停/恢复                     |
+| Q8 | `_run.json` + `run-<id>.log` + `_batch_state` 扩展 + 只读 `run_status.py` |
 
-- 该集实际执行了 `run_asr_chain`；
-- 最终落到该集的字幕条数为 0（ASR 三档全空，或 ASR 有结果但裁 cut 后零条）。
+***
 
-移除条件：
+## 3. Q3：路径配置收口
 
-- 该集再次执行 ASR，且**本集最终字幕条数 > 0**；
-- 仅“又跑了一遍但字幕仍空”不满足（会继续作为 failed 记录，保持清单）。
+### 3.1 为什么不建议“配置 + 静默兜底”
 
-未进入 ASR 的集（找不到视频等）既不算 failed 也不算 repaired，不改清单。
+* 静默兜底会让“配置写错”表现为“运行正常”，问题延迟到导出/归档才暴露。
+* 当前已经出现多套来源：`series_root`、`watch.roots`、`batch_runner` 位置参数、`admission` 直接取 `watch.roots[index]`、`install_deps.ps1` 自己的 `D:\AI_Deps` 链。再加一层兜底只会扩大漂移。
+* 用户要的是“配置决定可用性”，正确形态是：**配置缺失/无效 → 立即给出可操作错误**；而不是“猜一个路径继续跑”。
 
-持久化/兼容：
+### 3.2 目标模型
 
-- `build_job()` 预置 `derived.subtitle_missing = []`；`migrate_job()` 自动为旧 job 补齐（无需迁移脚本）。
-- `validate_job()` 校验：`derived` 必须是对象；`subtitle_missing` 必须是非 bool 正整数数组且严格升序去重。非法形态 `update_job` 直接 ValueError，不落盘。
-- job.json 缺失时：`subtitle_missing()` 返回 `[]` 并在 stderr 告警；`sync_subtitle_missing()` 不创建 job.json（创建仍只由 `create_job` 负责），返回内存排序结果并告警。
+**唯一真源**：`pipeline/presets.json`（`JY_*` 环境变量仅作为显式覆盖，且必须指向有效目录）。
 
-`ExportBlocked(missing)`：`missing` 为升序去重集号；`str(e)` 固定 `缺字幕未修复：第1、3、8集`（`format_episodes` 支持空列表 → `（无）`）。
+**业务根（必须显式配置，不自动猜）**：
 
-## 3. 文件级改动
+| 键              | 用途                  | 缺失行为                              |
+| -------------- | ------------------- | --------------------------------- |
+| `series_root`  | 唯一素材根；所有调用方的“短剧素材根” | `ConfigError`                     |
+| `export_dir`   | 成品导出根               | 导出相关调用时 `ConfigError`             |
+| `archive_root` | 归档根                 | 可留空 = 禁用归档；配置了但无效 → `ConfigError` |
+| `deps_root`    | 依赖/模型/工具根           | `ConfigError`                     |
 
-### 3.1 `lib/job_manifest.py`
+**watcher 额外扫描根（只影响 watcher，不影响任何业务根）**：
 
-1. `build_job()` 增加 `"derived": {"subtitle_missing": []}`。
-2. `validate_job()` 在 `workflow` 校验后增加 `derived` 形态校验（见 §2）。
-3. 新增模块级 API（放在 `update_job` 之后）：
+| 键             | 用途                          | 规则                                                           |
+| ------------- | --------------------------- | ------------------------------------------------------------ |
+| `watch.roots` | 临时/额外素材根，仅 `cover_watch` 扫描 | 为空 → 只扫 `series_root`；非空 → 每项必须存在、是目录、且下面至少有一个 `*/cover_job` |
 
-```python
-class ExportBlocked(RuntimeError): ...
-def format_episodes(eps) -> str
-def get_subtitle_missing(job: dict) -> list[int]        # 过滤非正整数，sorted(set)
-def subtitle_missing(job_dir: str) -> list[int]
-def sync_subtitle_missing(job_dir: str, *, failed_eps=(), repaired_eps=()) -> list[int]
-def require_export_allowed(job_dir: str) -> list[int]   # 非空 raise
-def find_job_dir(start_path: str, *, max_depth: int = 8) -> Optional[str]
-```
+* 运行时有效扫描根 = `[series_root] + watch.roots` 去重；
+* `watch.roots` 不再参与 `series_root` 解析，不再作为 `admission`/`init_draft` 的默认根；
+* 临时指定某一部剧的素材目录，用 `admission.video.root` 或 `batch_runner` 位置参数显式覆盖，不走 `watch.roots`。
 
-`sync_subtitle_missing` 细节：
+**派生根（允许系统探测，但必须显示来源）**：
 
-- `new = sorted((set(current) | {正 int failed}) - {正 int repaired})`；
-- 仅当 `new != current` 时调用 `update_job(job_dir, {"derived": {"subtitle_missing": new}}, event="subtitle_missing", detail=...)`（保持 revision/history 单写入口）；
-- detail：`新增缺字幕：第3、8集；已修复：第5集`（只拼非空段）；
-- 无 `job.json`：stderr 告警 + 返回 `new`，不写盘；
-- 写盘异常向上抛，由调用方兜底。
+* `projects_root`、`presets_root`、`jianying_log_dir`：来自 `LOCALAPPDATA`/注册表等系统位置；
+* `jianying_dir`：配置优先，其次注册表探测；都失败 → `ConfigError`；
+* 不再保留 `D:\剪映5.9\...`、`D:\油管打猎\L`、`D:\短剧`、`D:\短剧_存档`、`D:\AI_Deps` 这些字面量。
 
-`find_job_dir`：文件→取目录；自身含 `job.json` 直接返回；否则逐级向上查 `<ancestor>/cover_job/job.json`，最多 `max_depth` 层；找不到 None；不抛异常。
+### 3.3 统一解析入口
 
-### 3.2 `lib/export_state.py`
-
-新增：
+在 `pipeline/export_config.py` 新增：
 
 ```python
-def clear_block(job_dir, *, failure_class="subtitle_missing", now=None) -> dict | None
+class ConfigError(ValueError):
+    """配置缺失/无效：带 key、当前值、修复提示。"""
+
+def resolve_paths(mode="run"):
+    """返回统一路径快照 + 来源。mode: run|export|install|console。"""
+
+def validate_config(mode="run"):
+    """返回 {ok, paths, issues:[{key,message,hint}]}，不抛异常。"""
+
+def get_watch_roots():
+    """watcher 有效扫描根：[series_root] + watch.roots 去重并校验（只读）。"""
 ```
 
-- 仅 `status=="failed"` 且 `failure_class` 精确匹配时生效；
-- 置 `pending`，清 `last_error`，`failure_class="unknown"`，`next_retry_at=0`，`time` 心跳，`progress=None`；
-- `attempts` / `consecutive_failures` 保留（可追溯）；
-- 走 `_save_if_changed`，幂等；真源不存在返回 `_read_raw`（None），不创建。
-
-### 3.3 `lib/subtitle_guard.py`（新增，唯一通知实现）
+`resolve_paths()` 返回：
 
 ```python
-notify(job_dir) -> bool   # 清单非空 → 生产 toast 一条；进程内按 abspath(job_dir) 去重，重复调用不重弹
+{
+  "series_root": "...", "watch_roots": [...], "watch_extra_roots": [...],
+  "export_dir": "...", "archive_root": "...", "deps_root": "...",
+  "jianying_dir": "...", "projects_root": "...", "presets_root": "...",
+  "sources": {"series_root": "presets.json", "export_dir": "env", ...},
+  "issues": [...]
+}
 ```
 
-- 标题：`⚠️ 缺字幕需人工处理`
-- 正文：`缺字幕未修复：第…集（共 N 集）；请重剪这些集，字幕非空后才会移出清单；未修复前不会导出。`
-- 清单空 / job.json 不存在 → False，不弹。
-- 导入方式：`sys.path` 注入 `<repo>/scripts`，`from utils.notifier import toast`；测试可替换 `subtitle_guard.toast`。
-- 不在 watcher 内调用（watcher 无“整轮”概念，只写日志，避免每轮刷屏）。
+所有调用方只允许使用该快照或对应的 `get_*()`，禁止再自行读 `watch.roots`。
 
-### 3.4 `pipeline/pipeline.py`
+### 3.4 解析规则（去掉所有静默回退）
 
-1. 顶部 `import job_manifest as jm`。
-2. `run_pipeline(...)` 新增可选关键字 `job_dir=None`（默认 None，保持旧调用兼容）。解析顺序：
-   - 入参 `job_dir`；
-   - 否则 `jm.find_job_dir(video_paths[0])`；
-   - 在「同步前」和「导出前」各解析一次（允许 job_dir 在运行中途才出现）。
-3. 逐集循环：
+1. 环境变量存在但目录无效 → `ConfigError`，**不再**回退到 JSON。
+2. JSON 字段存在但目录无效 → `ConfigError`，**不再**回退到下一级。
+3. `series_root` 不再把 `watch.roots` 当候选，彻底移除“series\_root → watch.roots → D:\短剧”链。
+4. `watch.roots` 为空 → 有效扫描根只有 `[series_root]`（派生，不写盘）。
+5. `watch.roots` 非空 → 每项必须：绝对路径、存在、是目录、下面至少有一个 `*/cover_job`；不要求位于 `series_root` 下；有效扫描根为 `[series_root]` 与各项去重合并。
+6. `export_dir`、`archive_root`、`deps_root` 只从 JSON/环境变量解析，不再有字面量默认值。
+7. `archive_root` 留空表示禁用归档；`archive_root` 位于任一有效扫描根下继续由 `archive_job.py` 拒绝。
+8. `batch_runner.py` 的位置参数视为“本次显式覆盖”：必须存在，记录 `source="cli"`，不改变全局配置；若不在 `series_root` 下，打印明确警告（不阻断，保留单剧临时跑能力）。
+9. `admission.video.root` 是唯一允许的“临时素材根”入口；`root_index` 仅在等于 0 时视为 `series_root`，大于 0 时要求改用 `root` 并报错。
+10. `series_root` 要求存在；不存在 → `ConfigError`。目录为空只告警，不阻断建稿前的人工准备。
 
-```python
-ep_num = int(re.search(r"第\s*(\d+)\s*集", u["name"]).group(1)) if 匹配 else u.get("idx")
-before = len(cn_all)
-cn_subs = run_asr_chain(v)
-if not cn_subs:
-    failed_eps.add(ep_num); continue
-# ...按 cut 过滤并 append 后...
-if len(cn_all) == before:
-    failed_eps.add(ep_num)
-else:
-    repaired_eps.add(ep_num)
-```
+### 3.5 调用方收口
 
-   - 只有真正执行 `run_asr_chain` 的集参与统计（`skip_local_ai`/跳过 ASR 的集不参与）；
-   - 循环内不发通知、不写盘（避免逐集 IO 与刷屏）。
-4. 循环结束后、翻译修复轮前：`jm.sync_subtitle_missing(...)` 一次；异常 `print` 后继续整轮。
-5. 模块级纯函数（供测试）：
+| 文件                                       | 改动                                                                                                                                                                        |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pipeline/export_config.py`              | 新增 `ConfigError`、`resolve_paths()`、`validate_config()`、`get_watch_roots()`；删除 `DEFAULT_SERIES_ROOT/EXPORT/ARCHIVE/DEPS/JIANYING`；`_resolve_dir/_resolve_target` 改为“无效即抛错” |
+| `pipeline_ui/admission_draft.py:167-175` | `_root_of` 改为“`video.root` 显式优先，否则 `series_root`”；`root_index>0` 报错并提示改用 `root`                                                                                           |
+| `pipeline_ui/init_draft.py:54-75`        | 不再传 `get_watch_config().get("roots")`，统一走 `resolve_series_dir()` 默认值                                                                                                      |
+| `pipeline_ui/console/paths.py:38-49`     | 改用 `resolve_paths()`；缺失项返回空并由 doctor 报错                                                                                                                                   |
+| `pipeline_ui/console/envinit.py`         | `inventory()` / `validate_presets()` / `ensure_dirs()` 使用统一快照；`series_root` 必填                                                                                            |
+| `pipeline/doctor_core.py:305-316`        | 路径检查显示 `source` 与 `issue`，不再展示兜底路径                                                                                                                                        |
+| `pipeline/install_deps.ps1:101-119`      | 删除 `D:\AI_Deps` 与“无 D 盘 → C:\AI\_Deps”兜底；无 `-DepsRoot`/`JY_DEPS_ROOT`/`presets.deps_root` 时直接报错                                                                           |
+| `scripts/freshness_baseline.py:209`      | 帮助文案移除 `D:\短剧` 回退描述                                                                                                                                                       |
+| `pipeline/presets.example.json`          | 业务根改为空字符串 + `_必填说明`；`watch.roots` 改为 `[]`；移除所有 `D:\...` 示例                                                                                                                |
+| `pipeline/presets.json`                  | 本轮不改；由迁移脚本/Console 动作写入                                                                                                                                                   |
 
-```python
-def _classify_subtitle_outcome(ep_num, *, asr_empty: bool, appended: int) -> str | None
-```
+### 3.6 一次性迁移
 
-6. Step 11 导出前：
+新增 `pipeline/migrate_config.py`：
 
-```python
-if do_export:
-    missing = 文件清单 ∪ 本轮 failed_eps（内存兜底）
-    if missing: 打印 ExportBlocked 消息 + 修复说明; do_export = False
-    else: jm.require_export_allowed(job_dir)（job_dir 为空时跳过）
-```
+* `--dry-run`（默认）/ `--write`；
+* 备份 `presets.json` 为 `presets.json.bak-<时间戳>`；
+* 仅做确定性迁移：
+  * `series_root` 为空且 `watch.roots` 恰好一个有效目录 → 写入该目录；
+  * `series_root` 为空且 `watch.roots` 多个 → 要求 `--series-root`，不猜；
+  * 其它业务根缺失只报告，不猜；
+* 原子写回，输出迁移摘要。
 
-   - 内存兜底保证：job.json 尚未生成、但本轮有零字幕集时也不会导出；
-   - 被拦后本轮其余收尾（记录视频、写 job）照常，不抛异常。
+Console 环境预设页新增动作 `config.migrate`：调用同一逻辑（复用 `envinit.save_presets` 的备份与原子写），成功后刷新检查。
 
-### 3.5 `lib/cover_watch.py`
+### 3.7 测试
 
-1. `run_export(job_dir, plan, ...)` **第一条语句**：
+* `tests/test_path_config.py` 重写：
+  * `series_root` 缺失 → `ConfigError`；
+  * JSON 无效路径 → `ConfigError`，不回退；
+  * `watch.roots` 为空 → 有效扫描根 `[series_root]`；
+  * `watch.roots` 非空但目录不存在 → `ConfigError`；
+  * `watch.roots` 非空且目录下无 `*/cover_job` → `ConfigError`；
+  * `watch.roots` 含 `series_root` 时去重不重复；
+  * `admission.video.root` 优先于 `series_root`；`root_index>0` 报错；
+  * 所有 `get_*` 与 `resolve_paths()` 返回一致。
+* 新增 `tests/test_migrate_config.py`：
+  * 单 root 自动迁移；
+  * 多 root 不猜、报错；
+  * 写入前有备份。
 
-```python
-try:
-    jm.require_export_allowed(job_dir)
-except jm.ExportBlocked as e:
-    打印完整消息 + 修复说明
-    if dry_run: return False          # 不写状态
-    es.fail(job_dir, str(e), retryable=False,
-            failure_class="subtitle_missing", phase="export")
-    return False
-```
+### 3.8 Skill 与契约文件同步（必做）
 
-   - 必须先于 `es.gate`、`begin`、`_preclean_bundles`、`Popen`，`--phase export` 也绕不过；
-   - 已是 `failed/subtitle_missing` 时日志只追加一行短信息（不重复打全量集号），避免每轮刷日志；
-   - watcher 不因此弹通知。
-2. `note_edit_result(job_dir, ok=True, ...)`：成功且 `jm.subtitle_missing(job_dir)` 为空 → `es.clear_block(job_dir, failure_class="subtitle_missing")`；非空保持 failed。清空后才可能进入下一轮导出。
+三根统一后，所有涉及路径语义的 skill、契约、用户手册必须同步，禁止继续描述“回退到 `D:\短剧` / `D:\AI_Deps`”或“`series_root` 取 `watch.roots[0]`”。
 
-### 3.6 `pipeline/batch_runner.py`
+| 文件                                                                                                                                                      | 需要修改的内容                                                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `.trae/skills/jianying-editor/SKILL.md:80,86,91`                                                                                                        | 归档说明改为：剧集默认留在 `series_root`（以及 `watch.roots` 额外根）；`archive_root` 不能位于任一有效扫描根下；`watch.roots` 为空不再是拒绝条件 |
+| `.trae/skills/jianying-editor/examples/robust_auto_export.py:1963-1981`                                                                                 | `subtitle_gate()` 的 `roots` 默认值改为 `pc.get_watch_roots()`（已含 `series_root`），docstring 同步               |
+| `.trae/skills/drama-cover-builder/SKILL.md:307,340`                                                                                                     | 归档条件改为“有效扫描根”；配置示例说明 `watch.roots` 是额外根，主根来自 `series_root`                                            |
+| `.trae/skills/drama-cover-builder/references/handoff-contract.md:96,100,283,603`                                                                        | 明确 `video.export_dir` 是“成品记录字段”，不是全局导出根；全局根只来自 `presets.json`                                         |
+| `.trae/skills/drama-cover-builder/references/handoff-contract.md:430,432,566,572,574`                                                                   | 归档契约改为：`archive_root` 为正式键，`watch.archive_root` 仅兼容；拒绝条件改为“位于任一有效扫描根下”；删除“`watch.roots` 未配置即拒绝”       |
+| `SKILL.md`（仓库根）                                                                                                                                         | 增加一行契约：路径唯一入口为 `pipeline/export_config.resolve_paths()`，禁止在 skill 内手写根路径                              |
+| `使用指南.md:77-95,141-174,183,375,482`                                                                                                                     | 表格改为 `series_root`/`export_dir`/`deps_root` 必填、无内置默认；`watch.roots` 改为额外扫描根；删除“已回退到下一级”；归档条件同步         |
+| `快速上手.md:18,32,51,58,94,101-110,133,167`                                                                                                                | 删除 `D:\AI_Deps`、`D:\成片导出` 默认表述；`-DepsRoot` 缺失时要求配置；示例 JSON 用占位路径；故障表同步                                |
+| `docs/manual-entry-real-run.md`                                                                                                                         | 机器相关路径改为变量/占位（`<素材根>`、`<归档根>`、`<导出根>`），注明取自 `presets.json`；保留流程，不再把 `D:\短剧` 当默认                       |
+| `docs/web-console-plan.md:35,55-61,103,151-154,296,314`                                                                                                 | 白名单根改为由 `resolve_paths()` 提供；默认值表改为“示例/来源”；删除 `D:\油管打猎\L`、`D:\短剧_存档` 作为默认的描述                          |
+| `docs/project_status.md:166,167,183,206`                                                                                                                | 增加说明：`D:\短剧`、`D:\短剧_存档` 是当机数据，不是默认值；后续以配置为准                                                           |
+| `specs/web-console/spec.md`、`specs/docs-consistency/spec.md`、`specs/export-parity/spec.md`、`specs/export-parity/tasks.md`、`specs/multi-account-todo.md` | 顶部加“路径契约已收口”说明；把描述当前默认值的句子改为引用 `resolve_paths()`                                                      |
+| `pipeline/presets.example.json:35-46`                                                                                                                   | `_说明` 改为新契约；业务根置空；`watch.roots` 置空；删除 `D:\成片导出`、`D:\AI_Deps`、`D:\短剧` 字面量                              |
+| `pipeline/presets.json`                                                                                                                                 | 本轮不改；迁移后由 `series_root` 承载唯一素材根，`watch.roots` 如仍保留则按额外根语义去重                                           |
 
-1. 新增 `job_dir = os.path.join(series_dir, "cover_job")`（两分支共用）。
-2. 两处 `run_pipeline` 调用（串流、逐集）都显式传 `job_dir=job_dir`。
-3. 串流分支：`_toast("🎬 串流草稿已就绪")` 后 → `subtitle_guard.notify(job_dir)`；`if args.auto_export` 启动后台导出前：
-   `try jm.require_export_allowed(job_dir)`，被拦 → 打印完整集号 + 修复说明，跳过导出（不再弹第二条通知）。
-4. 逐集分支：批量完成 toast 后 → `subtitle_guard.notify(job_dir)` 一次。
-5. 单集失败不弹 toast（保持现状）。
+验收标准：全仓库对 `D:\短剧`、`D:\成片导出`、`D:\短剧_存档`、`D:\AI_Deps` 的引用只剩“历史数据/示例占位/迁移说明”，不再有任何“默认值”语义。
 
-### 3.7 `pipeline/series_runner.py`
+***
 
-1. 路径注入补 `<repo>/lib`；导入 `job_manifest as jm`、`subtitle_guard`、`export_config as pc`。
-2. `_job_dir_for(target, is_draft)`：
-   - 剧集目录 → `<target>/cover_job`；
-   - 草稿名 → 遍历 `pc.get_watch_config().get("roots")`，匹配 `<root>/<剧名>/cover_job`（草稿名以剧名开头）；唯一命中返回，多命中/无命中打印候选并返回 None。
-3. `_run_export(draft_name, timeout=1800, *, cold_start=False, job_dir=None)` **第一条**：
-   - `job_dir = job_dir or _job_dir_for(...)`；为空则不拦（保持旧行为）；
-   - 被拦 → 打印完整集号 + 修复说明，`return False`；不建目录、不 `_preclean_bundles`、不 `Popen`。
-4. 调用点补 `job_dir`；被拦时：
-   - 该剧状态写 `blocked`（不进入失败重试计数）；
-   - `subtitle_guard.notify(job_dir)` 一次（整轮收尾，不按集）；
-   - 继续下一部，最终 `main()` 返回 1。
+## 4. Q6：环境预设 / 环境依赖 / 剪映前置
 
-### 3.8 `.trae/skills/jianying-editor/examples/robust_auto_export.py`
+### 4.1 页面分组
 
-1. 解析参数后、启动剪映前，调用本地闸门：
+* **环境预设**：路径字段、`series_root`、`watch.roots`（额外 watcher 扫描根）、GLM key、预设组、剪映前置。
+* **环境依赖**：Python、pip 核心/AI、torch/CUDA、ffmpeg、Chromium、OCR、Ollama；只保留“可一键安装/可实测”的项。
+* **剪映前置**（建议单独成组，放在环境预设下）：
+  * 剪映安装 + 版本（5.9.0.11632）；
+  * 交互桌面会话；
+  * 草稿根索引一致性；
+  * 模板草稿 `default`；
+  * 组合预设名匹配。
+* 本轮只做**展示分组**：`env.js` 的 `renderGroups()` 把 `jianying` 组渲染到环境预设页；检查函数不变。
 
-```python
-def subtitle_gate(draft_name, roots=None) -> list[int]
-```
+### 4.2 文档修订
 
-   - `roots` 取 `pipeline/presets.json` 的 `watch.roots`（复用 `export_config`，找不到则 None）；
-   - 用与 `series_runner._job_dir_for` 相同的匹配规则找 `cover_job`；
-   - 清单非空 → 打印完整集号 + 修复说明，`sys.exit(2)`；找不到 job_dir → 照旧运行（不误伤独立使用）。
-2. 只加这一处闸门，不改导出流程。
+* 删除“首次登录/同意协议”；
+* “安装剪映 5.9”“模板草稿”“组合预设”改为环境预设中的配置/提醒项；
+* 计划任务标注“可选”，不强制拉起；
+* 素材目录资产准备标注“暂不要求”；
+* “缺口”复核：
+  * MediaInfo DLL：`pymediainfo` 已装且可导入；`can_parse()` 未检查；真实使用只在 `scripts/vendor/pyJianYingDraft/local_materials.py`，有 ffprobe 回退 → skill 路径缺口，不影响 pipeline；
+  * `imageio-ffmpeg`：全仓库无引用 → 不是缺口；
+  * VC++ Redistributable：未显式检查，但 torch/rapidocr 导入实测已间接验证 → 诊断加固项；
+  * CUDA 终检：已存在（`envinit.py:648-686`、`install_deps.ps1:525`）→ 不是缺口；
+  * onnxruntime/numpy：ui\_pylibs 的 rapidocr 已实导入，numpy/pillow 已精确 pin；仅 `scripts/jy_onnx_asr.py` 直接 import onnxruntime，若该脚本属于支持范围再补检查。
 
-### 3.9 `.trae/skills/drama-cover-builder/references/handoff-contract.md`
+***
 
-1. §2 字段表 `workflow.*` 与 `publish.status` 之间新增 `derived.subtitle_missing` 行：array，升序去重正整数；写入/移除条件见 §2；缺省 `[]`。
-2. 新增小节「导出前硬拦」：
-   - 五个入口统一调 `require_export_allowed`；`robust_auto_export` 直调在 `sys.exit(2)`；
-   - 被拦写 `.export_state.json`：`status=failed / failure_class=subtitle_missing / phase=export`，不可重试；
-   - `--phase export` 不放行；
-   - `note_edit_result(ok=True)` 且清单空 → `clear_block` 复位 `pending`；
-   - 整轮结束由 `subtitle_guard.notify` 发一条通知。
-3. §8 阶段产物表 pipeline 行补 `derived.subtitle_missing`。
+## 5. Q7 P0：暂停哨兵
 
-## 4. 测试（沿用独立脚本 + assert；不依赖 pytest）
+### 5.1 `pipeline/watcher_supervisor.ps1`
 
-### 4.1 `tests/test_subtitle_missing.py`
-1. 记录：`sync(failed_eps={8,3,3})` → `[3,8]`；revision 递增、history 有事件；子进程读回 `[3,8]`。
-2. 清除：`[3,8]` + `repaired_eps={8}` → `[3]`。
-3. **反例**：`[3]` + 只重跑（`failed_eps={3}, repaired_eps=空`）→ 仍 `[3]`。
-4. 校验：`[3,3]` / `[8,3]` / `[0]` / `["3"]` / `[True]` / 非数组 → ValueError。
-5. 兼容：`build_job` 有 `[]`；无 `derived` 的旧 job 经 `migrate_job` 得 `[]`；job.json 缺失时 `subtitle_missing=[]`、`sync` 不创建文件。
-6. `_classify_subtitle_outcome`：`asr_empty=True`→failed；`appended=0`→failed；`appended=2`→repaired。
-
-### 4.2 `tests/test_export_gate.py`
-1. `require_export_allowed` 抛 `ExportBlocked`，message 含全部集号且升序。
-2. `cover_watch.run_export(job_dir, None)`：返回 False，`cw.subprocess.Popen` 未被调用；`.export_state.json` = `failed/subtitle_missing/export`；`consecutive_failures` 未增；`export_state.gate(..., phase_override="export")` 仍给出 failed 原因。
-3. `dry_run=True` 被拦：返回 False 且 `.export_state.json` 未被创建/改写。
-4. `series_runner._run_export("draft", job_dir=...)`：False，Popen 未调用，导出目录未被创建。
-5. `clear_block`：failed+匹配 → pending、last_error 清空、attempts 保留；不匹配 → 原样；清空清单后 `require_export_allowed` 放行。
-6. `robust_auto_export.subtitle_gate(draft, roots=[temp_root])`：草稿对应 job 清单非空 → 返回集号；清单空/找不到 job → `[]`。
-
-### 4.3 `tests/test_subtitle_missing_notify.py`
-1. 清单 `[1,3,8]` → `notify` 返回 True，`subtitle_guard.toast` 调用 **1 次**，标题/正文含「第1、3、8集」。
-2. 重复调用 `notify` 同一 job_dir → 仍只有 1 次（进程内去重）。
-3. 清单空 / job.json 不存在 → 0 次、返回 False。
-4. 源码结构守卫：`batch_runner.py` 中 `notify(job_dir)` 恰好 2 处；`series_runner.py` 被拦分支 1 处；且 `require_export_allowed` 出现在 `auto_export` 启动之前。
-
-### 4.4 回归
-`Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }` 全部通过（含 smoke、notifier 隔离、gate_cut、edit_pause_after、watcher_heartbeat）。测试期不得出现真实桌面通知。
-
-## 5. 验收
+* 新增 `$pauseFile = Join-Path $logDir 'watcher.pause'`。
+* `Invoke-Supervisor` 开头、日志目录创建后、`watcherPy` 检查前：
 
 ```powershell
-cd "<repo>"
-python tests\test_subtitle_missing.py
-python tests\test_export_gate.py
-python tests\test_subtitle_missing_notify.py
-Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }
+if (Test-Path -LiteralPath $pauseFile) {
+    Write-Log '托管已暂停（存在 pipeline/_work/watcher.pause），本次不拉起 watcher'
+    return 0
+}
 ```
 
-通过后一次性报告：改动文件、测试结果、缺字幕从记录到拦截的实际行为样例。
+### 5.2 `pipeline/delayed_start.ps1`
 
-## 6. 明确不做
+* 新增同一 `$pauseFile`。
+* 第 4 步启动前检查，存在则记日志并 `return 0`；第 3 步写 `export_config.json` 保留。
 
-- 不自动重试缺字幕集；不改 ASR 候选链 / GPU / watcher 心跳与指纹。
-- 不改 `--phase export` 语义，不给 watcher 加通知。
-- 不重构 batch_runner / series_runner / robust_auto_export 的其他流程。
-- 不写 `<剧集根>`，不启动 watcher，不导出。
+***
+
+## 6. Q7 P1：Console 暂停/恢复
+
+* `envinit.py`：`PAUSE_FILE`、`watcher_paused()`、`task_status().paused`、`set_watcher_paused()`；`_chk_watcher_task()` / `_chk_watcher_runtime()` 展示暂停态与 `task.pause` / `task.resume` 按钮。
+* `app.py`：动作分发 `task.pause` / `task.resume`。
+* `env.js`：确认文案与调用分支。
+* `status.py`：`WATCHER_PAUSE`，`watcher_info()` 返回 `paused`。
+* 只写/删哨兵，不杀进程、不改计划任务。
+
+***
+
+## 7. Q8 P0：batch\_runner 运行记录
+
+* `batch_runner.py`：`_Tee`、`_atomic_write_json`、`_start_run`、`_finish_run`。
+* `_run.json`：`schema_version/run_id/source/argv/cwd/series_dir/workdir/started_at/ended_at/exit_code/status/log_path`。
+* 日志：`run-<run_id>.log`，stdout/stderr 双写。
+* `_batch_state.json` 单集新增：`started_at/attempts/error/error_class/artifact`。
+* `__main__` 收尾：`SystemExit`、`KeyboardInterrupt`、其它异常均落最终状态。
+
+***
+
+## 8. Q8 P1：只读聚合
+
+* 新增 `pipeline/run_status.py --workdir <dir> [--json]`。
+* `status.py` 的 `_batch_state_entries()` 优先读 `_run.json`，旧格式回退。
+* `tests/test_external_tasks.py` 新增读取、回退、`run_status.collect` 用例。
+
+***
+
+## 9. 不做
+
+* 不拆分 `install_deps.ps1`、不新增管理员批处理（下一轮）；
+* 不改 `lib/cover_watch.py` 的业务逻辑；
+* 不删除任何 `_work_*`、日志、清单或草稿；
+* 不改计划任务触发频率。
+
+***
+
+## 10. 验证
+
+1. `pytest tests/test_path_config.py tests/test_migrate_config.py tests/test_external_tasks.py`
+2. PowerShell 语法检查两个 `.ps1`。
+3. 哨兵验证：创建 → 跑 supervisor → 确认“托管已暂停”且退出码 0 → 删除 → 恢复。
+4. `python pipeline/migrate_config.py --dry-run` / `--write`（在临时副本上）。
+5. `python pipeline/run_status.py --workdir <tmp> --json`。
+6. Console：环境预设页出现“剪映前置”；暂停/恢复按钮生效。
+
+***
+
+## 11. 风险与回滚
+
+| 风险                 | 影响                     | 回滚                                                     |
+| ------------------ | ---------------------- | ------------------------------------------------------ |
+| 旧机器首次升级后 doctor 变红 | 需要一次迁移/填配置             | Console `config.migrate` 或 `migrate_config.py --write` |
+| 路径函数改为抛错           | 未配置时更早失败               | 恢复 `_resolve_dir` 旧行为（git revert 单文件）                  |
+| `watch.roots` 校验偏严 | 临时目录没放 `cover_job` 会报错 | 按提示补 `cover_job` 或清空该项；不改 `series_root`                |
+| 哨兵忘记恢复             | watcher 不工作            | 删除 `watcher.pause`；Console/doctor 持续提示                 |
+| `_run.json` 半截     | 读取失败                   | `.tmp + os.replace`；删除文件即回退                            |

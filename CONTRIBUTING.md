@@ -14,12 +14,16 @@
 
 ```powershell
 $py = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
+# 0. 测试依赖（首次；或安装依赖时加 pipeline\install_deps.ps1 -IncludeTest）
+& $py -m pip install -r requirements-dev.txt
 # 1. Python 语法
 & $py -m py_compile pipeline\pipeline.py   # 以及你改动的其它 .py
 # 2. 预设解析自检（如动了预设相关逻辑）
 & $py pipeline\pipeline.py --list-presets
 # 3. 安装器画像自检（如动了 install_deps.ps1）
 powershell -File pipeline\install_deps.ps1 -DetectOnly
+# 4. 单元测试（提交前必跑；pytest 版本低于 pyproject.toml 的 minversion 会直接报错）
+& $py -m pytest tests -q
 ```
 
 ## 硬性规则

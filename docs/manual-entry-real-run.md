@@ -1,6 +1,8 @@
-# 手工入口真实流程验收手册（`D:\短剧` + watcher 共存）
+# 手工入口真实流程验收手册（真实素材根 + watcher 共存）
 
-适用场景：用一部新剧，完全按《快速上手》的真实流程跑（剧集目录就放在 `D:\短剧\<剧名>`、watcher 保持运行、默认导出目录、真实清单目录、真实归档根），跑完后用手工入口做归档与复核，验证「`archived` 但归档缺失」这类状态矛盾能不能真的报出来。
+适用场景：用一部新剧，完全按《快速上手》的真实流程跑（剧集目录就放在 `<素材根>\<剧名>`、watcher 保持运行、真实导出根、真实清单目录、真实归档根），跑完后用手工入口做归档与复核，验证「`archived` 但归档缺失」这类状态矛盾能不能真的报出来。
+
+> 本文用占位符 `<素材根>` / `<导出根>` / `<归档根>` / `<依赖根>`。它们的真实值来自本机 `pipeline/presets.json` 的顶层 `series_root`、`export_dir`、`archive_root`、`deps_root`（或对应的 `JY_*` 环境变量），由 `pipeline/export_config.py` 统一解析；下文不再写死任何盘符。
 
 > 本文只做流程与依据整理。执行前先看第 1 节现场快照；下面的命令不包含任何删除真实数据、`--all`、`--force` 操作。
 
@@ -8,8 +10,8 @@
 
 ## 0. 三个结论（先回答质疑）
 
-1. **测试剧可以放 `D:\短剧\<剧名>`，与 watcher 共用根目录没问题**——前提是这部剧没有 `cover_job\job.json`。watcher 只扫描 `<root>\<剧名>\cover_job\job.json` 发现任务，而且还要通过「4 张封面 + prompts.json + titles.gate=done」的触发判定；纯 `batch_runner` 流程不会创建 `job.json`，所以不会被调度。真正的冲突来自「同一部剧既有 job.json、又手工跑脚本」，详见第 2.1 节。
-2. **归档可以直接用真实归档根 `D:\短剧_存档`**。代价是生产归档池里会留下这部测试剧的目录、清单 `paths.export_file` 会被改写成归档路径；如果这部剧同时有 `job.json`，job 台账不会跟着改，之后默认的 `archive_job` 会因「目标已存在」或「成品三件套缺失」而跳过/冲突。新剧没有 job 时，直接用真实根测是可行的。
+1. **测试剧可以放 `<素材根>\<剧名>`，与 watcher 共用根目录没问题**——前提是这部剧没有 `cover_job\job.json`。watcher 只扫描有效扫描根（`series_root` + `watch.roots`）下的 `<root>\<剧名>\cover_job\job.json` 发现任务，而且还要通过「4 张封面 + prompts.json + titles.gate=done」的触发判定；纯 `batch_runner` 流程不会创建 `job.json`，所以不会被调度。真正的冲突来自「同一部剧既有 job.json、又手工跑脚本」，详见第 2.1 节。
+2. **归档可以直接用真实归档根 `<归档根>`（`presets.json` 的 `archive_root`，或 `JY_ARCHIVE_ROOT`）**。代价是生产归档池里会留下这部测试剧的目录、清单 `paths.export_file` 会被改写成归档路径；如果这部剧同时有 `job.json`，job 台账不会跟着改，之后默认的 `archive_job` 会因「目标已存在」或「成品三件套缺失」而跳过/冲突。新剧没有 job 时，直接用真实根测是可行的。
 3. **清单可以直接用真实目录 `pipeline\_stream_manifests`**（已被 `.gitignore` 忽略）。只要剧名唯一，不会碰到别的剧。风险是台账永久留痕、`list / verify --all / clean --all` 都会带上它、同名重跑会叠加版本；清单写入不是原子写、也没有文件锁，所以同一部剧不能同时开两个跑批。
 
 ---
@@ -22,11 +24,11 @@
 | 剪映默认草稿模板 | `%LOCALAPPDATA%\JianyingPro\User Data\Projects\com.lveditor.draft\default` 存在 | 通过 |
 | 组合预设 | 预设库 9 个；`presets_a` 的 4 个名字都能对上 | 通过 |
 | Python | `3.12.10` | 通过 |
-| ffmpeg / ffprobe | `D:\AI_Deps\tools\ffmpeg\bin\` 下均在 | 通过 |
+| ffmpeg / ffprobe | `<依赖根>\tools\ffmpeg\bin\` 下均在（`deps_root`） | 通过 |
 | 磁盘 | C 盘 102.3 GB、D 盘 112.0 GB 空闲 | 通过 |
-| 剧集根 | `D:\短剧` 现有 23 部；测试剧名无冲突 | 可放 |
-| 导出池 | `D:\油管打猎\L` 现有 42 个目录 | 默认导出位置 |
-| 归档池 | `D:\短剧_存档` 现有 71 个目录 | 默认归档位置 |
+| 剧集根 | `<素材根>`（`series_root`）现有 23 部；测试剧名无冲突 | 可放 |
+| 导出池 | `<导出根>`（`export_dir`）现有 42 个目录 | 真实导出位置 |
+| 归档池 | `<归档根>`（`archive_root`）现有 71 个目录 | 真实归档位置 |
 | 清单 | `pipeline\_stream_manifests` 现有 34 份，均无 `versions` | 可新增 |
 | `.export.lock` | **占用中**：pid 27136，owner=`pipeline_ui export`，21:32:57 起 | **当前不能开跑** |
 | watcher | 计划任务 `TraeDramaWatcher` 为 Ready；本次盘点未发现有 `watch_jianying` 进程 | 以现场为准 |
@@ -78,7 +80,7 @@ if (Test-Path .export.lock) { Get-Content .export.lock -Raw }
 目录约定：
 
 ```
-D:\短剧\<剧名>\
+<素材根>\<剧名>\
 ├─ 第01集.mp4
 ├─ 第02集.mp4
 ├─ ...
@@ -105,10 +107,10 @@ D:\短剧\<剧名>\
 
 ```powershell
 $Name = "手工验收剧"
-Test-Path "D:\短剧\$Name"
-(Get-ChildItem "D:\短剧\$Name" -Filter *.mp4).Count
-& "D:\AI_Deps\tools\ffmpeg\bin\ffprobe.exe" -v error -select_streams v:0 `
-  -show_entries stream=width,height -of csv=p=0 "D:\短剧\$Name\封面.png"
+Test-Path "<素材根>\$Name"
+(Get-ChildItem "<素材根>\$Name" -Filter *.mp4).Count
+& "<依赖根>\tools\ffmpeg\bin\ffprobe.exe" -v error -select_streams v:0 `
+  -show_entries stream=width,height -of csv=p=0 "<素材根>\$Name\封面.png"
 ```
 
 **预期**：目录存在；mp4 数量 = 目标集数（20–40）；封面输出 `1080,1920`。
@@ -126,7 +128,7 @@ Test-Path "D:\短剧\$Name"
 **目的**：完全按《快速上手》第一条出片命令跑整部剧，不隔离任何目录。
 
 ```powershell
-python pipeline\batch_runner.py "D:\短剧\手工验收剧" --cut 30 --no-watch
+python pipeline\batch_runner.py "<素材根>\手工验收剧" --cut 30 --no-watch
 ```
 
 说明（依据 `快速上手.md` §5、`pipeline\batch_runner.py`）：
@@ -134,7 +136,7 @@ python pipeline\batch_runner.py "D:\短剧\手工验收剧" --cut 30 --no-watch
 - 位置参数是**剧集目录**，不是草稿名；默认行为是「生成串流草稿 → 自动导出 → 自动质检」，并持有全局导出锁 `.export.lock`（`batch_runner.py:345-353`）。
 - `--cut 30` 的语义是**整条串流时间线开头裁掉 30 秒**（`pipeline.py:3051-3066`，多集时明确打印「串流：整条时间线前移」），**不是每集各裁 30 秒**。30 集会只影响第一集开头这一段。
 - 不写 `--limit` 就是整部剧；`--no-watch` 只关闭批量进度守护，不影响导出。
-- 默认导出到 `presets.json` 的 `export_dir`（当前 `D:\油管打猎\L`），成品目录名 = 草稿名。
+- 默认导出到 `presets.json` 的 `export_dir`（即 `<导出根>`），成品目录名 = 草稿名。
 - 想放宽导出超时：`--export-timeout 120`（单位分钟，默认 60）。20–40 集串成一条长片时建议放宽。
 
 **预期输出（按出现顺序）**
@@ -150,7 +152,7 @@ python pipeline\batch_runner.py "D:\短剧\手工验收剧" --cut 30 --no-watch
   📏 裁剪前 XXXX.XXs → 裁剪后 XXXX.XXs
 🏁 串流草稿完成: 手工验收剧_第01-30集串流
   📐 帧对齐: 30集, 总长 XXXX.Xs → XXXX.Xs
-📤 后台导出 → D:\油管打猎\L\手工验收剧_第01-30集串流\手工验收剧_第01-30集串流.mp4
+📤 后台导出 → <导出根>\手工验收剧_第01-30集串流\手工验收剧_第01-30集串流.mp4
   ⏳ 等待导出完成（上限 60min，每 25s 轮询一次）...
     ✅ 导出完成（耗时 X.Xmin，...）
 ```
@@ -174,7 +176,7 @@ python pipeline\batch_runner.py "D:\短剧\手工验收剧" --cut 30 --no-watch
 **现场文件**
 
 - 批量状态：`pipeline\_work_<剧名>_<hash8>\_batch_state.json`
-- 导出进度：`D:\油管打猎\L\<草稿名>\<草稿名>.mp4.progress.json`
+- 导出进度：`<导出根>\<草稿名>\<草稿名>.mp4.progress.json`
 - 导出控制台：`export_console.log`（有 job 在 `cover_job\`，无 job 在 `pipeline\_work\`）
 
 ---
@@ -185,7 +187,7 @@ python pipeline\batch_runner.py "D:\短剧\手工验收剧" --cut 30 --no-watch
 
 ```powershell
 $Draft = "手工验收剧_第01-30集串流"
-$Out   = "D:\油管打猎\L\$Draft"
+$Out   = "<导出根>\$Draft"
 Get-ChildItem $Out | Select-Object Name,Length
 Get-Content "pipeline\_stream_manifests\$Draft.json" -Raw
 ```
@@ -213,17 +215,17 @@ Get-Content "pipeline\_stream_manifests\$Draft.json" -Raw
 python pipeline\stream_manifest.py archive --manual --job "手工验收剧_第01-30集串流" --dry-run
 ```
 
-不写 `--archive-root` 时使用真实归档根（`export_config.get_archive_root()`：`JY_ARCHIVE_ROOT` → `presets.json` 的 `archive_root` → 默认 `D:\短剧_存档`）。
+不写 `--archive-root` 时使用配置里的归档根（`export_config.get_archive_root()`：`JY_ARCHIVE_ROOT` → `presets.json` 的 `archive_root` → 旧字段 `watch.archive_root`；都为空表示禁用归档）。
 
 **预期**
 
 ```
 清理归档 [手工验收剧_第01-30集串流]（手工判定层，profile=全部）:
   [模式] 只搬成品 bundle；源剧集目录原地不动；不读 job/锁/export_state
-  [计划] 手工验收剧_第01-30集串流: D:\油管打猎\L\... -> D:\短剧_存档\手工验收剧_第01-30集串流 (XXX MB)
+  [计划] 手工验收剧_第01-30集串流: <导出根>\... -> <归档根>\手工验收剧_第01-30集串流 (XXX MB)
   合计: XXX MB
   （dry-run：未移动任何文件，记录未改动）
-  （源剧集目录原地不动: D:\短剧\手工验收剧）
+  （源剧集目录原地不动: <素材根>\手工验收剧）
 ```
 
 **失败怎么判**
@@ -247,8 +249,8 @@ Get-Content "pipeline\_stream_manifests\手工验收剧_第01-30集串流.json" 
 **预期**
 
 ```
-  [已搬] 手工验收剧_第01-30集串流: D:\短剧_存档\手工验收剧_第01-30集串流
-  （源剧集目录原地不动: D:\短剧\手工验收剧）
+  [已搬] 手工验收剧_第01-30集串流: <归档根>\手工验收剧_第01-30集串流
+  （源剧集目录原地不动: <素材根>\手工验收剧）
 ```
 
 清单里出现：
@@ -258,14 +260,14 @@ Get-Content "pipeline\_stream_manifests\手工验收剧_第01-30集串流.json" 
   "a": {
     "draft": "手工验收剧_第01-30集串流",
     "state": "archived",
-    "export_file": "D:/短剧_存档/手工验收剧_第01-30集串流/手工验收剧_第01-30集串流.mp4",
-    "export_dir": "D:/短剧_存档/手工验收剧_第01-30集串流",
-    "archived_to": "D:/短剧_存档/手工验收剧_第01-30集串流"
+    "export_file": "<归档根>/手工验收剧_第01-30集串流/手工验收剧_第01-30集串流.mp4",
+    "export_dir": "<归档根>/手工验收剧_第01-30集串流",
+    "archived_to": "<归档根>/手工验收剧_第01-30集串流"
   }
 }
 ```
 
-并且 `paths.export_file` 被改写到归档路径（`pipeline\manual_archive.py:91-103`）。**源剧集目录 `D:\短剧\手工验收剧` 不会被移动**（手工层与默认 `archive_job` 的区别）。
+并且 `paths.export_file` 被改写到归档路径（`pipeline\manual_archive.py:91-103`）。**源剧集目录 `<素材根>\手工验收剧` 不会被移动**（手工层与默认 `archive_job` 的区别）。
 
 **失败怎么判**
 
@@ -307,7 +309,7 @@ python pipeline\stream_manifest.py verify --manual --job "手工验收剧_第01-
 **目的**：让 `state=archived` 与磁盘不一致，确认检查真的报出来。
 
 ```powershell
-Rename-Item "D:\短剧_存档\手工验收剧_第01-30集串流" "手工验收剧_第01-30集串流.__missing__"
+Rename-Item "<归档根>\手工验收剧_第01-30集串流" "手工验收剧_第01-30集串流.__missing__"
 python pipeline\stream_manifest.py verify --manual --job "手工验收剧_第01-30集串流"; "rc=$LASTEXITCODE"
 ```
 
@@ -331,7 +333,7 @@ rc=1
 ### Step 8 还原现场
 
 ```powershell
-Rename-Item "D:\短剧_存档\手工验收剧_第01-30集串流.__missing__" "手工验收剧_第01-30集串流"
+Rename-Item "<归档根>\手工验收剧_第01-30集串流.__missing__" "手工验收剧_第01-30集串流"
 python pipeline\stream_manifest.py verify --manual --job "手工验收剧_第01-30集串流"; "rc=$LASTEXITCODE"
 ```
 
@@ -355,7 +357,7 @@ python pipeline\stream_manifest.py clean --manual --job "手工验收剧_第01-3
 
 ## 3. 三个质疑的逐条依据
 
-### 3.1 为什么以前建议不放 `D:\短剧`？共用到底行不行
+### 3.1 为什么以前建议不放素材根（`series_root`）？共用到底行不行
 
 **先给结论**：共用可以。只要这部剧没有 `cover_job\job.json`，watcher 不会发现、不会建草稿、不会抢锁、不会写清单。
 
@@ -379,11 +381,11 @@ python pipeline\stream_manifest.py clean --manual --job "手工验收剧_第01-3
 
 **冲突怎么处置**：以「谁先拿到锁/谁在跑」为准。手工跑批已经启动、watcher 随后尝试 export → watcher 记日志重试；watcher 正在 edit（不拿锁）而你又启动手工跑批 → 应立即停手工跑批，不要杀 watcher，也不要删除中间产物，等 watcher 这一轮结束后再核对草稿与清单。
 
-### 3.2 为什么以前建议隔离归档根？直接用 `D:\短剧_存档` 行不行
+### 3.2 为什么以前建议隔离归档根？直接用真实 `<归档根>` 行不行
 
 **行，可以直接用**。手工归档只搬成品 bundle，不动源目录（`pipeline\manual_archive.py:159-160`、`:243-256`）。但有四个实际后果：
 
-1. **生产归档池留痕**：`D:\短剧_存档\<草稿名>` 多一条测试剧目录；当前已有 71 个目录，混进去后靠名字区分。
+1. **生产归档池留痕**：`<归档根>\<草稿名>` 多一条测试剧目录；当前已有 71 个目录，混进去后靠名字区分。
 2. **清单被改写**：`paths.export_file / export_dir` 指到归档路径，`versions.a` 写入 `archived`（`manual_archive.py:91-103`）。之后若同名再导出，清单会先被导出侧改回新路径，但 `versions.a` 仍是 archived，状态会分叉。
 3. **和默认归档链冲突**（仅当这部剧有 job.json）：手工搬走后，`job.video.outputs` 仍指向原导出路径，默认 `archive_job` 的三件套审计会判缺件（`pipeline\archive_job.py:225-238`）；即使忽略审计，目标已存在时它会 `[skip] 归档目标已存在（源目录仍在，需人工处理冲突）`（`:338-340`），源目录搬不走。
 4. **全量命令会带上它**：`verify --all`、`clean --all` 都会把这部测试剧纳入；`clean --all` 尤其危险。
@@ -410,16 +412,16 @@ python pipeline\stream_manifest.py clean --manual --job "手工验收剧_第01-3
 
 ```text
 按「快速上手」的真实流程，用《手工验收剧》第01–30集在本机跑一遍，不要用隔离目录：
-- 素材放在 D:\短剧\手工验收剧\，文件名是 第01集.mp4 … 第30集.mp4
-- 封面用 D:\短剧\手工验收剧\封面.png（1080×1920 竖图）
-- 跑：python pipeline\batch_runner.py "D:\短剧\手工验收剧" --cut 30 --no-watch
-  要求自动导出到默认目录、导出后自动质检；20–40 集这种长串流把 --export-timeout 放宽到 120
+- 素材放在 <素材根>\手工验收剧\（<素材根> = presets.json 的 series_root），文件名是 第01集.mp4 … 第30集.mp4
+- 封面用 <素材根>\手工验收剧\封面.png（1080×1920 竖图）
+- 跑：python pipeline\batch_runner.py "<素材根>\手工验收剧" --cut 30 --no-watch
+  要求自动导出到 presets.json 的 export_dir、导出后自动质检；20–40 集这种长串流把 --export-timeout 放宽到 120
 - 开跑前先 doctor，并检查 .export.lock；锁被占就等，不许用 --force
 - 全程不要动别的剧、不要停 watcher、不要 --all，不要改 pipeline/lib 代码
 - 出片后先核对三件套和清单，再执行：
   python pipeline\stream_manifest.py archive --manual --job "手工验收剧_第01-30集串流" --dry-run
   确认计划无误后再真归档，然后用 verify --manual 复核
-- 最后只把 D:\短剧_存档\手工验收剧_第01-30集串流 改名制造「归档缺失」，确认 verify 报
+- 最后只把 <归档根>\手工验收剧_第01-30集串流 改名制造「归档缺失」，确认 verify 报
   [残留] versions.a ... state=archived 但归档目标不存在 且 rc=1，再改回来
 - 不要删除任何东西；不要对有 cover_job\job.json 的剧同时手工跑脚本
 ```
