@@ -242,7 +242,7 @@ def test_empty_cut_track_is_blocked_before_save_or_publish(monkeypatch):
     for name in ('create_empty_draft', 'inject_videos_into_draft',
                  'merge_preset_into_draft', 'publish_staged_draft',
                  'find_preset_by_name', 'save_draft',
-                 'resolve_presets', 'write_preset_manifest'):
+                 'resolve_presets', 'set_draft_cover', 'write_preset_manifest'):
         setattr(pipeline, name, lambda *args, **kwargs: None)
     pipeline.DRAFT_ROOT = 'unused'
     monkeypatch.setitem(sys.modules, 'pipeline', pipeline)
@@ -323,7 +323,7 @@ def _load_init_draft(monkeypatch):
     for name in ('create_empty_draft', 'inject_videos_into_draft',
                  'merge_preset_into_draft', 'publish_staged_draft',
                  'find_preset_by_name', 'save_draft',
-                 'resolve_presets', 'write_preset_manifest'):
+                 'resolve_presets', 'set_draft_cover', 'write_preset_manifest'):
         setattr(pipeline, name, lambda *args, **kwargs: None)
     pipeline.DRAFT_ROOT = 'unused'
     monkeypatch.setitem(sys.modules, 'pipeline', pipeline)
@@ -344,7 +344,7 @@ def test_init_draft_defaults_derive_from_admission_config(monkeypatch, tmp_path)
             'draft_name': 'cfg_draft',
             'video': {'glob': '第*集.mp4', 'limit': 3, 'range': '2-4'},
         },
-        get_watch_config=lambda: {'roots': [str(root)]},
+        get_series_root=lambda: str(root),
     ))
     d = module.admission_defaults()
     assert d['draft_name'] == 'cfg_draft'

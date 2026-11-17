@@ -98,12 +98,12 @@ try:
             text = open(b["log"], encoding="utf-8", errors="replace").read()
             check("B3 日志含子进程 stdout", "PROBE_OK" in text, text[-200:])
 
-        # C. verify_export.py 对 None stdout 不崩（直接以 pythonw 跑 --help 不起作用，
-        #    这里只做语法级导入检查：不设 stdout 时模块不应在 reconfigure 处抛错）
+        # C. verify_export.py 对 None stdout 不崩：reconfigure 已收敛到 main()，
+        #    导入期不再触碰全局流（这里只做源码级检查）
         vpath = os.path.join(_ROOT, "pipeline", "verify_export.py")
         src = open(vpath, encoding="utf-8").read()
-        check("C1 verify_export 已对 None stdout 兜底",
-              "if sys.stdout is not None" in src)
+        check("C1 verify_export 导入期不再 reconfigure",
+              "sys.stdout.reconfigure" not in src.split("def main(")[0])
 finally:
     shutil.rmtree(TMP, ignore_errors=True)
 

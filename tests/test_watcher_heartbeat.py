@@ -66,6 +66,15 @@ def main():
         hb.stop()
         check("stop 后线程退出", hb._thread is not None and not hb._thread.is_alive())
 
+        print("\n== 优雅停止哨兵 ==")
+        stop_path = os.path.join(tmp, cw.STOP_NAME)
+        check("无哨兵 → take_stop_request 返回 False",
+              cw.take_stop_request(tmp) is False)
+        with open(stop_path, "w", encoding="utf-8") as f:
+            f.write("stop\n")
+        check("有哨兵 → 返回 True", cw.take_stop_request(tmp) is True)
+        check("消费后哨兵被删除（下次启动不会立刻退出）", not os.path.isfile(stop_path))
+
         print("\n== 放行前代码指纹校验 ==")
         hb_path = os.path.join(tmp, "guard_heartbeat.json")
 
