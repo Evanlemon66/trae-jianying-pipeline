@@ -36,6 +36,15 @@ def _is_cache_fresh(src: str, dst: str) -> bool:
         return False
 
 
+def norm_cache_hit(input_path: str) -> bool:
+    """该源视频的转封装缓存是否可直接复用（命中时不会触发任何编码）。"""
+    src = os.path.abspath(input_path)
+    try:
+        return _is_cache_fresh(src, _norm_output_path(src))
+    except OSError:
+        return False
+
+
 def _probe_video(input_path: str) -> dict:
     cmd = [
         "ffprobe",

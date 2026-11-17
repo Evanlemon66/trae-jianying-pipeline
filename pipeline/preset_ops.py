@@ -321,13 +321,15 @@ def _read_stable_source(content_path, probes=4, interval=0.6):
 
 def clone_draft_with_presets(source, target_name=None, preset_profile=None,
                              presets=None, overwrite=False, job_dir=None,
-                             cover_image=None):
+                             cover_image=None, cover_fallback="abort"):
     """复制已剪辑草稿 → 剥离旧预设层 → 合并 preset_profile 的预设 → 发布为独立新草稿。
 
     presets 为 None 时按 preset_profile 从 presets.json 解析。
     版本封面：cover_image 显式优先；否则按 job_dir + preset_profile 从该组竖版封面
-    取图（B/C 组绝不沿用源草稿的 A 封面）；B/C 组缺组封面时用源草稿主轨视频抽帧
-    兜底并在台账记 cover.source=frame，无法抽帧则硬失败。返回统计 dict。
+    取图（B/C 组绝不沿用源草稿的 A 封面）；B/C 组缺组封面时默认用源草稿主轨视频抽帧
+    兜底并在台账记 cover.source=frame，无法抽帧则硬失败。
+    cover_fallback="source"：缺组封面时不做抽帧，直接复用源草稿封面
+    （台账记 cover.source=source_draft）。返回统计 dict。
     """
     src_dir, _src_content, src_name = _resolve_source(source)
     if presets is None:
@@ -435,21 +437,29 @@ def clone_draft_with_presets(source, target_name=None, preset_profile=None,
     cover_frame_video = None
     cover_written = False
     if not cover_src and _is_version_profile(preset_profile):
-        cover_frame_video = _first_local_video(draft)
-        frame_ok = False
-        if cover_frame_video:
-            try:
-                frame_ok = set_draft_cover(stage_dir, extract_from_video=cover_frame_video)
-            except Exception as e:  # ffmpeg 失败/无 ffmpeg 都落到下面的硬失败
-                print(f"  ⚠️ 抽帧兜底失败: {e}")
-        if not frame_ok:
-            raise RuntimeError(_missing_group_cover_message(
-                job_dir, _profile, cover_frame_video))
-        cover_src = os.path.join(stage_dir, "draft_cover.jpg")  # 抽帧已直接落盘
-        cover_source = "frame"
-        cover_written = True
-        print(f"  ⚠️ 预设组 {_profile} 缺竖版封面：已从 "
-              f"{os.path.basename(cover_frame_video)} 抽帧兜底（cover.source=frame）")
+        if cover_fallback == "source":
+            # 开关打开：组封面缺失时直接沿用源草稿封面（stage 是完整拷贝，无需重写）
+            cover_source = "source_draft"
+            cover_written = False
+            print(f"  ℹ️ 预设组 {_profile} 缺竖版封面：复用源草稿封面"
+                  "（cover.source=source_draft）")
+        else:
+            cover_frame_video = _first_local_video(draft)
+            frame_ok = False
+            if cover_frame_video:
+                try:
+                    frame_ok = set_draft_cover(stage_dir,
+                                               extract_from_video=cover_frame_video)
+                except Exception as e:  # ffmpeg 失败/无 ffmpeg 都落到下面的硬失败
+                    print(f"  ⚠️ 抽帧兜底失败: {e}")
+            if not frame_ok:
+                raise RuntimeError(_missing_group_cover_message(
+                    job_dir, _profile, cover_frame_video))
+            cover_src = os.path.join(stage_dir, "draft_cover.jpg")  # 抽帧已直接落盘
+            cover_source = "frame"
+            cover_written = True
+            print(f"  ⚠️ 预设组 {_profile} 缺竖版封面：已从 "
+                  f"{os.path.basename(cover_frame_video)} 抽帧兜底（cover.source=frame）")
     elif not cover_src:
         print("  ⚠️ 未指定扩展版本组（A/基础版）：沿用源草稿封面")
     if cover_src:
@@ -465,7 +475,8 @@ def clone_draft_with_presets(source, target_name=None, preset_profile=None,
     new_manifest["cover"] = {
         "source": cover_source or "source_draft",
         "group": _profile or None,
-        "file": ("draft_cover.jpg" if cover_source == "frame" else cover_src),
+        "file": ("draft_cover.jpg" if cover_source in ("frame", "source_draft")
+                 else cover_src),
         "extracted_from": cover_frame_video,
     }
     write_preset_manifest(stage_dir, new_manifest)
@@ -482,7 +493,8 @@ def clone_draft_with_presets(source, target_name=None, preset_profile=None,
     if _fr and job_dir:
         try:
             _cover_arg = (os.path.join(target, "draft_cover.jpg")
-                          if cover_source == "frame" else cover_src)
+                          if cover_source in ("frame", "source_draft")
+                          else cover_src)
             _fr.record_draft_write(job_dir, final_content, "preset_clone")
             _fr.record_cover(job_dir,
                              _fr.version_for_draft(job_dir, target_name),

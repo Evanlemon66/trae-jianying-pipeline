@@ -29,8 +29,6 @@ import subprocess
 import sys
 import time
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 _SCRIPTS = os.path.join(_ROOT, "scripts")
@@ -330,7 +328,11 @@ def _job_dir_for(target: str, is_draft: bool) -> str | None:
         cand = os.path.join(target, "cover_job")
         return cand if os.path.isfile(os.path.join(cand, "job.json")) else None
     hits: list[tuple[int, str]] = []
-    for root in (pc.get_watch_config().get("roots") or []):
+    try:
+        roots = pc.get_watch_roots()
+    except Exception:
+        roots = []
+    for root in roots:
         try:
             names = os.listdir(root)
         except OSError:
@@ -770,4 +772,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     raise SystemExit(main())

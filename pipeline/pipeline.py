@@ -20,6 +20,7 @@ from jy_cover import set_draft_cover, set_cover_composition
 from export_config import (get_deps_root, get_font_path, get_presets_root,
                            get_projects_root, preset_profile_name)
 import job_manifest as jm
+import step_cache as sc  # noqa: E402  产物级内容缓存（断点续跑）
 from no_window import NO_WINDOW, install_default_hidden, hidden_child_env
 install_default_hidden()  # 无控制台托管时兜底隐藏所有子进程窗口（有控制台不生效）
 
@@ -27,10 +28,9 @@ from utils.formatters import (
     get_all_drafts as _upstream_get_all_drafts,
     get_duration_ffprobe_cached as _upstream_get_duration,
 )
-from utils.media_normalizer import should_normalize_video_for_jianying, normalize_video_for_jianying
+from utils.media_normalizer import (should_normalize_video_for_jianying,
+                                    normalize_video_for_jianying, norm_cache_hit)
 from vendor.pyJianYingDraft.draft_folder import DraftFolder
-
-sys.stdout.reconfigure(encoding="utf-8")
 
 
 # ━━━━ 分步耗时统计（供流程优化分析）━━━━
@@ -51,8 +51,12 @@ def timed_step(name):
         print(f"  ⏱️ [{name}] {dt:.1f}s")
 
 
-def _timing_summary(workdir, tag=""):
-    """按阶段聚合打印耗时表，并追加到 workdir/_timings.jsonl"""
+def _timing_summary(workdir, tag="", final=False):
+    """按阶段聚合打印耗时表；final=True 时追加一行到 workdir/_timings.jsonl 并清空。
+
+    墙钟对账：wall_s 从 run_pipeline 开始计时，timed_s 是各 timed_step 之和，
+    untimed_s = wall_s - timed_s（初始化、未被包裹的收尾等）。
+    """
     if not _TIMINGS:
         return
     agg = {}
@@ -62,15 +66,25 @@ def _timing_summary(workdir, tag=""):
         a[0] += dt
         a[1] += 1
     total = sum(dt for _, dt in _TIMINGS)
-    print(f"\n{'='*52}\n  ⏱️ 分步耗时统计（总计 {total/60:.1f} 分钟）\n{'='*52}")
+    wall = round(time.time() - _RUN_STARTED_TS, 1) if _RUN_STARTED_TS else None
+    print(f"\n{'='*52}\n  ⏱️ 分步耗时统计（已计时 {total/60:.1f} 分钟"
+          + (f" / 墙钟 {wall/60:.1f} 分钟）" if wall else "）") + f"\n{'='*52}")
     for key, (s, n) in sorted(agg.items(), key=lambda kv: -kv[1][0]):
         avg = s / n
-        print(f"  {key:<10} 合计 {s:>7.1f}s  ×{n:<3} 均值 {avg:>6.1f}s  占比 {s/total*100:>5.1f}%")
+        print(f"  {key:<12} 合计 {s:>7.1f}s  ×{n:<3} 均值 {avg:>6.1f}s  占比 {s/total*100:>5.1f}%")
     print("=" * 52)
+    if not final:
+        return
     try:
         rec = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "tag": tag,
             "total_s": round(total, 1),
+            "wall_s": wall,
+            "untimed_s": round(wall - total, 1) if wall else None,
+            "started_at": (time.strftime("%Y-%m-%d %H:%M:%S",
+                                         time.localtime(_RUN_STARTED_TS))
+                           if _RUN_STARTED_TS else None),
+            "ended_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "stages": {k: {"total_s": round(v[0], 1), "count": v[1]} for k, v in agg.items()},
             "detail": [[n, round(d, 1)] for n, d in _TIMINGS],
         }
@@ -78,6 +92,8 @@ def _timing_summary(workdir, tag=""):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
+    finally:
+        _TIMINGS.clear()
 
 
 def _find_ffmpeg():
@@ -130,6 +146,52 @@ def _load_env_profile():
 
 
 _ENV_PROFILE = _load_env_profile()
+
+# ── 断点续跑缓存版本：模型/渠道变更时手动 +1，旧缓存自动失效 ──
+_DEMUCS_VERSION = "v1"
+_ASR_VERSION = "v1"
+_TRANSLATE_VERSION = "v1"
+
+
+def _cache_tag(section, version):
+    """机器画像该阶段的配置 + 版本号：换模型/渠道后 key 自动变化。"""
+    try:
+        raw = json.dumps(_ENV_PROFILE.get(section) or {}, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        raw = ""
+    return f"{version}:{raw}"
+
+
+# ── 运行级进度产物：Console / watcher / 手工 CLI 共用的唯一只读来源 ──
+_RUN_STARTED_TS = None
+
+
+def _write_progress(workdir, stage, label, done=0, total=0, **extra):
+    """原子写 `<workdir>/_progress.json`（观测数据，失败绝不影响主流程）。
+
+    stage 取值与 Console 的 STAGES 一一对应：
+      build / demucs / presets_cut / asr_translate / cleanup / verify / export
+    asr_translate 额外带 asr_done / tr_done 两个计数（识别与翻译逐集交替）。
+    """
+    if not workdir:
+        return
+    payload = {
+        "v": 1, "stage": stage, "label": label,
+        "done": int(done), "total": int(total),
+        "started_at": _RUN_STARTED_TS or time.time(),
+        "updated_at": time.time(),
+        "run_id": os.environ.get("JY_RUN_ID", ""),
+    }
+    payload.update(extra)
+    try:
+        p = os.path.join(workdir, "_progress.json")
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
 
 DRAFT_ROOT = get_projects_root()
 # 草稿构建暂存区：放在剪映草稿目录之外（同盘），构建完成后整体搬到 DRAFT_ROOT。
@@ -257,6 +319,38 @@ def cleanup_draft_temp_files(draft_dir):
     return prune_restore_backups(draft_dir)
 
 
+def _rebase_staged_paths(obj, stage_dir, target_dir):
+    """把仍指向暂存区的绝对路径改写到发布后的目录，返回改写条数。
+
+    封面 composition 的 `Resources/cover/<uuid>.png` 在暂存区里是按绝对路径写入的，
+    发布（move）后暂存区会被清理，不改写就变成「媒体丢失」。
+    """
+    old = os.path.abspath(stage_dir)
+    olds = {old, old.replace("\\", "/")}
+    new = os.path.abspath(target_dir).replace("\\", "/")
+    changed = 0
+
+    def walk(node):
+        nonlocal changed
+        if isinstance(node, dict):
+            for k, v in list(node.items()):
+                if isinstance(v, str):
+                    for o in olds:
+                        if v.startswith(o):
+                            tail = v[len(o):].replace("\\", "/")
+                            node[k] = new + (tail if tail.startswith("/") else "/" + tail)
+                            changed += 1
+                            break
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(obj)
+    return changed
+
+
 def publish_staged_draft(stage_dir, draft_name, duration_us=0):
     """把暂存区构建好的草稿整体搬进剪映草稿目录（原子发布）。
 
@@ -309,6 +403,10 @@ def publish_staged_draft(stage_dir, draft_name, duration_us=0):
             draft = json.load(f)
         draft["name"] = draft_name
         draft["update_time"] = int(time.time() * 1_000_000)
+        # 暂存区素材（封面 composition）必须改到最终目录，否则搬走后变「媒体丢失」
+        _rebased = _rebase_staged_paths(draft, stage_dir, target)
+        if _rebased:
+            print(f"  🔗 发布时改写暂存区路径 {_rebased} 处（封面等素材）")
         draft_io.write_draft_content(draft, content_path)
     except Exception as e:
         print(f"  [warn] 发布时更新 draft_content 失败: {e}")
@@ -1918,7 +2016,7 @@ BLANK_VIDEO_SEGMENT = {
 }
 
 
-def inject_videos_into_draft(draft, video_paths, normalize: bool = True):
+def inject_videos_into_draft(draft, video_paths, normalize: bool = True, workdir=None):
     """
     往已有草稿里注入视频（追加主轨 + materials.videos）。
     - 多个视频按传入顺序（调用方按文件名 a→z 排序）串在同一条主 video track 上
@@ -1942,14 +2040,17 @@ def inject_videos_into_draft(draft, video_paths, normalize: bool = True):
     episodes = []
     first_size = None
 
-    for vp in video_paths:
+    for _i, vp in enumerate(video_paths, 1):
+        _write_progress(workdir, "build", "建稿 · 注入视频", _i - 1, len(video_paths))
         if normalize:
+            _cached = norm_cache_hit(vp)
             _norm = normalize_video_for_jianying(vp)
             if _norm is None:
                 print(f"  ⚠️ 转封装失败，跳过: {os.path.basename(vp)}")
                 continue
             if _norm != vp:
-                print(f"  🔧 自动转封装: {os.path.basename(vp)} → {os.path.basename(_norm)}")
+                mark = "♻️ 复用转封装缓存" if _cached else "🔧 自动转封装"
+                print(f"  {mark}: {os.path.basename(vp)} → {os.path.basename(_norm)}")
             vp = _norm
 
         dur_us = get_video_duration_us(vp)
@@ -1991,6 +2092,8 @@ def inject_videos_into_draft(draft, video_paths, normalize: bool = True):
             "material_id": vid,
         })
         cum_start += dur_us
+
+    _write_progress(workdir, "build", "建稿 · 注入视频", len(video_paths), len(video_paths))
 
     if not segs:
         raise RuntimeError("所有视频都无法获取时长！")
@@ -2593,7 +2696,7 @@ def resolve_presets(profile=None):
                 if items is None:
                     raise RuntimeError(
                         f"presets.json 中未找到预设组 'presets_{name}'；"
-                        f"可用: {sorted(k for k in cfg if str(k).lower().startswith('presets'))}")
+                        f"可用: {sorted(k for k, v in cfg.items() if isinstance(v, list) and str(k).lower().startswith('presets_'))}")
                 return _preset_items(items), f"配置文件 {os.path.basename(PRESETS_JSON)} / 预设组 {name}"
             default_profile = preset_profile_name(cfg.get("default_preset_profile"))
             if default_profile:
@@ -2782,11 +2885,15 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                  do_vad_gate=True, vad_min_speech_ratio=None,
                  presets=None, preset_profile=None,
                  cover_image=None, cover_extract_from_video=None, cover_extract_time_s=3.0,
-                 vocal_mode="audio_track", job_dir=None):
+                 vocal_mode="audio_track", job_dir=None, use_cache=True,
+                 defer_timing=False):
+    global _RUN_STARTED_TS
+    sc.configure(use_cache)
     if workdir is None:
         workdir = default_workdir_for_draft(draft_name_or_path)
     os.makedirs(workdir, exist_ok=True)
     _TIMINGS.clear()  # 每次运行重新计时
+    _RUN_STARTED_TS = time.time()
 
     if presets is None:
         presets, _preset_src = resolve_presets(preset_profile)
@@ -2893,9 +3000,12 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         )
 
     episodes = []
+    # 初始化（草稿创建/加载/封面/预设解析）单独记账，避免混进注入耗时
+    if _RUN_STARTED_TS:
+        _TIMINGS.append(("初始化", time.time() - _RUN_STARTED_TS))
     if video_paths:
-        with timed_step("注入视频"):
-            episodes = inject_videos_into_draft(draft, video_paths)
+        with timed_step("建稿 · 注入视频"):
+            episodes = inject_videos_into_draft(draft, video_paths, workdir=workdir)
     print()
 
     multi = len(episodes) > 1
@@ -2933,19 +3043,35 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             vocal_track_id = None
             bgm_track_id = None
             for i, ep in enumerate(episodes, 1):
+                _write_progress(workdir, "demucs", "人声分离 + 音频提取", i - 1,
+                                len(episodes))
                 tag = f"第{i}集 " if multi else ""
                 print(f"  ── {tag}{ep['name']}")
                 try:
-                    src_for_demucs = ep["path"]
-                    if not src_for_demucs.lower().endswith(".wav"):
-                        tmp_wav = os.path.join(workdir, f"demucs_input_ep{i:02d}.wav")
-                        print("  🎬 先从视频提取音频...")
-                        if run_ffmpeg_extract_audio(src_for_demucs, tmp_wav):
-                            src_for_demucs = tmp_wav
-
-                    with timed_step(f"人声分离/ep{i}"):
-                        vocal, bgm = run_demucs(
-                            src_for_demucs, os.path.join(workdir, f"demucs_ep{i:02d}"))
+                    demucs_dir = os.path.join(workdir, f"demucs_ep{i:02d}")
+                    dkey = sc.make_key(
+                        "demucs", {"tag": _cache_tag("demucs", _DEMUCS_VERSION)},
+                        [sc.fingerprint(ep["path"])])
+                    hit = sc.load(workdir, "demucs", dkey)
+                    if hit and hit.get("vocal"):
+                        vocal = sc.abs_path(workdir, hit["vocal"])
+                        bgm = sc.abs_path(workdir, hit.get("bgm"))
+                        sc.note("demucs", f"{tag}人声分离")
+                    else:
+                        src_for_demucs = ep["path"]
+                        with timed_step(f"人声分离/ep{i}"):
+                            if not src_for_demucs.lower().endswith(".wav"):
+                                tmp_wav = os.path.join(workdir, f"demucs_input_ep{i:02d}.wav")
+                                print("  🎬 先从视频提取音频...")
+                                if run_ffmpeg_extract_audio(src_for_demucs, tmp_wav):
+                                    src_for_demucs = tmp_wav
+                            vocal, bgm = run_demucs(src_for_demucs, demucs_dir)
+                        if vocal and sc.enabled():
+                            sc.save(workdir, "demucs", dkey, {
+                                "vocal": sc.rel_path(workdir, vocal),
+                                "bgm": sc.rel_path(workdir, bgm) if bgm else None,
+                                "files": sc.dir_manifest(demucs_dir, workdir),
+                            })
                     if not vocal:
                         print("  ✗ demucs 输出缺失")
                         continue
@@ -2972,21 +3098,39 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                     break
                 except Exception as e:
                     print(f"  ✗ 人声分离失败: {e}")
+            _write_progress(workdir, "demucs", "人声分离 + 音频提取",
+                            len(episodes), len(episodes))
         else:
             source = video_path or existing_audio
             if not source:
                 print("  ⏭️ 无音频源")
             else:
                 try:
-                    tmp_wav = os.path.join(workdir, "extract_input.wav")
-                    src_for_demucs = source
-                    if video_path and not (existing_audio and existing_audio.endswith(".wav")):
-                        print("  🎬 先从视频提取音频...")
-                        ok = run_ffmpeg_extract_audio(video_path, tmp_wav)
-                        if ok:
-                            src_for_demucs = tmp_wav
-
-                    vocal, bgm = run_demucs(src_for_demucs, workdir)
+                    dkey = sc.make_key(
+                        "demucs", {"tag": _cache_tag("demucs", _DEMUCS_VERSION)},
+                        [sc.fingerprint(source)])
+                    hit = sc.load(workdir, "demucs", dkey)
+                    if hit and hit.get("vocal"):
+                        vocal = sc.abs_path(workdir, hit["vocal"])
+                        bgm = sc.abs_path(workdir, hit.get("bgm"))
+                        sc.note("demucs", "人声分离")
+                    else:
+                        with timed_step("人声分离"):
+                            tmp_wav = os.path.join(workdir, "extract_input.wav")
+                            src_for_demucs = source
+                            if video_path and not (existing_audio and existing_audio.endswith(".wav")):
+                                print("  🎬 先从视频提取音频...")
+                                ok = run_ffmpeg_extract_audio(video_path, tmp_wav)
+                                if ok:
+                                    src_for_demucs = tmp_wav
+                            vocal, bgm = run_demucs(src_for_demucs, workdir)
+                        if vocal and sc.enabled():
+                            sc.save(workdir, "demucs", dkey, {
+                                "vocal": sc.rel_path(workdir, vocal),
+                                "bgm": sc.rel_path(workdir, bgm) if bgm else None,
+                                "files": sc.files_manifest(workdir, [vocal, bgm]),
+                            })
+                    _write_progress(workdir, "demucs", "人声分离 + 音频提取", 1, 1)
                     if vocal:
                         try:
                             if vocal_mode == "audio_track":
@@ -3013,6 +3157,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
 
     # ━━━━ Step 2-5: 四个预设（自动拉伸对齐主轨） ━━━━
     if do_presets:
+        _write_progress(workdir, "presets_cut", "预设合并 + 裁剪", 0, 0)
+        _t_presets = time.time()
         for idx, (preset_name, alpha_override) in enumerate(PRESETS, start=2):
             print(f"━ [{idx}] 加预设: {preset_name} ━━━━━━━━━━━━━━━━━━━━━━━")
             pp = find_preset_by_name(preset_name)
@@ -3047,9 +3193,11 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                 traceback.print_exc()
             main_dur = get_main_video_duration(draft)
             print()
+        _TIMINGS.append(("预设合并", time.time() - _t_presets))
 
     # ━━━━ Step 6: 可选裁剪（所有预设都加完才裁） ━━━━
     if cut_us is not None:
+        _t_cut = time.time()
         print(f"━ [6] 裁剪 {cut_us/1_000_000:.2f}s 之前"
               + ("（串流：整条时间线前移）" if multi else "") + " ━━━━━━━━")
         pre_dur = get_main_video_duration(draft)
@@ -3067,6 +3215,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
         if main_dur <= 0:
             print("  ✗ 裁点超出总时长, 裁剪后没有内容, 已中止（草稿未保存）")
             return None
+        _TIMINGS.append(("裁剪", time.time() - _t_cut))
         print()
     else:
         print("━ [6] 无裁剪参数，跳过 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -3102,7 +3251,12 @@ def run_pipeline(draft_name_or_path, video_paths=None,
 
         if not units:
             print("  ✗ 找不到可用的视频/音频源!")
-        for u in units:
+        _write_progress(workdir, "asr_translate", "识别字幕 + 翻译字幕", 0,
+                        len(units) * 2, asr_done=0, tr_done=0)
+        for _ui, u in enumerate(units, 1):
+            _write_progress(workdir, "asr_translate", "识别字幕 + 翻译字幕",
+                            (_ui - 1) * 2, len(units) * 2,
+                            asr_done=_ui - 1, tr_done=_ui - 1)
             tag = f"第{u['idx']}集 " if len(units) > 1 else ""
             print(f"  ── {tag}{u['name']}  offset={u['start_us']/1_000_000:.2f}s")
             # 缺字幕策略：集号优先从「第N集」解析，回退单位序号
@@ -3111,19 +3265,39 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                 u.get("idx") if isinstance(u.get("idx"), int) else None)
             cn_before = len(cn_all)
 
-            # Step 7: 分离音频
-            asr_source = u["path"]
-            if do_ffmpeg and not asr_source.lower().endswith(
-                    (".wav", ".mp3", ".m4a", ".aac", ".flac")):
-                wav = os.path.join(workdir, f"audio_ep{u['idx']:02d}.wav")
-                asr_source, ok = _extract_audio_with_heal(asr_source, wav)
-                if ok:
-                    print(f"  ✅ 提取到: {wav}")
-
-            # Step 8: 识别字幕（集内相对时间轴）
+            # Step 7-8: 识别字幕（集内相对时间轴）；命中缓存直接复用（跳过抽音频）
             if do_whisper:
-                with timed_step(f"ASR/ep{u['idx']}"):
-                    cn_subs = run_asr_chain(asr_source, workdir, skip_local_ai)
+                akey = sc.make_key(
+                    "asr", {"tag": _cache_tag("whisper", _ASR_VERSION),
+                            "skip_local_ai": bool(skip_local_ai)},
+                    [sc.fingerprint(u["path"])])
+                hit = sc.load(workdir, "asr", akey)
+                if hit is not None and hit.get("subs"):
+                    cn_subs = hit["subs"]
+                    sc.note("asr", f"{tag}识别")
+                else:
+                    with timed_step(f"ASR/ep{u['idx']}"):
+                        asr_source = u["path"]
+                        if do_ffmpeg and not asr_source.lower().endswith(
+                                (".wav", ".mp3", ".m4a", ".aac", ".flac")):
+                            wav = os.path.join(workdir, f"audio_ep{u['idx']:02d}.wav")
+                            asr_source, ok = _extract_audio_with_heal(asr_source, wav)
+                            if ok:
+                                print(f"  ✅ 提取到: {wav}")
+                        cn_subs = run_asr_chain(asr_source, workdir, skip_local_ai)
+                    if cn_subs and sc.enabled():
+                        # 逐集产物（stage-rerun §5 命名）+ 清单校验
+                        apath = os.path.join(workdir, f"asr_ep{u['idx']:02d}.json")
+                        try:
+                            with open(apath + ".tmp", "w", encoding="utf-8") as _f:
+                                json.dump({"subs": cn_subs}, _f, ensure_ascii=False)
+                            os.replace(apath + ".tmp", apath)
+                        except OSError as e:
+                            print(f"  [warn] 写 ASR 产物失败（忽略）: {e}")
+                        sc.save(workdir, "asr", akey, {
+                            "subs": cn_subs,
+                            "files": sc.files_manifest(workdir, [apath]),
+                        })
             else:
                 cn_subs = []
             if not cn_subs:
@@ -3177,13 +3351,35 @@ def run_pipeline(draft_name_or_path, video_paths=None,
 
             # Step 9: 翻译本集字幕，时间轴同样加集偏移
             if do_translate and not skip_local_ai:
-                with timed_step(f"翻译/ep{u['idx']}"):
-                    en_texts = translate_texts([s["text"] for s in cn_subs], workdir)
-                if not en_texts:
-                    # 立即修复：GLM 429 多为瞬时抖动，45s 后全链重试一次
-                    print(f"  ⚠️ {tag}翻译全链失败，45s 后立即重试一次")
-                    time.sleep(45)
-                    en_texts = translate_texts([s["text"] for s in cn_subs], workdir)
+                tsrc = [s["text"] for s in cn_subs]
+                tkey = sc.make_key(
+                    "translate", {"tag": _cache_tag("translate", _TRANSLATE_VERSION),
+                                  "src": tsrc}, [])
+                hit = sc.load(workdir, "translate", tkey)
+                if hit is not None and isinstance(hit.get("en"), list) \
+                        and len(hit["en"]) == len(tsrc):
+                    en_texts = hit["en"]
+                    sc.note("translate", f"{tag}翻译")
+                else:
+                    with timed_step(f"翻译/ep{u['idx']}"):
+                        en_texts = translate_texts(tsrc, workdir)
+                    if not en_texts:
+                        # 立即修复：GLM 429 多为瞬时抖动，45s 后全链重试一次
+                        print(f"  ⚠️ {tag}翻译全链失败，45s 后立即重试一次")
+                        time.sleep(45)
+                        en_texts = translate_texts(tsrc, workdir)
+                    if en_texts and len(en_texts) == len(tsrc) and sc.enabled():
+                        tpath = os.path.join(workdir, f"translation_ep{u['idx']:02d}.json")
+                        try:
+                            with open(tpath + ".tmp", "w", encoding="utf-8") as _f:
+                                json.dump({"src": tsrc, "en": en_texts}, _f, ensure_ascii=False)
+                            os.replace(tpath + ".tmp", tpath)
+                        except OSError as e:
+                            print(f"  [warn] 写翻译产物失败（忽略）: {e}")
+                        sc.save(workdir, "translate", tkey, {
+                            "en": en_texts,
+                            "files": sc.files_manifest(workdir, [tpath]),
+                        })
                 if not en_texts:
                     print(f"  ✗ {tag}所有翻译渠道失败, 本集英文字幕留空待修复轮")
                     translation_gaps.append({
@@ -3205,6 +3401,10 @@ def run_pipeline(draft_name_or_path, video_paths=None,
                         "text": str(t),
                         "_refined": s.get("_refined", False),
                     })
+
+        _write_progress(workdir, "asr_translate", "识别字幕 + 翻译字幕",
+                        len(units) * 2, len(units) * 2,
+                        asr_done=len(units), tr_done=len(units))
 
         # 缺字幕清单：整轮只写一次，异常不中断后续（翻译修复轮/导出收尾照常）
         _sync_jd = _resolve_pipeline_job_dir(job_dir, video_paths)
@@ -3255,9 +3455,12 @@ def run_pipeline(draft_name_or_path, video_paths=None,
 
     # ━━━━ Step 10: 隐藏中文字幕 ━━━━
     if do_hide_cn:
+        _write_progress(workdir, "cleanup", "隐藏中文字幕 + VAD 门控", 0, 0)
+        _t_hide = time.time()
         print("━ [10] 隐藏中文字幕 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         hidden = hide_text_track_by_language(draft, lang_cn=True)
         print(f"  🙈 隐藏了 {hidden} 个 text material")
+        _TIMINGS.append(("隐藏中文字幕", time.time() - _t_hide))
         print()
 
     # ━━━━ Step 10.2: VAD 门控（人声干声非语音段压制 -40 dB）━━━━
@@ -3297,6 +3500,7 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             print(f"📏 duration 更新: {old_dur/1_000_000:.2f}s → {main_dur/1_000_000:.2f}s")
 
     # ━━━━ Step 10.5: 字幕/音频终检（发布前 gate）━━━━
+    _write_progress(workdir, "verify", "终检 + 残缺集补翻 + 帧对齐", 0, 0)
     _missing_eps_pending = []  # 残缺集软阻断：非空时发布后自动补翻+复验门控导出
     if do_subtitle_check:
         print("━ [10.5] 字幕/音频终检（中文残留 / 超长 / 结构 / 音频素材）━━")
@@ -3477,7 +3681,8 @@ def run_pipeline(draft_name_or_path, video_paths=None,
             print("  💡 请在剪映里手动点 [导出] 按钮")
         print()
 
-    _timing_summary(workdir, tag=os.path.basename(dp_root or draft_name_or_path))
+    _timing_summary(workdir, tag=os.path.basename(dp_root or draft_name_or_path),
+                    final=not defer_timing)
     print(f"{'='*60}")
     print(f"  🎉 Pipeline 完成!")
     print(f"  📄 草稿 JSON: {draft_path}")
@@ -3635,6 +3840,7 @@ def clean_workdir(workdir, protect_referenced=True):
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     import argparse
     parser = argparse.ArgumentParser(description="JianYing Full-Local Pipeline (方案B: 注入已有草稿)")
     parser.add_argument("draft", nargs="?", default=None,
@@ -3663,6 +3869,8 @@ if __name__ == "__main__":
                         help="跳过发布前字幕终检（中文残留/超长/结构）")
     parser.add_argument("--no-vad-gate", action="store_true",
                         help="跳过 VAD 门控（默认开启：干声非语音段压 -40 dB）")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="忽略产物缓存（demucs/ASR/翻译全量重算）")
     args = parser.parse_args()
 
     if args.list_presets:
@@ -3687,7 +3895,8 @@ if __name__ == "__main__":
             try:
                 with open(PRESETS_JSON, encoding="utf-8") as f:
                     _cfg = json.load(f)
-                _groups = sorted(k for k in _cfg if str(k).lower().startswith("presets_"))
+                _groups = sorted(k for k, v in _cfg.items()
+                                 if str(k).lower().startswith("presets_") and isinstance(v, list))
                 if _groups:
                     print(f"\n已配置预设组: {_groups}")
                     print(f"默认预设组: {_cfg.get('default_preset_profile') or '(未设置)'}")
@@ -3730,6 +3939,7 @@ if __name__ == "__main__":
             do_translate=not args.no_translate,
             do_hide_cn=not args.no_hide_cn,
             do_subtitle_check=not args.skip_subtitle_check,
+            use_cache=not args.no_cache,
         )
         _toast("🎬 单集草稿完成", str(args.draft))
     except Exception as e:
