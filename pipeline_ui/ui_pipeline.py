@@ -183,16 +183,22 @@ def _step_timeout(step_key, duration_s):
 
 def _draft_duration_s():
     """当前打开草稿的时长（秒），失败返回 None。
-    候选名依次尝试：活动草稿名（可能陈旧，如 default）→ init_draft 默认草稿名；
-    取第一个「文件夹存在且时长>0」的结果；duration 字段缺失时按主轨片段求和。"""
+    候选名依次尝试：活动草稿名（可能陈旧，如 default）→ presets.json 的
+    admission.draft_name（取不到就跳过该候选）；取第一个「文件夹存在且时长>0」的结果；
+    duration 字段缺失时按主轨片段求和。"""
     try:
         from ui_recognize_translate import DRAFT_ROOT, _active_draft_name
         try:
             candidates = [_active_draft_name()]
         except Exception:
             candidates = []
-        from init_draft import DRAFT_NAME
-        candidates.append(DRAFT_NAME)
+        try:
+            from export_config import get_admission_config
+            _cfg_name = str((get_admission_config() or {}).get('draft_name') or '').strip()
+        except Exception:
+            _cfg_name = ''
+        if _cfg_name:
+            candidates.append(_cfg_name)
         for name in filter(None, candidates):
             try:
                 with open(os.path.join(DRAFT_ROOT, name, 'draft_content.json'), encoding='utf-8') as f:
@@ -229,7 +235,7 @@ def step_precheck(workdir):
     if calib is None:
         dprint(f"  ❌ 未找到匹配 calibration ({info})")
         if str(info).startswith('no_calibration'):
-            dprint("  👉 请先跑准入: py -3.12 pipeline_ui\\admission_test.py --init "
+            dprint("  👉 请先跑准入: py -3.12 pipeline_ui\\admission_test.py "
                    "--stop-after export --vocal-mode vocal")
         else:
             # env_mismatch：有文件但环境读数对不上——先查窗口放置/环境变化，不引导重跑准入
@@ -250,14 +256,15 @@ def step_precheck(workdir):
                 'inputs': {'warnings': r['warnings'], 'calib_path': info}}
     for e in r['errors']:
         dprint(f"  ❌ {e}")
-    dprint("  👉 请重跑准入: py -3.12 pipeline_ui\\admission_test.py --init "
+    dprint("  👉 请重跑准入: py -3.12 pipeline_ui\\admission_test.py "
            "--stop-after export --vocal-mode vocal")
     return {'ok': False, 'duration_s': round(time.time() - t0, 1),
             'error': '；'.join(r['errors']), 'inputs': {'errors': r['errors']}}
 
 
 def step_init_draft(workdir, draft_name=None, video_dir=None, video_limit=None,
-                    video_range=None, cut_s=None, normalize=False, preset_profile=None):
+                    video_range=None, cut_s=None, normalize=False, preset_profile=None,
+                    cover_image=None):
     """[0] 初始化草稿：创建/重置 → 注入视频 → 合并预设 → 发布 → 打开。
     video_limit=None 表示全部集数；传 N 表示取前 N 集。
     normalize=False 直接引用原始视频（跳过逐集重编码）。
@@ -266,7 +273,7 @@ def step_init_draft(workdir, draft_name=None, video_dir=None, video_limit=None,
     t0 = time.time()
     kwargs = {'video_limit': video_limit, 'video_range': video_range,
               'cut_s': cut_s, 'normalize': normalize,
-              'preset_profile': preset_profile}
+              'preset_profile': preset_profile, 'cover_image': cover_image}
     if draft_name:
         kwargs['draft_name'] = draft_name
     if video_dir:
@@ -326,7 +333,7 @@ def step_finalize(workdir):
             'error': None if ok else 'verify failed'}
 
 
-def step_export(workdir, draft_name=None, resolution=None):
+def step_export(workdir, draft_name=None, resolution=None, require_cover=True):
     """导出 MP4。调用 .trae/skills/jianying-editor/examples/robust_auto_export.py。
     其 CLI: robust_auto_export.py <draft_name> <output_path> [--move] [--retries N] [--resolution X]"""
     import subprocess
@@ -415,6 +422,10 @@ def step_export(workdir, draft_name=None, resolution=None):
             cmd += ['--expect-duration', str(expected_s)]
         if resolution:
             cmd += ['--resolution', resolution]
+        if not require_cover:
+            # 准入无 cover_job：显式声明"本次不校验封面"，不靠文件存在性猜
+            cmd += ['--no-cover']
+            dprint("  导出三件套口径：无 cover_job → 只校验 mp4 + progress（封面缺失仅记录）")
         timeout = _step_timeout('export', expected_s)
         dprint(f"  导出草稿「{draft_name}」→ {output_path}（时长 {expected_s}s，"
                f"分辨率 {resolution or '沿用剪映当前值'}，导出后搬回 workdir，超时 {timeout}s）")
@@ -435,13 +446,22 @@ def step_export(workdir, draft_name=None, resolution=None):
             except OSError:
                 pass
 
+            # 导出子进程 stdout/stderr 单独落盘（行缓冲 + 子进程无缓冲），不再只留在内存
+            _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+            os.makedirs(_log_dir, exist_ok=True)
+            _export_log = os.path.join(
+                _log_dir, 'export_child_%s.log' % time.strftime('%Y%m%d_%H%M%S'))
+            _child_env = hidden_child_env()
+            _child_env['PYTHONUNBUFFERED'] = '1'
+            _log_fh = open(_export_log, 'w', encoding='utf-8', buffering=1)
+            dprint(f"  导出子进程日志: {_export_log}")
             proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                stdout=_log_fh, stderr=subprocess.STDOUT, text=True,
                 encoding='utf-8', errors='replace',
                 stdin=subprocess.DEVNULL,   # 避免脚本失败路径 input() 在无 tty 时 EOFError
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-                env=hidden_child_env(),
+                env=_child_env,
             )
 
             def _sizes_mb():
@@ -479,7 +499,15 @@ def step_export(workdir, draft_name=None, resolution=None):
                            + (f"（临时新增 {delta:.0f}MB，写盘中）" if delta > 0.5
                               else "（临时无新增，准备阶段/未写盘）"))
 
-            out, err = proc.communicate()
+            try:
+                _log_fh.close()
+            except Exception:
+                pass
+            try:
+                out = open(_export_log, encoding='utf-8', errors='replace').read()
+            except OSError:
+                out = ''
+            err = ''
             elapsed = time.time() - t0
             if proc.returncode == 0:
                 dprint(f"[6] 导出 MP4 ✅  耗时 {elapsed:.1f}s")
@@ -487,8 +515,13 @@ def step_export(workdir, draft_name=None, resolution=None):
                         'inputs': {'cmd': cmd}}
             else:
                 dprint(f"[6] 导出 MP4 ❌  返回码 {proc.returncode}")
+                # 门禁结论打在 stdout（如「导出后校验未通过: 缺 封面」），只看 stderr
+                # 会拿到空错误、failure_class 落 unknown —— 两条流都要回传。
+                dprint(f"  stdout(尾): {(out or '')[-800:]}")
                 dprint(f"  stderr: {(err or '')[-500:]}")
-                return {'ok': False, 'duration_s': round(elapsed, 1), 'error': (err or '')[-300:],
+                detail = '\n'.join(x for x in ((out or '').strip(), (err or '').strip()) if x)
+                return {'ok': False, 'duration_s': round(elapsed, 1),
+                        'error': detail[-800:] or f'export 子进程返回码 {proc.returncode}',
                         'inputs': {'cmd': cmd}}
         except Exception as e:
             elapsed = time.time() - t0
@@ -517,12 +550,13 @@ STEP_IMPL = {
 
 def step_kwargs(step_key, workdir, vocal_mode, draft_name, video_dir, cut_s=None,
                 video_limit=None, video_range=None, normalize=False, export_resolution=None,
-                preset_profile=None):
+                preset_profile=None, cover_image=None):
     """每个步骤的实参（调度统一 impl(**kw)）。"""
     if step_key == 'init_draft':
         return {'workdir': workdir, 'draft_name': draft_name, 'video_dir': video_dir,
                 'video_limit': video_limit, 'video_range': video_range,
-                'cut_s': cut_s, 'normalize': normalize, 'preset_profile': preset_profile}
+                'cut_s': cut_s, 'normalize': normalize, 'preset_profile': preset_profile,
+                'cover_image': cover_image}
     if step_key == 'vocal_separate':
         return {'workdir': workdir, 'vocal_mode': vocal_mode}
     if step_key == 'cut_timeline':
@@ -561,6 +595,7 @@ def run_pipeline_ui(workdir: str,
                     draft_name: str = None,
                     video_dir: str = None,
                     cut_s: float = None,
+                    cover_image: str = None,
                     video_limit: int = None,
                     video_range: str = None,
                     normalize: bool = False,
@@ -675,7 +710,7 @@ def run_pipeline_ui(workdir: str,
         step_t0 = time.time()
         kw = step_kwargs(step_key, workdir, vocal_mode, draft_name, video_dir, cut_s,
                          video_limit, video_range, normalize, export_resolution,
-                         preset_profile=preset_profile)
+                         preset_profile=preset_profile, cover_image=cover_image)
         ui_calibration.take_trace()          # 清掉轨迹；UI 入参由准入测试记录落盘
         try:
             # step 子预算：用动态超时（准入基线×草稿时长×130%）；
@@ -767,6 +802,8 @@ def main():
     parser.add_argument('--video-dir', default=None, help='[0] 初始化草稿的视频目录（默认取 init_draft 配置）')
     parser.add_argument('--cut', dest='cut_s', type=float, default=None,
                         help='[2] 时间线裁剪起点（秒）；不传则不裁剪')
+    parser.add_argument('--cover-image', dest='cover_image', default=None,
+                        help='[0] 封面图片路径；不传则沿用剪映默认（首帧）')
     parser.add_argument('--profile', dest='preset_profile', default=None, metavar='A',
                         help='[0] 预设组名（presets.json 里的 presets_<组名>），多账号各用各的预设')
     parser.add_argument('--limit', dest='video_limit', type=int, default=None,
@@ -796,6 +833,7 @@ def main():
             draft_name=args.draft_name,
             video_dir=args.video_dir,
             cut_s=args.cut_s,
+            cover_image=args.cover_image,
             video_limit=args.video_limit,
             video_range=args.video_range,
             normalize=args.normalize,

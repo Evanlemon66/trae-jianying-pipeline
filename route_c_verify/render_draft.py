@@ -19,22 +19,22 @@ import shutil
 import subprocess
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(HERE, "work")
 OUT = os.path.join(HERE, "out")
 
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "pipeline"))
+from export_config import get_jianying_dir, get_projects_root  # noqa: E402
+
 DRAFT_JSON = os.path.join(
-    os.environ["LOCALAPPDATA"],
-    "JianyingPro", "User Data", "Projects", "com.lveditor.draft",
-    "pipe_v3_final", "draft_content.json",
+    get_projects_root(),
+    os.environ.get("JY_DRAFT_NAME", "pipe_v3_final"), "draft_content.json",
 )
 
 
 def _resolve_font_src() -> str:
     """剪映自带字体（zh-hans.ttf）：JY_JIANYING_DIR → 系统中文字体兜底，找不到返回空串。"""
-    jy_dir = os.environ.get("JY_JIANYING_DIR", "").strip()
+    jy_dir = get_jianying_dir()
     if jy_dir:
         p = os.path.join(jy_dir, "Resources", "Font", "SystemFont", "zh-hans.ttf")
         if os.path.isfile(p):
@@ -274,4 +274,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     main()

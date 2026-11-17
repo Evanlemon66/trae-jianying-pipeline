@@ -100,7 +100,7 @@ python scripts/utils/watcher.py --dir <workdir> --once
 ### SOP 1：批量制作 + watcher（最常用）
 
 ```bash
-python pipeline/batch_runner.py "D:\短剧\目录" --watch --only 20..30
+python pipeline/batch_runner.py "<剧集根>\目录" --watch --only 20..30
 ```
 
 `--watch` 自动后台起 watcher，无需手动再开。完成后弹：
@@ -181,9 +181,9 @@ notifier.py (优先 plyer，无 plyer → 降级 NotifyIcon)
 
 | 脚本 | 调用方式 | 触发场景 | 验证 |
 |---|---|---|---|
-| [batch_runner.py](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\pipeline\batch_runner.py#L200-L201) | `_toast("🎬 串流草稿已就绪", ...)` | 单草稿串流模式完成 | ✅ 多次验证 |
-| [batch_runner.py](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\pipeline\batch_runner.py#L273) | `_toast("🎬 批量制作完成", ...)` | 多草稿批量模式全部结束 | ✅ |
-| [batch_runner.py](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\pipeline\batch_runner.py#L109-L126) | `--watch` 参数 | 自动后台启动 watcher 守护进程 | ✅ |
-| [robust_auto_export.py（skill 版）](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\.trae\skills\jianying-editor\examples\robust_auto_export.py#L759) | `_toast_safe("📤 导出进行中", ...)` / `_toast_safe("📤 导出成功", ...)` | 导出中每 5 分钟一次进度、成功一次 | ✅ |
-| [auto_exporter.py（项目版）](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\scripts\auto_exporter.py#L121-L124) | `toast("📤 导出成功/失败", ...)` | 项目根 scripts 下的独立副本（skill 版已回退为无 toast 薄壳） | ✅ |
-| [watcher.py](file:///d:\剪映5.9\剪映5.9版+jianying-skill\国内用户下载这个（trae+skill）\trae-jianying-skill\scripts\utils\watcher.py#L155-L168) | `toast("👁️ 状态/全部终态", ...)` | 集结束 + 全部终态自动退出 | ✅ 生命周期测试通过 |
+| [batch_runner.py](../../../pipeline/batch_runner.py#L200-L201) | `_toast("🎬 串流草稿已就绪", ...)` | 单草稿串流模式完成 | ✅ 多次验证 |
+| [batch_runner.py](../../../pipeline/batch_runner.py#L273) | `_toast("🎬 批量制作完成", ...)` | 多草稿批量模式全部结束 | ✅ |
+| [batch_runner.py](../../../pipeline/batch_runner.py#L109-L126) | `--watch` 参数 | 自动后台启动 watcher 守护进程 | ✅ |
+| [robust_auto_export.py（skill 版）](../jianying-editor/examples/robust_auto_export.py#L759) | `_toast_safe("📤 导出进行中", ...)` / `_toast_safe("📤 导出成功", ...)` | 导出中每 5 分钟一次进度、成功一次 | ✅ |
+| [auto_exporter.py（项目版）](../../../scripts/auto_exporter.py#L121-L124) | `toast("📤 导出成功/失败", ...)` | 项目根 scripts 下的独立副本（skill 版已回退为无 toast 薄壳） | ✅ |
+| [watcher.py](../../../scripts/utils/watcher.py#L155-L168) | `toast("👁️ 状态/全部终态", ...)` | 集结束 + 全部终态自动退出 | ✅ 生命周期测试通过 |

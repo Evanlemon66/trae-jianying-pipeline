@@ -1,14 +1,16 @@
 uiautomation==2.0.20
 playwright==1.52.0
-pynput==1.7.7
+pynput>=1.7.7
+pyautogui>=0.9.54      # pipeline_ui / admission_test 的鼠标键盘自动化（9 个模块直接 import）
+plyer>=2.1.0           # 桌面通知：Windows 现代 Toast；缺失时 notifier 自动降级，不阻断主流程
 edge-tts==7.2.3
-pymediainfo==7.0.1
+pymediainfo>=7.0.1
 opencv-python==4.11.0.86
 numpy==2.2.4
 pillow==13.0.0
 imageio==2.37.0
-psutil==7.0.0
-requests==2.32.5
+psutil>=7.0.0
+requests>=2.32.5
 websockets==16.0
 
 # ── pipeline AI 链路 ──
@@ -17,8 +19,8 @@ faster-whisper==1.2.1
 funasr-onnx==0.4.3
 videocaptioner==1.4.2
 audio-separator==0.47.1
-pyloudnorm==0.2.0      # ITU-R BS.1770-4 LUFS 响度计量（环境声泄漏检测）
-silero-vad==6.2.3      # 语音活动检测（VAD，模型文件随包自带；备份在 D:\AI_Deps\models\silero-vad\）
+pyloudnorm>=0.2.0      # ITU-R BS.1770-4 LUFS 响度计量（环境声泄漏检测）
+silero-vad==6.2.3      # 语音活动检测（VAD，模型文件随包自带；备份在 <依赖根>\models\silero-vad\）
 
 # torch/torchaudio 必须装 CUDA 版（demucs GPU 加速，42x 实时速率）：
 #   pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu126
@@ -36,3 +38,8 @@ silero-vad==6.2.3      # 语音活动检测（VAD，模型文件随包自带；�
 #
 # 已知无关冲突（不处理，与 pipeline 无关）：httpcore 1.0.5 要 h11<0.15（现 0.16.0）、
 # mitmproxy 12.2.3 要 typing-extensions<=4.14（现 4.16.0）——均属 mitmproxy 独立工具链
+
+# ── pipeline_ui UI 自动化 OCR（全局安装，与主链路共用同一套 numpy/opencv/pillow）──
+# admission_test / ui_pipeline 经 ocr_locate 直接 import rapidocr_onnxruntime；
+# 其依赖的 numpy / opencv-python / pillow / onnxruntime 均在本文件定版，不再使用独立依赖目录。
+rapidocr_onnxruntime==1.4.4

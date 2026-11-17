@@ -3,8 +3,9 @@ import json
 import csv
 
 # 路径定义
-LOCAL_APP_DATA = os.getenv('LOCALAPPDATA')
-PROJECTS_ROOT = os.path.join(LOCAL_APP_DATA, r"JianyingPro\User Data\Projects\com.lveditor.draft")
+from utils.formatters import get_default_drafts_root
+
+PROJECTS_ROOT = get_default_drafts_root()
 
 # Skill 根目录
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

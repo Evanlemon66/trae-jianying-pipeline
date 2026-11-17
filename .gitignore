@@ -8,7 +8,11 @@ _*.py
 
 # 个人配置（含个人预设名/密钥/导出目录，不入库；参考 *.example.json）
 pipeline/presets.json
+# 迁移/编辑留下的备份同样含密钥，一律不入库
+pipeline/presets.json.bak-*
 pipeline/vc_config.json
+# sidecar 上线前的一次性冻结基线（含本机绝对路径/剧名，由 scripts/freshness_baseline.py 生成）
+data/freshness_legacy_baseline.json
 
 # Python 缓存
 __pycache__/
@@ -88,3 +92,13 @@ pipeline_ui/*.bmp
 pipeline_ui/*.stall.png
 pipeline_ui/*.progress.json
 pipeline_ui/*.err
+# 准入/导出实跑证据与临时产物（日志、截图、草稿快照、测试片段，不入库）
+pipeline_ui/_evidence_*/
+pipeline_ui/_draft_snapshots/
+pipeline_ui/*.verify.log
+pipeline_ui/verify_timeline*.png
+pipeline_ui.progress.json
+# Web Console 运行数据（runs.jsonl / 日志 / 工作目录，仅本机，不入库）
+pipeline_ui/_console/
+workdir_r*/
+specs/ui-admission-launch/evidence/

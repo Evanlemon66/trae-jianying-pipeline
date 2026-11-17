@@ -40,7 +40,7 @@
 | 8 | 其余组出图 | 从第二组起逐组使用本组选中的标题；同标题特例时同构图、加大光效/规模/压迫/姿态/天地比例 | `_dl/src/<组>1..4.png` |
 | 9 | 即梦精修 | `canvas create` → 逐组 `resource upload` 与 `node create image` → 批量 `node upscale image --mode normal --credit-ceiling 0 --wait` → 逐张 `resource download` | `_dl/up/<组>1..4.png`、`_dl/im_res.json`、`_dl/im_up.json` |
 | 10 | 裁切与精确尺寸 | 横版裁 `(0,744,3072,2472)`、竖版裁 `(672,0,2400,3072)`；LANCZOS → 2848×1600 / 1080×1920 | `04_covers/` 每组 4 张（B 组在 `b_group/`） |
-| 11 | 质检与登记 | 分组接触表看图 + 右下角 700×260 放大 2 倍水印图；生成 `covers_manifest.json`；job 推 `covers_ready` | `_dl/final_report.json`、`covers_manifest.json`、`job.json` |
+| 11 | 质检与登记 | 分组接触表看图 + 右下角 700×260 放大 2 倍水印图；生成 `covers_manifest.json`；job 推 `covers_ready`。各组竖版图即该版本草稿封面（A=`cover_04_vertical`，B=`b_group/cover_04_vertical_B`） | `_dl/final_report.json`、`covers_manifest.json`、`job.json` |
 | 12 | 画布 + 交付 | `FileBatchUpload` 取全部成品短链 → `+create` 每组 4 item → `+get` 回读 → RichMediaCard 分组交付 | 画布 item、按组卡片 |
 
 ---

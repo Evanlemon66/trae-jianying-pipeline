@@ -156,5 +156,48 @@ check("ui_hang 重试仍软关优先", fe5.switch_calls == 1 and fm5.restart_cal
 
 rae._get_manager = _orig_get_manager
 
+print("\n== _rebind_from_manager：拿到 None 不覆盖旧绑定，并明确报错 ==")
+
+
+class _BackendWithWindow:
+    def __init__(self, win):
+        self.win = win
+        self.calls = 0
+
+    def rebind_window(self):
+        self.calls += 1
+        return self.win
+
+
+class _MgrWithBackend:
+    def __init__(self, backend):
+        self.backend = backend
+
+
+class _Exp:
+    def __init__(self, window=None, backend_win=None):
+        self.window = window
+        self._manager = _MgrWithBackend(_BackendWithWindow(backend_win))
+
+
+e_none = _Exp(window="OLD")
+raised = False
+try:
+    rae._rebind_from_manager(e_none)
+except Exception as exc:
+    raised = "未找到" in str(exc)
+check("拿不到主窗口 → 抛明确错误", raised)
+check("旧绑定未被覆盖", e_none.window == "OLD")
+
+sentinel = object()
+e_ok = _Exp(window="OLD", backend_win=sentinel)
+check("拿到主窗口 → 返回并覆盖绑定",
+      rae._rebind_from_manager(e_ok) is sentinel and e_ok.window is sentinel)
+
+e_soft = _Exp(window="OLD")
+check("required=False → 不抛错、不覆盖",
+      rae._rebind_from_manager(e_soft, required=False) is None
+      and e_soft.window == "OLD")
+
 print(f"\n{'='*40}\n{'全部通过' if not fails else '失败: ' + '、'.join(fails)}")
 sys.exit(1 if fails else 0)

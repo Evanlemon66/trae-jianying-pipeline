@@ -13,9 +13,9 @@
   ⑨ 移动失败后重跑：stage 已 archived，源仍在、目标不存在 → 续做成功，不重复记事件
   ⑩ archive_root 等于/嵌在 roots 下 → 拒绝，报错指明命中的 root
   ⑪ 盘符根 root 的分隔符守卫
-  ⑫ roots 为空 fail-closed
+  ⑫ 有效扫描根为空 fail-closed（显式 roots=[] / 解析报错）
   ⑬ job_dir 不是 <剧名>/cover_job → 拒绝（--force 也不行）
-  ⑭ 剧集目录不是 watch.roots 的直接子级 → 拒绝
+  ⑭ 剧集目录不是有效扫描根的直接子级 → 拒绝
   ⑮ 剧集目录是盘符根 → 拒绝
 
 运行：python tests\\test_archive_job.py（纯临时目录，不碰真实剧）
@@ -32,9 +32,11 @@ from unittest import mock
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "lib"))
 sys.path.insert(0, os.path.join(_ROOT, "pipeline"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import job_manifest as jm  # noqa: E402
 import archive_job as aj  # noqa: E402
 import cover_watch as cw  # noqa: E402
+from bundle_fixture import make_bundle  # noqa: E402
 
 fails = []
 
@@ -92,6 +94,11 @@ def make_job_at(series, leaf, name, stage="video_ready", export_state="cleaned")
 
 def read_job(jd):
     return jm.load_job(os.path.join(jd, "job.json"))
+
+
+def seed_bundle(dir_path, name):
+    """造一套合法成品（mp4 + progress.done + 竖版封面），返回 mp4 路径。"""
+    return make_bundle(dir_path, name)["mp4"]
 
 
 def write_manifest(name, series):
@@ -218,18 +225,33 @@ check("拒绝文案指明命中 root", "命中 root" in out and "D:/" in out, ou
 check("stage 未变", read_job(jd)["stage"] == "video_ready")
 check("目录原地", os.path.isdir(os.path.join(series, "cover_job")))
 
-print("\n== ⑫ roots 为空 fail-closed ==")
+print("\n== ⑫ 有效扫描根为空 fail-closed ==")
 series, jd = make_job("noroots", export_state="cleaned")
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     rc = aj.archive(jd, ARCH, MF, roots=[])
 out = buf.getvalue()
 check("roots 为空返回 2", rc == 2, rc)
-check("文案说明未配置 watch.roots 且已拒绝",
-      "未配置 watch.roots" in out and "已拒绝执行" in out, out.strip())
+check("文案说明有效扫描根为空且已拒绝",
+      "有效扫描根为空" in out and "已拒绝执行" in out, out.strip())
 check("stage 未变", read_job(jd)["stage"] == "video_ready")
 check("目录原地", os.path.isdir(os.path.join(series, "cover_job")))
 check("归档目录未创建", not os.path.exists(os.path.join(ARCH, "noroots")))
+
+# 未显式传 roots 时由 get_watch_roots() 解析；解析失败必须 fail-closed，不能当“无根可用”
+series, jd = make_job("noroots_cfg", export_state="cleaned")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf), \
+        mock.patch.object(aj.pc, "get_watch_roots",
+                          side_effect=aj.pc.ConfigError("series_root", "缺少 series_root",
+                                                        "请在 presets.json 填写 series_root")):
+    rc = aj.archive(jd, ARCH, MF)
+out = buf.getvalue()
+check("配置解析失败返回 2", rc == 2, rc)
+check("文案带出 ConfigError 与修复提示",
+      "series_root" in out and "请在 presets.json 填写" in out, out.strip())
+check("配置失败目录原地", os.path.isdir(os.path.join(series, "cover_job")))
+check("配置失败 stage 未变", read_job(jd)["stage"] == "video_ready")
 
 print("\n== ⑬ job_dir 不是 <剧名>/cover_job → 拒绝 ==")
 series = os.path.join(ROOT, "notcover")
@@ -292,16 +314,26 @@ rc = run(jd)
 check("b 版未导出 → 跳过返回 1", rc == 1, rc)
 check("b 版未导出 → stage 未变", read_job(jd)["stage"] == "video_ready", read_job(jd)["stage"])
 check("b 版未导出 → 目录原地", os.path.isdir(os.path.join(series, "cover_job")))
-rc = aj.archive(jd, ARCH, MF, force=True, roots=ROOTS)
+rc = aj.archive(jd, ARCH, MF, force=True, roots=ROOTS,
+                allow_stale_reason="测试：已人工核对（无 sidecar）")
 check("--force 可绕过未完成检查", rc == 0, rc)
 check("--force 后已移动", os.path.isdir(os.path.join(ARCH, "multiver", "cover_job")))
 
 series2, jd2 = make_job("multiver2", publish_status="published")
+# 归档现在按导出侧口径校验每个 exported 版本的三件套，台账要能指到真实成品
+out_a_dir = os.path.join(TMP, "exports", "multiver2_a")
+out_b_dir = os.path.join(TMP, "exports", "multiver2_b")
+out_a = seed_bundle(out_a_dir, "multiver2_a")
+out_b = seed_bundle(out_b_dir, "multiver2_b")
 jm.update_job(jd2, {"workflow": {"preset_profile": "a,b"},
-                    "video": {"outputs": {"a": {"state": "exported"},
-                                          "b": {"state": "exported"}}}},
+                    "video": {"outputs": {
+                        "a": {"state": "exported", "draft": "multiver2_a",
+                              "export_dir": out_a_dir, "export_file": out_a},
+                        "b": {"state": "exported", "draft": "multiver2_b",
+                              "export_dir": out_b_dir, "export_file": out_b}}}},
               event="test_seed", detail="seed 多版本已完成")
-rc = run(jd2)
+rc = aj.archive(jd2, ARCH, MF, roots=ROOTS,
+                allow_stale_reason="测试：已人工核对（无 sidecar）")
 check("声明版本全部完成 → 正常归档", rc == 0, rc)
 check("全部完成 → 已移动", os.path.isdir(os.path.join(ARCH, "multiver2", "cover_job")))
 

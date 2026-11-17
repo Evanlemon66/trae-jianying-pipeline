@@ -348,6 +348,65 @@ def test_account_cover_group_dir_with_suffix(tmp_path):
     assert jm.account_cover_errors(str(tmp_path)) == []
 
 
+def test_resolve_profile_cover_group_first_and_no_silent_fallback(tmp_path):
+    """版本封面解析：账号组优先；不存在的组必须返回 None，绝不回落到 A。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import job_manifest as jm
+    covers = tmp_path / "04_covers"
+    for n in _cover_names():
+        _png(covers / f"{n}.png")
+    _png(covers / "b_group" / "cover_04_vertical_B.png")
+    (tmp_path / "job.json").write_text(json.dumps(
+        {"vertical_cover": {"file": "04_covers/cover_04_vertical.png"}}), encoding="utf-8")
+
+    assert os.path.basename(jm.resolve_profile_cover(str(tmp_path), "a")) == "cover_04_vertical.png"
+    assert jm.resolve_profile_cover(str(tmp_path), "presets_b").endswith("cover_04_vertical_B.png")
+    assert jm.resolve_profile_cover(str(tmp_path), "c") is None
+
+
+def test_clone_applies_profile_cover(tmp_path, monkeypatch):
+    """克隆换预设必须同时换封面：draft_cover 与 cover composition 都指向 B 组竖版图。"""
+    src = tmp_path / "src_draft"
+    src.mkdir()
+    draft, mid = _draft_with_preset_tracks()
+    media = tmp_path / "a.mp4"
+    media.write_bytes(b"x")
+    draft["materials"]["videos"][0]["path"] = str(media)
+    draft.update({"id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                  "name": "A", "duration": 10_000_000})
+    (src / "draft_content.json").write_text(
+        json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+    (src / "draft_meta_info.json").write_text(
+        json.dumps({"draft_id": draft["id"], "draft_name": "A"}, ensure_ascii=False),
+        encoding="utf-8")
+    pl.write_preset_manifest(str(src), {
+        "tracks": ["t-preset"],
+        "materials": {"videos": [mid["preset"]], "drafts": [mid["draft"]]},
+    })
+
+    covers = tmp_path / "cover_job" / "04_covers"
+    (covers / "b_group").mkdir(parents=True)
+    cover_b = covers / "b_group" / "cover_04_vertical_B.jpg"
+    cover_b.write_bytes(b"\xff\xd8\xff\xd9")
+    (covers / "cover_04_vertical.jpg").write_bytes(b"\xff\xd8\xff\xda")
+
+    monkeypatch.setattr(preset_ops, "DRAFT_ROOT", str(tmp_path / "drafts"))
+    monkeypatch.setattr(preset_ops, "_STAGING_ROOT", str(tmp_path / "stage"))
+    monkeypatch.setattr(preset_ops, "get_main_video_duration", lambda _d: 10_000_000)
+    monkeypatch.setattr(pl, "DRAFT_ROOT", str(tmp_path / "drafts"))
+
+    r = preset_ops.clone_draft_with_presets(
+        str(src), target_name="A_b", presets=[], preset_profile="b",
+        job_dir=str(tmp_path / "cover_job"))
+
+    assert r["cover"] == str(cover_b)
+    out_dir = tmp_path / "drafts" / "A_b"
+    assert (out_dir / "draft_cover.jpg").read_bytes() == cover_b.read_bytes()
+    out, _ = pl.load_draft(r["content_path"])
+    ids = {d["id"] for d in out["materials"]["drafts"]}
+    assert out["cover"]["cover_draft_id"] in ids
+
+
 def test_validate_job_allows_multi_group_prompts(tmp_path):
     sys.path.insert(0, os.path.join(_ROOT, "lib"))
     import job_manifest as jm
@@ -363,42 +422,166 @@ def test_validate_job_allows_multi_group_prompts(tmp_path):
     assert any("组 B 缺槽位" in e for e in errs)
 
 
-def test_profiles_from_job_outputs_requires_three_conditions_and_caps_two(tmp_path, monkeypatch):
-    """反推必须三条件齐备（prompts 组 + 4 张封面 + presets_<组>），且默认上限 2 组。"""
+def _write_prompts(job_dir, groups):
+    d = job_dir / "03_prompts"
+    d.mkdir(parents=True, exist_ok=True)
+    items = [{"slot": s, "group": g} for g in groups for s in (1, 2, 3, "vertical")]
+    (d / "prompts.json").write_text(json.dumps({"items": items}), encoding="utf-8")
+
+
+def test_job_profiles_job_first_then_prompts(tmp_path, monkeypatch):
+    """版本声明 job 优先、prompts 兜底；缺 presets_<组> 只标 blocked，不整体阻断。"""
     sys.path.insert(0, os.path.join(_ROOT, "lib"))
     import cover_watch as cw
     monkeypatch.setattr(cw, "_available_preset_profiles",
-                        lambda: ["a", "b", "c", "d"])
+                        lambda: ["a", "b", "c"])
     jd = tmp_path / "cover_job"
-    (jd / "03_prompts").mkdir(parents=True)
-    (jd / "03_prompts" / "prompts.json").write_text(
-        json.dumps({"items": [{"slot": s, "group": g}
-                              for g in "ABCD" for s in (1, 2, 3, "vertical")]}),
-        encoding="utf-8")
-    for g in "abcd":
-        for i in range(4):
-            _png(jd / "04_covers" / f"{g}_group" / f"c{i}.png")
-    assert cw._profiles_from_job_outputs(str(jd)) == ["a", "b"]  # C/D 不自动扩
+    assert cw._job_profiles({}, str(jd)) == ["a"]          # 无 job 组 / 无 prompts → 单版本
+    _write_prompts(jd, ["A"])
+    assert cw._job_profiles({}, str(jd)) == ["a"]          # 仅 A → 单版本
+    _write_prompts(jd, ["A", "B"])
+    assert cw._job_profiles({}, str(jd)) == ["a", "b"]     # 回落 prompts → 两版
+    assert cw._profile_groups({}, str(jd))[1] == "prompts"
+    # B 组缺封面不影响版本判定（封面由克隆入口兜底/硬失败）
+    assert not (jd / "04_covers" / "b_group").exists()
+    # job 显式声明 B（prompts 只有 A）→ job 优先，两版
+    job_b = {"titles": {"selected_groups": [{"group": "A"}, {"group": "B"}]}}
+    assert cw._job_profiles(job_b, str(jd)) == ["a", "b"]
+    assert cw._profile_groups(job_b, str(jd))[1] == "job"
+    # job 只声明 A，prompts 有 A+B → job 优先：B 只告警、不参与判定
+    job_a = {"titles": {"selected_groups": [{"group": "A"}]}}
+    assert cw._job_profiles(job_a, str(jd)) == ["a"]
+    groups, source, ignored = cw._profile_groups(job_a, str(jd))
+    assert (groups, source, ignored) == (["a"], "job", ["b"])
+    _write_prompts(jd, ["A", "B", "C"])
+    assert cw._job_profiles({}, str(jd)) == ["a", "b", "c"]
+    # 缺 presets_b → 不报错：声明仍是三版，b 标 blocked，A/C 照常可跑
+    monkeypatch.setattr(cw, "_available_preset_profiles", lambda: ["a", "c"])
+    assert cw._job_profiles({}, str(jd)) == ["a", "b", "c"]
+    assert cw._blocked_profiles(["a", "b", "c"]) == [
+        {"profile": "b", "reason": "missing_presets", "missing": "presets_b"}]
+    assert cw._runnable_profiles(["a", "b", "c"]) == ["a", "c"]
 
-    # 只剩 A/B 时，B 少一张封面 → 该组第②条不满足，不足 2 组
-    import shutil
-    shutil.rmtree(jd / "04_covers" / "c_group")
-    shutil.rmtree(jd / "04_covers" / "d_group")
-    (jd / "04_covers" / "b_group" / "c0.png").unlink()
-    assert cw._profiles_from_job_outputs(str(jd)) == []
 
-    # presets.json 里没有对应组 → 第③条不满足
-    (jd / "04_covers" / "b_group" / "c0.png").write_bytes(b"x")
-    monkeypatch.setattr(cw, "_available_preset_profiles", lambda: [])
-    assert cw._profiles_from_job_outputs(str(jd)) == []
-
-
-def test_pending_account_outputs_reads_job_profiles_only(tmp_path, monkeypatch):
+def test_pending_account_outputs_follows_prompt_groups(tmp_path, monkeypatch):
     sys.path.insert(0, os.path.join(_ROOT, "lib"))
     import cover_watch as cw
     monkeypatch.setattr(cw, "_draft_root", lambda: str(tmp_path))
-    (tmp_path / "剧_串流").mkdir()
-    job_dir = str(tmp_path / "剧" / "cover_job")
-    assert cw._pending_account_outputs({"workflow": {}}, job_dir) == []
+    monkeypatch.setattr(cw, "_available_preset_profiles", lambda: ["a", "b"])
+    # 本用例只测账号草稿判定，隔离真实导出目录（否则本机同名成品会造成台账冲突）
+    monkeypatch.setattr(cw, "_output_conflicts", lambda *a, **k: [])
+    (tmp_path / "剧_第01-100集串流").mkdir()
+    job_dir = tmp_path / "剧" / "cover_job"
+    # 单组 prompts 就是单版本（workflow 不声明组）
+    _write_prompts(job_dir, ["A"])
+    assert cw._pending_account_outputs({"workflow": {}}, str(job_dir)) == []
+    # workflow.preset_profile 显式声明 a,b 时优先于 prompts（multi-account-todo 的
+    # 版本优先级：workflow > job > global > 反推），b 版缺成品应算待补
     assert cw._pending_account_outputs(
-        {"workflow": {"preset_profile": "a,b"}}, job_dir) == ["剧_串流_b"]
+        {"workflow": {"preset_profile": "a,b"}}, str(job_dir)) == ["剧_第01-100集串流_b"]
+    _write_prompts(job_dir, ["A", "B"])
+    assert cw._pending_account_outputs({"workflow": {}}, str(job_dir)) == ["剧_第01-100集串流_b"]
+
+
+def test_check_trigger_passes_with_unexported_clone(tmp_path, monkeypatch):
+    """端到端：video_ready + 已导出基础版 + B 组未导出 → 放行补 B。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import cover_watch as cw
+    monkeypatch.setattr(cw, "_draft_root", lambda: str(tmp_path))
+    monkeypatch.setattr(cw, "_available_preset_profiles", lambda: ["a", "b"])
+    monkeypatch.setattr(cw, "_draft_exported", lambda n: False)
+    (tmp_path / "剧_第01-100集串流").mkdir()
+    (tmp_path / "剧_第01-100集串流_b").mkdir()
+    jd = tmp_path / "剧" / "cover_job"
+    _write_prompts(jd, ["A", "B"])
+    (jd / "job.json").write_text("{}", encoding="utf-8")
+    job = {"stage": "video_ready", "titles": {"gate": "done"},
+           "video": {"status": "done", "export_state": "exported"}}
+    monkeypatch.setattr(cw.jm, "detect_cover_files",
+                        lambda d, apply=False: ({1, 2, 3, "vertical"}, {}))
+    monkeypatch.setattr(cw.jm, "account_cover_errors", lambda d: [])
+    monkeypatch.setattr(cw.jm, "load_job", lambda p: job)
+    ok, reasons = cw.check_trigger(str(jd))
+    assert ok is True, reasons
+
+
+def test_build_plan_exports_existing_clone_when_base_done(tmp_path, monkeypatch):
+    """八零猎王场景：A 已导出、`_b` 已建但未导 → 计划只补导 `_b`。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import cover_watch as cw
+    monkeypatch.setattr(cw, "_draft_root", lambda: str(tmp_path))
+    monkeypatch.setattr(cw, "_available_preset_profiles", lambda: ["a", "b"])
+    monkeypatch.setattr(cw, "_effective_cut", lambda *a, **k: None)
+    monkeypatch.setattr(cw, "_migrate_ctx", lambda job: {})
+    monkeypatch.setattr(cw, "_progress_info", lambda p: (0.0, None, None))
+    monkeypatch.setattr(cw, "retry_gate", lambda *a, **k: None)
+    monkeypatch.setattr(cw, "_draft_exported", lambda n: n == "剧_第01-100集串流")
+    # 导出目录隔离：本用例只测"只补导 _b"，不引入真实导出目录的台账冲突
+    monkeypatch.setattr(cw, "_output_conflicts", lambda *a, **k: [])
+    (tmp_path / "剧_第01-100集串流").mkdir()
+    (tmp_path / "剧_第01-100集串流_b").mkdir()
+    jd = tmp_path / "剧" / "cover_job"
+    jd.mkdir(parents=True)
+    _write_prompts(jd, ["A", "B"])
+    job = {"stage": "video_ready", "titles": {"gate": "done"},
+           "video": {"status": "done", "export_state": "exported"}}
+    plan = cw.build_plan(str(jd), job, {"export_policy": "immediate"}, pending_edit=0,
+                         notify=False, write_log=False)
+    assert plan["action"] == "export", plan
+    assert plan["profiles"] == ["a", "b"]
+    assert plan["export_targets"] == ["剧_第01-100集串流_b"]
+
+
+# ── 发布闸门（三件套 / 台账冲突 / edit 闸门） ──────────────────
+
+def _export_root(tmp_path, monkeypatch):
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import cover_watch as cw
+    out_dir = tmp_path / "export"
+    out_dir.mkdir()
+    monkeypatch.setattr(cw.pc, "export_mp4_path",
+                        lambda name: str(out_dir / f"{name}.mp4"))
+    return cw, out_dir
+
+
+def test_missing_artifacts_three_piece(tmp_path, monkeypatch):
+    """成品三件套：mp4 / -封面.jpg / .progress.json 缺件逐项报出；导出后判成败只认正式 progress。"""
+    cw, out_dir = _export_root(tmp_path, monkeypatch)
+    # 本用例的断言对象就是「缺件」与「内容不合法」：内容用 b"x"/{} 是故意的
+    # （_missing_artifacts 只查存在性），不要套 make_bundle 改成合法三件套。
+    assert cw._missing_artifacts("D") == ["mp4", "封面", "progress"]
+    (out_dir / "D.mp4").write_bytes(b"x")
+    assert cw._missing_artifacts("D") == ["封面", "progress"]
+    (out_dir / "D-封面.jpg").write_bytes(b"x")
+    (tmp_path / "export.progress.json").write_text("{}", encoding="utf-8")  # 侧写
+    assert cw._missing_artifacts("D") == []
+    assert cw._missing_artifacts("D", strict_progress=True) == ["progress"]
+    (out_dir / "D.mp4.progress.json").write_text("{}", encoding="utf-8")
+    assert cw._missing_artifacts("D", strict_progress=True) == []
+
+
+def test_output_conflicts_both_directions(tmp_path, monkeypatch):
+    """台账 exported 但磁盘缺件 / 磁盘齐全但台账没登记，两个方向都要报冲突。"""
+    cw, out_dir = _export_root(tmp_path, monkeypatch)
+    job = {"video": {"export_state": "exported"}}
+    assert [c["kind"] for c in cw._output_conflicts(job, "剧_串流", ["a"])] == [
+        "ledger_exported_disk_missing"]
+    # 台账⇄磁盘冲突判定只认存在性；这里的 b"x" 是故意的残缺/占位，保持原样
+    for suffix in (".mp4", "-封面.jpg", ".mp4.progress.json"):
+        (out_dir / f"剧_串流{suffix}").write_bytes(b"x")
+    assert cw._output_conflicts(job, "剧_串流", ["a"]) == []
+    assert [c["kind"] for c in cw._output_conflicts({"video": {}}, "剧_串流", ["a"])] == [
+        "disk_present_ledger_missing"]
+
+
+def test_edit_gate_blocks_export_until_fixed(tmp_path):
+    """edit 失败闸门：无状态文件不拦也不建文件；硬失败后拦；--phase edit 可强制。"""
+    sys.path.insert(0, os.path.join(_ROOT, "lib"))
+    import cover_watch as cw
+    import edit_state as eds
+    assert cw._edit_gate(str(tmp_path)) is None
+    assert eds.peek(str(tmp_path)) is None
+    eds.fail(str(tmp_path), "素材缺失", retryable=False, failure_class="asset_missing")
+    assert "剪辑硬失败" in (cw._edit_gate(str(tmp_path)) or "")
+    assert cw._edit_gate(str(tmp_path), "edit") is None
+    assert cw._edit_gate(str(tmp_path), "export") is not None

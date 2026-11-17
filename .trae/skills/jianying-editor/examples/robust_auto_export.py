@@ -44,12 +44,39 @@ import uiautomation as uia
 _HERE_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_HERE_DIR))))
 _LIB_DIR = os.path.join(_REPO_ROOT, "lib")
+_PIPE_DIR = os.path.join(_REPO_ROOT, "pipeline")
+
+
+def _require_repo_layout():
+    """上探仓库依赖层；找不到时给出布局说明，而不是裸 ModuleNotFoundError。"""
+    missing = [rel for rel in ("lib/jianying_launch.py", "lib/jianying_proc.py",
+                               "pipeline/export_config.py", "pipeline/draft_io.py")
+               if not os.path.isfile(os.path.join(_REPO_ROOT, *rel.split("/")))]
+    if missing:
+        raise ImportError(
+            "未找到仓库依赖层，robust_auto_export.py 不能脱离仓库单独使用。\n"
+            "支持的唯一布局：<repo>/.trae/skills/jianying-editor/examples/robust_auto_export.py\n"
+            f"本次按上探推算的仓库根：{_REPO_ROOT}\n"
+            f"缺失：{', '.join(missing)}\n"
+            "请把整个仓库（含 lib/ 与 pipeline/）一起 clone/解压后再运行。"
+        )
+
+
+_require_repo_layout()
 if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 try:
     import failure_class as fc  # noqa: E402
 except Exception:  # 分类器不可用时退回旧逻辑
     fc = None
+
+# ========== 1c. 草稿写盘原语（串流恢复的唯一写回入口）==========
+# 恢复必须走 pipeline/draft_io.write_draft_content：原子写 + 不变量校验 + 写时留痕。
+if _PIPE_DIR not in sys.path:
+    sys.path.insert(0, _PIPE_DIR)
+import draft_io  # noqa: E402
+from export_config import get_projects_root  # noqa: E402
+import jianying_launch as jl  # noqa: E402  版本预检/候选枚举
 
 # ========== 1c. 实例生命周期管理器（第 2 项，同目录 jy_instance.py）==========
 # 四套拉起/回首页逻辑收敛到该管理器；只有它的 kill() 允许 taskkill。
@@ -70,14 +97,29 @@ def _get_manager(exporter):
     return mgr
 
 
-def _rebind_from_manager(exporter):
-    """管理器操作后窗口句柄可能已变，从管理器后端重新绑定到 exporter.window。"""
+def _rebind_from_manager(exporter, required=True):
+    """管理器操作后把 exporter.window 重新绑到剪映主窗口。
+
+    教训：回退用的搜索条件不是窗口——`Name='导出'` 只是查询描述，未校验存在性
+    就当成主窗口，会让后续每次读 ClassName 白等 10s 超时（看起来像剪映假死）。
+    任何 rebind 路径都不能跳过存在性校验：拿不到主窗口（None）时**不覆盖**已有
+    绑定；required=True 直接报错，False 只告警（自愈/收尾等允许继续的场景）。
+    """
     try:
         w = _get_manager(exporter).backend.rebind_window()
-        if w is not None:
-            exporter.window = w
     except Exception as e:
-        dprint(f"⚠️ 重绑窗口失败: {e}")
+        if required:
+            raise Exception(f"重绑主窗口失败（UIA 读取异常）：{e}")
+        dprint(f"⚠️ 重绑窗口异常（保留旧绑定）: {e}")
+        return None
+    if w is None:
+        msg = "未找到【剪映专业版】主窗口（保留旧绑定，不用搜索条件冒充窗口）"
+        if required:
+            raise Exception(f"[window_missing] 重绑主窗口失败：{msg}")
+        dprint(f"⚠️ {msg}")
+        return None
+    exporter.window = w
+    return w
 
 
 def _presets_jianying_dir():
@@ -159,25 +201,24 @@ def _mtime(path):
 
 
 def _preflight_media(draft_name):
-    """导出预检：把草稿引用的音视频源文件逐个 ffprobe 一遍，提前暴露损坏/缺失素材。
+    """导出预检：把草稿引用的音视频源文件逐个校验，提前暴露损坏/缺失素材。
 
     剪映遇到坏素材会弹「导出文件缺失/损坏 10011」并卡在 0%，肉眼难查；
     这里在动剪映之前就校验完，返回 (可解码数量, [(路径, 原因), ...])。
+    fail-closed：ffprobe 缺失只降级「解码检查」，文件存在性/大小检查恒执行，
+    缺失素材不会被带进剪映。
     """
     import json
     import concurrent.futures as futures
 
-    root = os.environ.get("JY_PROJECTS_ROOT", "").strip() or os.path.join(
-        os.environ.get("LOCALAPPDATA", ""), "JianyingPro", "User Data",
-        "Projects", "com.lveditor.draft")
+    root = get_projects_root()
     content = os.path.join(root, draft_name, "draft_content.json")
     if not os.path.isfile(content):
         raise Exception(f"素材预检无法读取内容文件: {content}")
 
     ffprobe = _find_ffprobe()
     if not ffprobe:
-        dprint("⚠️ 未找到 ffprobe，跳过素材预检（损坏素材仍可能导致导出卡死）")
-        return 0, []
+        dprint("⚠️ 未找到 ffprobe：仅校验文件存在性/大小，跳过解码检查")
 
     with open(content, encoding="utf-8") as f:
         data = json.load(f)
@@ -197,6 +238,8 @@ def _preflight_media(draft_name):
             return (p, "文件不存在")
         if os.path.getsize(p) < 1024:
             return (p, "文件过小/空文件")
+        if not ffprobe:
+            return None
         try:
             r = subprocess.run(
                 [ffprobe, "-v", "error", "-show_entries", "format=duration",
@@ -223,12 +266,21 @@ def _preflight_media(draft_name):
 # ========== 进度可见性（进度文件 + 定时 toast + 任务流程记录） ==========
 _last_progress_write = [0.0]
 _last_progress_toast = [0.0]
+# 进度采样（只留最近 60s）：用于算 MB/s；分片合并/改名导致体积回零时自动重置基线
+_PROGRESS_SAMPLES = []
+# 通知两条机制并存：时间驱动每 300s 一条 + 里程碑 25%/50%/75% 各一条（同档不重复）；
+# 里程碑估算不出百分比时直接跳过不弹（宁可少报，也不发假百分比）
+_PROGRESS_TOAST_EVERY_S = 300.0
+_PROGRESS_TOAST_AT = (25, 50, 75)
+_PROGRESS_TOASTED = set()
 
 # 本次任务上下文 + 主流程记录：全部写进 <output>.progress.json
 # 查进度时先看这个 json：status/stage/attempt/flow/errors 就能还原整个任务
 _TASK = {"draft": None, "output": None, "move": False, "attempt": 1, "attempts_max": 1,
          "status": "running", "stage": None, "start_time": None, "expected_duration": None,
          "real_file": None, "errors": [],
+         # 预期成品体积（上一版成品 size，任务启动时采样一次）；拿不到为 None
+         "expected_bytes": None, "total_source": None,
          "phase": None, "failure_class": None, "recovery_action": None}
 _FLOW = []
 _PREFLIGHT_DONE = [False]
@@ -250,15 +302,243 @@ def _flush_task(done=False, final_file=None, duration=None, cover=None):
                     done=done, final_file=final_file, duration=duration, cover=cover)
 
 
+def _archived_exports(output_path, limit=5):
+    """同目录历史归档成品 [(版号, 尺寸)]，v1 最新；供预期体积回退。"""
+    if not output_path:
+        return []
+    stem, ext = os.path.splitext(os.path.abspath(output_path))
+    out = []
+    for n in range(1, limit + 1):
+        p = f"{stem}.v{n}{ext}"
+        try:
+            if os.path.isfile(p):
+                size = os.path.getsize(p)
+                if size > 0:
+                    out.append((n, size))
+        except OSError:
+            continue
+    return out
+
+
+_CALIB_FILE = os.path.join(_PIPE_DIR, "_export_calibration.json")
+_CALIB_KEEP = 30      # 每个分辨率键保留最近样本数
+_CALIB_MIN = 1        # 同分辨率样本达到该数量就用自校准码率（体积/时长与编码速度无关，一条即可信）
+
+
+def _draft_canvas_key(draft_name):
+    """草稿画布尺寸 "1080x1920"，作为自校准样本的分组键（导出分辨率≈画布）。
+
+    canvas_config 是 draft_content.json 的第一个字段，只读文件头 64KB；
+    整份文件动辄几十 MB，全量解析太贵。
+    """
+    if not draft_name:
+        return "unknown"
+    try:
+        p = os.path.join(get_projects_root(), draft_name, "draft_content.json")
+        with open(p, encoding="utf-8-sig", errors="ignore") as f:
+            head = f.read(65536)
+    except Exception:
+        return "unknown"
+    m = re.search(r'"canvas_config"\s*:\s*\{([^{}]*)\}', head)
+    if not m:
+        return "unknown"
+    w = re.search(r'"width"\s*:\s*(\d+)', m.group(1))
+    h = re.search(r'"height"\s*:\s*(\d+)', m.group(1))
+    return f"{w.group(1)}x{h.group(1)}" if (w and h) else "unknown"
+
+
+def _load_calibration():
+    try:
+        with open(_CALIB_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _calibrated_bytes_per_sec(draft_name):
+    """同分辨率历史导出的 bytes/s 中位数；样本不足返回 (None, 已有样本数)。"""
+    key = _draft_canvas_key(draft_name)
+    if key == "unknown":
+        return None, 0
+    vals = []
+    for s in (_load_calibration().get("samples") or []):
+        try:
+            if s.get("key") == key:
+                v = float(s.get("bytes_per_s") or 0)
+                if v > 0:
+                    vals.append(v)
+        except (TypeError, ValueError):
+            continue
+    vals = vals[-_CALIB_KEEP:]
+    if len(vals) < _CALIB_MIN:
+        return None, len(vals)
+    vals.sort()
+    mid = len(vals) // 2
+    return (vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0), len(vals)
+
+
+def _record_calibration(draft_name, duration_s, size_bytes):
+    """成品落盘后记一条「分辨率/时长/体积」样本：下次首次导出就有真实码率基准。"""
+    try:
+        duration_s = float(duration_s or 0)
+        size_bytes = int(size_bytes or 0)
+    except (TypeError, ValueError):
+        return
+    if duration_s <= 0 or size_bytes <= 0:
+        return
+    key = _draft_canvas_key(draft_name)
+    if key == "unknown":
+        return
+    groups = {}
+    for s in (_load_calibration().get("samples") or []):
+        if isinstance(s, dict) and s.get("key"):
+            groups.setdefault(s["key"], []).append(s)
+    groups.setdefault(key, []).append({
+        "key": key, "duration_s": round(duration_s, 1),
+        "mb": round(size_bytes / 1048576.0, 1),
+        "bytes_per_s": round(size_bytes / duration_s, 1),
+        "draft": draft_name,
+        "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    samples = []
+    for arr in groups.values():
+        samples.extend(arr[-_CALIB_KEEP:])
+    try:
+        tmp = _CALIB_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"samples": samples}, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, _CALIB_FILE)
+    except OSError:
+        pass
+
+
+def _expected_export_bytes(output_path, expected_duration=None, draft_name=None):
+    """预期成品体积（字节, 来源）：上一版成品 > 归档副本 > 上次完成记录 > 时长估算。
+
+    上一版成品就是 job.json → video.outputs[].size_bytes 记的那个文件本身（同一个数），
+    直接量文件即可，不为导出链新增 job 目录依赖。同版本重跑前旧成品会被改名成
+    `<stem>.v1.mp4`（archive_stale_outputs），输出路径上就没有旧文件了；归档副本
+    就在同目录、体积同样可靠，所以排在第二优先。都拿不到返回 (None, "无估算")。
+    """
+    try:
+        if output_path and os.path.isfile(output_path):
+            size = os.path.getsize(output_path)
+            if size > 0:
+                return size, "上一版成品"
+    except OSError:
+        pass
+    for n, size in _archived_exports(output_path):
+        return size, f"归档副本 .v{n}"
+    # 上次完成时的进度记录（只认 done，避免把本次运行中的半成品 MB 当总量）
+    try:
+        final_path, side_path = _progress_paths(output_path)
+        for p in (final_path, side_path):
+            if not os.path.isfile(p):
+                continue
+            with open(p, encoding="utf-8") as f:
+                rec = json.load(f)
+            if not rec.get("done"):
+                continue
+            mb = rec.get("final_mb") or rec.get("exported_mb")
+            if mb and float(mb) > 0:
+                return float(mb) * 1048576, "上次进度记录"
+    except Exception:
+        pass
+    # 同系列其它账号的成品（_a/_b/_c 只换预设层，时长一致）：体积最接近的估算源。
+    # 重导同一条时上一版已删、也没有归档，靠这条兜住，避免长期「无估算」拿不到百分比。
+    try:
+        bundle = os.path.dirname(os.path.abspath(output_path))
+        base = os.path.basename(bundle)
+        root = os.path.dirname(bundle)
+        stem = re.sub(r"_[a-z]$", "", base)
+        for name in sorted(os.listdir(root)):
+            if name == base or not re.fullmatch(re.escape(stem) + r"(_[a-z])?", name):
+                continue
+            p = os.path.join(root, name, name + ".mp4")
+            if os.path.isfile(p):
+                size = os.path.getsize(p)
+                if size > 0:
+                    return size, f"同系列成品 {name}"
+    except OSError:
+        pass
+    if expected_duration and expected_duration > 0:
+        # 首次导出：优先用同分辨率历史成品算出的真实码率（自校准），再退经验常数
+        bps, n = _calibrated_bytes_per_sec(draft_name)
+        if bps:
+            return expected_duration * bps, f"自校准码率（同分辨率 {n} 次样本）"
+        est = expected_duration * _EST_BYTES_PER_SEC
+        if est > 0:
+            return est, "时长估算"
+    return None, "无估算"
+
+
+def _progress_rate_mbps(size, now, window=60.0):
+    """最近 window 秒的平均写入速率（MB/s）；体积回落（分片→正式文件）时重置基线。"""
+    if size <= 0:
+        return None
+    if _PROGRESS_SAMPLES and size < _PROGRESS_SAMPLES[-1][1]:
+        _PROGRESS_SAMPLES.clear()
+    _PROGRESS_SAMPLES.append((now, size))
+    cutoff = now - window
+    while len(_PROGRESS_SAMPLES) > 2 and _PROGRESS_SAMPLES[0][0] < cutoff:
+        _PROGRESS_SAMPLES.pop(0)
+    base_t, base_size = _PROGRESS_SAMPLES[0]
+    dt = now - base_t
+    if dt < 5 or size <= base_size:
+        return None
+    return (size - base_size) / 1048576.0 / dt
+
+
+def _progress_snapshot(real_export_file, expected_duration=None):
+    """统一进度口径：复用体积采样与 `_TASK["expected_bytes"]`，不另起一套数据源。"""
+    size = _export_progress_size(real_export_file)
+    total = _TASK.get("expected_bytes")
+    pct = min(99, int(size / total * 100)) if (total and total > 0 and size > 0) else None
+    rate = _progress_rate_mbps(size, time.time())
+    eta_s = None
+    if pct is not None and rate and rate > 0 and total > size:
+        eta_s = int((total - size) / 1048576.0 / rate)
+    return {"size": size, "total": total, "percent": pct, "rate": rate, "eta_s": eta_s}
+
+
+def _fmt_progress(snap):
+    """`4.2/8.7 GB（48%）约剩 12 分钟`；算不出来时明确写「无估算」，绝不留空。
+
+    尾段索引一次性写入会让速度失真，所以剩余时间一律标「约」，不装精确。
+    """
+    size_gb = snap["size"] / 1073741824
+    if not snap.get("total"):
+        return f"{size_gb:.1f} GB（无估算）"
+    total_gb = snap["total"] / 1073741824
+    if snap.get("percent") is None:
+        return f"{size_gb:.1f}/{total_gb:.1f} GB（无估算）"
+    text = f"{size_gb:.1f}/{total_gb:.1f} GB（{snap['percent']}%）"
+    if snap.get("eta_s") is not None:
+        text += f" 约剩 {max(1, int(round(snap['eta_s'] / 60)))} 分钟"
+    return text
+
+
 def _estimate_percent(real_export_file, expected_duration):
-    """体积估算百分比（封顶 99%）；无法估算时返回 None。"""
-    if not expected_duration or expected_duration <= 0:
-        return None
-    est_total = expected_duration * _EST_BYTES_PER_SEC
-    if est_total <= 0:
-        return None
-    cur = _export_progress_size(real_export_file)
-    return f"约 {min(99, int(cur / est_total * 100))}%"
+    """体积估算百分比（封顶 99%）；无法估算时返回「无估算」，不再返回空值。"""
+    snap = _progress_snapshot(real_export_file, expected_duration)
+    return "无估算" if snap["percent"] is None else f"约 {snap['percent']}%"
+
+
+def _progress_toast_due(snap):
+    """跨过 25%/50%/75% 各通知一次；百分比算不出来时不通知（不发假百分比）。"""
+    pct = snap.get("percent")
+    crossed = [th for th in _PROGRESS_TOAST_AT
+               if pct is not None and pct >= th and th not in _PROGRESS_TOASTED]
+    if not crossed:
+        return False
+    _PROGRESS_TOASTED.update(crossed)  # 一次跨多档（如 20%→60%）只弹一条
+    return True
+
+
+def _progress_toast_text(draft_name, snap, output_path):
+    """通知正文：草稿名 + 体积/百分比/约剩时间 + 成品路径。"""
+    return f"{draft_name}  {_fmt_progress(snap)}\n{output_path}"
 
 
 def _progress_paths(output_path):
@@ -275,14 +555,28 @@ def _progress_paths(output_path):
 
 
 def _write_progress(output_path, real_export_file, expected_duration, start_time,
-                    done=False, final_file=None, duration=None, cover=None):
+                    done=False, final_file=None, duration=None, cover=None, snap=None):
     """任务进度 + 主流程 json，关键节点即时刷新。
 
     运行中写同级 `<剧名>.progress.json`，完成时改写到剧名目录内并与 mp4/封面同目录。
+    进度口径统一走 `_progress_snapshot`（体积/预期总量/速率一次算），不另造一套。
     """
     import json
     if not output_path:
         return
+    # 草稿不存在时一律不落盘：测试/探测用假草稿跑导出，不应在真实导出根留下
+    # `__fake__.progress.json` 这类残留（导出结果仍由退出码/日志上报）。
+    _draft = _TASK.get("draft")
+    if _draft:
+        try:
+            if not os.path.isfile(os.path.join(get_projects_root(), _draft,
+                                               "draft_content.json")):
+                return
+        except Exception:
+            # 草稿根解析失败（ConfigError 等）时同样不落盘，导出结果仍由退出码上报
+            return
+    if snap is None:
+        snap = _progress_snapshot(real_export_file, expected_duration)
     rec = {
         "task": "剪映导出",
         "draft": _TASK.get("draft"),
@@ -293,9 +587,14 @@ def _write_progress(output_path, real_export_file, expected_duration, start_time
         "attempt": _TASK.get("attempt"),
         "attempts_max": _TASK.get("attempts_max"),
         "done": done,
-        "exported_mb": round(_export_progress_size(real_export_file) / 1048576, 1),
+        "exported_mb": round(snap["size"] / 1048576, 1),
+        "total_mb": round(snap["total"] / 1048576, 1) if snap.get("total") else None,
+        "total_source": _TASK.get("total_source"),
         "elapsed_s": int(time.time() - start_time) if start_time else 0,
-        "percent": _estimate_percent(real_export_file, expected_duration),
+        "percent": "无估算" if snap.get("percent") is None else f"约 {snap['percent']}%",
+        "percent_value": snap.get("percent"),
+        "rate_mbps": round(snap["rate"], 1) if snap.get("rate") else None,
+        "eta_s": snap.get("eta_s"),
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "flow": list(_FLOW),
         "errors": list(_TASK.get("errors") or []),
@@ -391,49 +690,104 @@ def _find_export_in_dir(search_dir, safe_name, min_mtime=None):
     return newest
 
 
+# 最近一次探测里被吞掉的异常原因：用于把「激活超时 / 窗口缺失」带到最终报错，
+# 不再让所有打开草稿失败都只剩一句「超时/卡死」。
+_LAST_PROBE_ERROR = [None]
+
+
 def _poll_with_timeout(fn, timeout):
     """在 daemon 线程里执行一次 UI 探测，超时判定为失败。
 
     剪映假死时 UIA 调用会无限阻塞（实测：名义 60s 的等待循环实挂 41 分钟），
     所以每次探测必须有独立的墙钟上限；daemon 线程不阻塞进程退出。
+    探测内抛出的异常记录到 _LAST_PROBE_ERROR，供调用方区分失败原因。
     """
     result = {}
 
     def _runner():
         try:
             result["value"] = fn()
-        except Exception:
-            pass
+        except Exception as e:
+            result["error"] = e
+            # 线程可能在 join 超时后才抛错，这里立刻记下原因，下一次轮询就能看到
+            # （实测：SetActive 的 10s 超时晚于 8s 轮询上限，不在线程内记就丢原因）。
+            _LAST_PROBE_ERROR[0] = str(e) or None
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
     t.join(timeout)
     if t.is_alive() or "value" not in result:
+        err = result.get("error")
+        if err is not None:
+            _LAST_PROBE_ERROR[0] = str(err) or None
+        # 线程还在跑时不抹掉已记录的原因：假死时异常要 10s 才抛出，
+        # 8s 的轮询上限会先到，清掉就丢失"激活超时"这一关键分类。
         return False, None
+    _LAST_PROBE_ERROR[0] = None
     return True, result["value"]
 
 
-def _cold_start_jianying(exporter, wait_home=jy_instance.HOME_READY_TIMEOUT_S):
-    """冷启动剪映（第 2 项：薄封装转调实例管理器 restart，唯一 kill 入口）。
-
-    每部剧导出前执行，避开"上一部刚导完 / 进程刚拉起"时窗口存在但 UI 未就绪
-    （此时 open_draft 会假死在草稿查找或加载阶段）。管理器内部全程墙钟 deadline，
-    杀进程 → 拉起 → 等首页；无法定位安装路径时抛含「冷启动失败」关键词的异常。
-
-    wait_home 默认 180s（第 1 条稳定性修复）：窗口已出现但 HomePage 尚未渲染完时
-    视为"继续等待"，不再按旧默认 90s 提前判失败。
-    """
-    dprint("冷启动剪映：交由实例管理器（杀进程→拉起→等首页，唯一 kill 入口）...")
-    _flow("冷启动剪映：管理器 restart")
+def _proc_alive(exporter):
+    """剪映进程是否仍存活。探测异常按 True（宁可继续等，也不因 psutil 抖动误判死亡）。"""
     try:
-        ok = _get_manager(exporter).restart(wait_home)
-    except jy_instance.JyInstanceError as e:
-        raise Exception(f"冷启动失败：{e}")
-    _rebind_from_manager(exporter)
-    if ok:
-        dprint("✅ 剪映冷启动完成，已停在首页")
-    else:
-        dprint("⚠️ 冷启动未在限定时间内看到首页，继续尝试打开草稿（open_draft 有墙钟上限）")
+        return bool(_get_manager(exporter).backend.process_running())
+    except Exception:
+        return True
+
+
+def _died_during_open_error(phase, elapsed):
+    """构造可被 failure_class 归为 launch_failed 的快速失败异常。"""
+    return Exception(
+        f"[launch_failed:died_during_open alive={elapsed:.1f}s attempt=0 env_check=0] "
+        f"{phase}期间剪映进程退出")
+
+
+def _wait_edit_page(exporter, editor_s, *, alive_fn=None, now_fn=time.time,
+                    sleep_fn=time.sleep, poll_fn=None):
+    """等编辑页：墙钟内轮询 UIA，但进程一消失立刻判拉起失败（不再把墙钟耗满）。
+
+    剪映可能拉起成功后活约 118s 自退（died_late）；旧实现只按墙钟空等到
+    editor_s（约 210s）才报“打开草稿超时”。这里每轮先判进程存活，进程没了
+    立即抛 [launch_failed:died_during_open]，由 failure_class → watcher 跨轮重拉
+    （重拉前 manager.launch 会先枚举进程，存活则只重连，绝不双开）。
+
+    返回进入编辑页的耗时（秒）；进程存活但墙钟耗尽仍抛原“打开草稿超时”，
+    并带上最后一次探测的具体原因（窗口缺失 / 激活超时），不再一律归成 ui_hang。
+    """
+    alive_fn = alive_fn or (lambda: _proc_alive(exporter))
+    capture_error = poll_fn is None
+    if poll_fn is None:
+        def _default_poll():
+            def _probe():
+                exporter.connect(retry=False)
+                return exporter.is_edit_page()
+            return _poll_with_timeout(_probe, timeout=8)
+        poll_fn = _default_poll
+
+    start = now_fn()
+    activate_failures = 0
+    while now_fn() - start < editor_s:
+        sleep_fn(1)
+        if not alive_fn():
+            raise _died_during_open_error("等待编辑页", now_fn() - start)
+        ok, is_edit = poll_fn()
+        if ok and is_edit:
+            elapsed = now_fn() - start
+            sleep_fn(3)  # 额外等待渲染完成
+            return elapsed
+        # 窗口在但连续两次激活超时：继续轮询只会重复同一个 10s 超时。
+        # 只容忍一次，避免把"加载大草稿时短暂无响应"误判成假死。
+        err = _LAST_PROBE_ERROR[0] if capture_error else None
+        if err and "[window_activate_timeout]" in err:
+            activate_failures += 1
+            if activate_failures >= 2:
+                raise Exception(
+                    err + "（打开草稿失败：窗口在但不可交互，疑似 UI 假死）")
+        else:
+            activate_failures = 0
+    detail = _LAST_PROBE_ERROR[0]
+    prefix = f"{detail} " if detail else ""
+    raise Exception(prefix + "打开草稿超时，未能进入编辑界面。请确认是否手动干预或程序卡死。")
 
 
 class ControlFinder:
@@ -469,10 +823,13 @@ class ControlFinder:
 # ========== 3. 导出控制器 ==========
 
 class Exporter:
-    def __init__(self):
+    def __init__(self, auto_connect=True):
         self.window = None
         self._setup_dpi()
-        self.connect()
+        # auto_connect=False 供 --cold-start：先判冷启动、kill→launch，再连接窗口。
+        # 否则构造时就 connect() 抢跑拉起一次，冷机变成"拉起→立刻杀→再拉起"。
+        if auto_connect:
+            self.connect()
 
     def _setup_dpi(self):
         """强制开启高 DPI 感知"""
@@ -533,29 +890,46 @@ class Exporter:
                 self.window = export_win
             else:
                 if retry:
-                    # 第 2 项：启动统一经实例管理器（墙钟 deadline + 探测线程超时）
-                    dprint("未找到【剪映专业版】，交由实例管理器启动...")
+                    mgr = _get_manager(self)
+                    # 找窗口/拉起这件事同样只走实例管理器的统一判定：
+                    # 能交互的首页就复用，进程在但假死就重启，不再各自维护默认值。
+                    dprint("未找到【剪映专业版】，交由实例管理器判定（复用/拉起/重启）...")
                     try:
-                        ok = _get_manager(self).launch(timeout=60)
+                        ok = mgr.ensure_for_export()
                     except jy_instance.JyInstanceError as e:
-                        raise Exception(f"无法自动启动【剪映专业版】：{e}")
-                    _rebind_from_manager(self)
+                        raise Exception(f"[window_missing] 无法自动启动【剪映专业版】：{e}")
                     if ok:
-                        dprint("程序已启动。")
+                        # 就绪才重绑；拿不到主窗口在这里就明确失败，
+                        # 不再像旧实现那样先塞一个搜索条件、之后白等 10s。
+                        _rebind_from_manager(self)
+                        dprint("程序已就绪。")
                         return
-                    raise Exception("无法自动启动【剪映专业版】，请手动启动后重试。")
+                    # 给上层一个可判别的标记：只有"拉起本身 died/timeout"才进跨轮重拉，
+                    # 其余启动失败仍按原 UI 假死退避处理。
+                    out = getattr(mgr, "last_outcome", None)
+                    tag = ""
+                    if out is not None and getattr(out, "outcome", "") in (
+                            "died", "died_late", "died_after_ready", "timeout"):
+                        tag = (f"[launch_failed:{out.outcome} alive={out.alive_s:.1f}s "
+                               f"attempt={out.attempt} "
+                               f"env_check={int(bool(out.env_check_seen))}] ")
+                    raise Exception(tag + "[window_missing] 无法自动启动【剪映专业版】，"
+                                    "请手动启动后重试。")
                 else:
-                    raise Exception("未找到【剪映专业版】窗口，请确保它已启动。")
-        
-        # 2. 激活窗口
+                    raise Exception("[window_missing] 未找到【剪映专业版】窗口，请确保它已启动。")
+
+        # 2. 激活窗口：激活失败不是"警告"，而是"窗口在但不可交互"的明确信号。
+        #    旧实现把它降级成 warning 继续跑，后续所有失败都被误报成 ui_hang，
+        #    这也是本次排查被误导的直接原因。这里按独立类别上报。
         try:
-            if self.window.Exists(0):
-                self.window.SetActive()
-                self.window.SetTopmost(True) # 临时置顶确保不被遮挡
-                time.sleep(0.2)
-                self.window.SetTopmost(False)
+            self.window.SetActive()
+            self.window.SetTopmost(True) # 临时置顶确保不被遮挡
+            time.sleep(0.2)
+            self.window.SetTopmost(False)
         except Exception as e:
-            dprint(f"窗口激活警告: {e}")
+            raise Exception(
+                f"[window_activate_timeout] 已找到【剪映专业版】窗口但激活失败"
+                f"（窗口在但不可交互，疑似 UI 假死）：{e}")
 
     def dismiss_blocking_dialogs(self):
         """尝试关闭可能阻挡界面的弹窗 (如环境检测、媒体丢失、版本更新等)"""
@@ -584,10 +958,22 @@ class Exporter:
             except: pass
 
     def is_home_page(self):
-        return "HomePage" in self.window.ClassName
+        """首页是否「真能用」：与实例管理器同一判据（ClassName + 可交互控件）。
+
+        旧实现只看 ClassName：UI 假死时类名仍是 HomePage_QMLTYPE_*，自愈据此
+        判定"已在首页，无需软关"而 skip 掉重启，三次重试都在复用卡死实例。
+        """
+        try:
+            return bool(_get_manager(self).backend.is_home())
+        except Exception:
+            return False
 
     def is_edit_page(self):
-        return "MainWindow" in self.window.ClassName
+        """是否在编辑页。窗口缺失/解析异常一律 False，不裸等 10s 搜索超时。"""
+        try:
+            return "MainWindow" in (self.window.ClassName or "")
+        except Exception:
+            return False
 
     def switch_to_home(self):
         """从编辑页返回首页（第 2 项：薄封装转调实例管理器 go_home）。
@@ -652,6 +1038,8 @@ class Exporter:
         dprint(f"打开草稿墙钟：找卡片 {find_s:.0f}s / 等编辑页 {editor_s:.0f}s")
         attempt = 0
         while time.time() - find_start < find_s:
+            if not _proc_alive(self):
+                raise _died_during_open_error("查找草稿", time.time() - find_start)
             attempt += 1
             ok, found = _poll_with_timeout(_find_card, timeout=10)
             if ok and found and found[0] is not None:
@@ -681,22 +1069,11 @@ class Exporter:
         # 剪映首页草稿通常在点击后会有短暂的“正在打开”状态
         draft_card.Click(simulateMove=False)
         
-        # 等待加载编辑页（墙钟按草稿规模放宽；每次 UIA 探测另有 8s 超时，避免假死时无限挂起）
+        # 等待加载编辑页（墙钟按草稿规模放宽；每次 UIA 探测另有 8s 超时）
+        # 进程退出立即判拉起失败，不再把墙钟空耗满（died_late 止血层）。
         dprint("正在加载编辑器 (可能需要较长时间)...")
-        load_start = time.time()
-        while time.time() - load_start < editor_s:
-            time.sleep(1)
-            def _poll_edit_page():
-                self.connect(retry=False)
-                return self.is_edit_page()
-
-            ok, is_edit = _poll_with_timeout(_poll_edit_page, timeout=8)
-            if ok and is_edit:
-                dprint(f"成功进入编辑页 (耗时 {int(time.time() - load_start)}s)。")
-                # 额外等待渲染完成
-                time.sleep(3)
-                return
-        raise Exception("打开草稿超时，未能进入编辑界面。请确认是否手动干预或程序卡死。")
+        elapsed = _wait_edit_page(self, editor_s)
+        dprint(f"成功进入编辑页 (耗时 {int(elapsed)}s)。")
 
     def export(self, output_path, draft_name, resolution="1080P", framerate=None,
                expected_duration=None, move_output=False):
@@ -883,17 +1260,25 @@ class Exporter:
                     f"导出卡死：产物 {stall_limit}s 无增长（{last_size/1048576:.1f}MB）: {real_export_file}")
             time.sleep(2)
 
-            # 进度可见性：每 30s 写进度文件（output_path.progress.json），每 5 分钟 toast 一次
+            # 进度可见性：每 30s 写进度文件 + 日志一行（体积/百分比/速率，不等通知也能查）；
+            # 通知：时间驱动 300s 一条 + 跨 25%/50%/75% 各一条；无百分比时跳过里程碑
             now = time.time()
+            snap = _progress_snapshot(real_export_file, expected_duration)
             if now - _last_progress_write[0] >= 30:
                 _last_progress_write[0] = now
                 _write_progress(output_path, real_export_file, expected_duration,
-                                start_time, done=False)
-            if now - _last_progress_toast[0] >= 300:
+                                start_time, done=False, snap=snap)
+                rate_txt = f"  {snap['rate']:.1f} MB/s" if snap.get("rate") else ""
+                skip_txt = ("" if snap.get("percent") is not None
+                            else "  （无百分比估算，跳过 25/50/75 里程碑通知）")
+                dprint(f"📤 导出进度 {_fmt_progress(snap)}{rate_txt}{skip_txt}")
+            text = _progress_toast_text(draft_name, snap, output_path)
+            if _progress_toast_due(snap):
+                _last_progress_toast[0] = now  # 刚发过里程碑，不紧接着重复一条定时通知
+                _toast_safe("📤 导出进行中", text)
+            elif now - _last_progress_toast[0] >= _PROGRESS_TOAST_EVERY_S:
                 _last_progress_toast[0] = now
-                pct = _estimate_percent(real_export_file, expected_duration)
-                _toast_safe("📤 导出进行中",
-                            f"{draft_name}  {pct}" if pct else f"{draft_name}（体积估算不可用）")
+                _toast_safe("📤 导出进行中", text)
 
         if not completed:
             raise Exception("导出超时或未检测到完成状态。")
@@ -971,6 +1356,8 @@ class Exporter:
                 raise Exception(f"成品时长 {dur:.1f}s 异常偏长（草稿 {expected_duration:.1f}s），"
                                 f"疑似草稿/导出内容不符")
         _flow(f"成品校验通过：时长 {dur:.1f}s，音轨=有")
+        # 自校准：把「真实时长 + 成品体积」沉淀成该分辨率的码率样本，供下次首导估总量
+        _record_calibration(draft_name, dur, os.path.getsize(found_file))
 
         # 9. 搬运开关：默认保留剪映原生结构（同名文件夹内含 mp4+封面），开启后才搬到目标路径
         if move_output:
@@ -1117,7 +1504,9 @@ def _do_recovery(action, exporter=None):
     实际动作写入 _TASK["recovery_action"] → progress sidecar + 日志行，供追溯/统计。
     """
     try:
-        exporter = exporter or Exporter()
+        # auto_connect=False：自愈本身就是要处理"窗口/UI 有问题"的状态，构造时再
+        # connect() 会先把激活超时抛出来，导致自愈根本没机会重启卡死实例。
+        exporter = exporter or Exporter(auto_connect=False)
     except Exception as e:
         dprint(f"⚠️ 自愈实例创建失败（仍将继续重试）: {e}")
         _TASK["recovery_action"] = "none"
@@ -1127,7 +1516,8 @@ def _do_recovery(action, exporter=None):
         if action == "kill_retry":
             dprint("自愈动作：kill_restart（强制杀进程 → 拉起 → 等首页）")
             _get_manager(exporter).restart(jy_instance.HOME_READY_TIMEOUT_S)
-            _rebind_from_manager(exporter)
+            # 自愈场景允许拿不到主窗口：只告警、保留旧绑定，由后续重试继续判定。
+            _rebind_from_manager(exporter, required=False)
             executed = "kill_restart"
         elif action == "dismiss_retry":
             dprint("自愈动作：dismiss（先关阻挡弹窗，再做就绪判断）")
@@ -1139,18 +1529,20 @@ def _do_recovery(action, exporter=None):
             # 就绪判断：墙钟上限，软关优先且不重启；到期未就绪则当轮升级强杀
             ready = mgr.go_home(timeout=40, allow_restart=False)
             if ready:
-                _rebind_from_manager(exporter)
+                _rebind_from_manager(exporter, required=False)
                 executed = "dismiss"
             else:
                 dprint("⚠️ 关闭弹窗后仍未就绪，当轮升级强杀重启（dismiss_then_kill）")
                 mgr.restart(jy_instance.HOME_READY_TIMEOUT_S)
-                _rebind_from_manager(exporter)
+                _rebind_from_manager(exporter, required=False)
                 executed = "dismiss_then_kill"
         else:
             # restart / unknown：先判窗口类，再决定软关还是强杀（第 2 条稳定性修复）
             kind = _window_kind(exporter)
             if kind == "home":
-                dprint("自愈动作：skip（已在首页，无需软关）")
+                # is_home_page 已含交互性校验：能走到这里说明首页真能用，
+                # 不是"ClassName=HomePage 的假死壳"。
+                dprint("自愈动作：skip（首页可交互，无需软关/重启）")
                 executed = "none"
             elif kind == "edit":
                 dprint("自愈动作：soft_home（当前在编辑页，点关闭按钮回首页）")
@@ -1159,7 +1551,7 @@ def _do_recovery(action, exporter=None):
             else:
                 dprint(f"自愈动作：kill_restart（窗口类={kind}，非编辑页/首页，跳过盲目软关）")
                 _get_manager(exporter).restart(jy_instance.HOME_READY_TIMEOUT_S)
-                _rebind_from_manager(exporter)
+                _rebind_from_manager(exporter, required=False)
                 executed = "kill_restart"
     except Exception as e2:
         dprint(f"⚠️ 自愈恢复失败（仍将继续重试）: {e2}")
@@ -1416,7 +1808,8 @@ def _restart_jianying_to_home(exporter):
     except jy_instance.JyInstanceError as e:
         dprint(f"⚠️ 重启失败（不影响导出结果）: {e}")
         return
-    _rebind_from_manager(exporter)
+    # 收尾步骤：重启后窗口可能仍在启动中，拿不到主窗口只告警，不影响导出结果。
+    _rebind_from_manager(exporter, required=False)
     if ok:
         dprint("✅ 剪映已重启并回到首页")
     else:
@@ -1424,14 +1817,24 @@ def _restart_jianying_to_home(exporter):
 
 
 def _find_draft_dir(draft_name):
-    """定位剪映草稿目录（JY_PROJECTS_ROOT 优先，其次 %LOCALAPPDATA% 默认位置）。"""
-    root = os.environ.get("JY_PROJECTS_ROOT", "").strip() or os.path.join(
-        os.environ.get("LOCALAPPDATA", ""),
-        "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+    """定位剪映草稿目录（统一草稿根解析：环境变量 > presets.json > 自动探测 > 默认）。"""
+    root = get_projects_root()
     candidate = os.path.join(root, draft_name)
     if os.path.isdir(candidate):
         return candidate
     return None
+
+
+def _draft_material_ids(d):
+    """draft_content.materials 下所有素材 id 集合（串流恢复的前置条件之一）。"""
+    ids = set()
+    for lst in (d.get("materials") or {}).values():
+        if not isinstance(lst, list):
+            continue
+        for m in lst:
+            if isinstance(m, dict) and m.get("id"):
+                ids.add(str(m["id"]))
+    return ids
 
 
 def _restore_streams_from_backup(draft_name):
@@ -1441,6 +1844,12 @@ def _restore_streams_from_backup(draft_name):
     （"串流视频"优化），合并时丢失 crop 后的 source_timerange.duration，
     导致音画不同步。pipeline 发布时会在草稿目录写一份 _pipeline_backup.json，
     本函数在打开草稿前比对，如果发现 video/audio 轨段数骤降则恢复。
+
+    恢复门槛：duration 与素材 id 集合必须同时相等才允许覆盖 live。段数骤降只说明
+    「像被合并」，若 duration 或素材集合已变，备份对应的不是当前这份时间线，
+    覆盖会把别的内容写回去，所以宁可跳过并说明原因。
+    写回统一走 draft_io.write_draft_content（writer=stream_restore），
+    让 E1 认这次写入、不被误判成 externally_modified；不变量失败必须上抛。
     """
     import json
     draft_dir = _find_draft_dir(draft_name)
@@ -1460,6 +1869,20 @@ def _restore_streams_from_backup(draft_name):
         dprint(f"⚠️ 读取草稿/备份失败: {e}")
         return False
 
+    # 恢复门槛：duration 与素材 id 集合必须同时相等，任一不满足就跳过并说明原因
+    cur_duration = int(cur.get("duration") or 0)
+    bak_duration = int(bak.get("duration") or 0)
+    cur_ids = _draft_material_ids(cur)
+    bak_ids = _draft_material_ids(bak)
+    if cur_duration != bak_duration or cur_ids != bak_ids:
+        ids_desc = "相等" if cur_ids == bak_ids else (
+            f"不等（仅当前 {len(cur_ids - bak_ids)} 个、仅备份 {len(bak_ids - cur_ids)} 个）")
+        dprint(
+            f"⚠️ 跳过串流恢复：duration 当前={cur_duration} 备份={bak_duration}"
+            f"（{'相等' if cur_duration == bak_duration else '不等'}），"
+            f"素材 id 集合 {ids_desc}；需 duration 与素材 id 集合同时相等才允许备份覆盖 live")
+        return False
+
     def _seg_counts(d):
         cnts = {}
         for t in d.get("tracks", []):
@@ -1471,7 +1894,11 @@ def _restore_streams_from_backup(draft_name):
     bak_cnt = _seg_counts(bak)
     needs_restore = False
     for k in bak_cnt:
-        if cur_cnt.get(k, 0) < bak_cnt[k] / 2:  # 骤降 >50% 认为被合并
+        # 段数 + 总时长双指标：时长相等已在内容门槛校验过，这里只判段数。
+        # 剪映 5.9 的合并不一定是"腰斩"，部分合并（如 117→70）同样会丢
+        # source_timerange，所以只要段数变少就触发恢复；内容门槛保证备份
+        # 对得上当前时间线（duration 与素材 id 集合都相等）。
+        if cur_cnt.get(k, 0) < bak_cnt[k]:
             needs_restore = True
             break
 
@@ -1499,7 +1926,7 @@ def _restore_streams_from_backup(draft_name):
             if bi < len(bak_tracks_by_type[ttype]):
                 cur_n = len(t.get("segments") or [])
                 bak_n = len(bak_tracks_by_type[ttype][bi].get("segments") or [])
-                if cur_n < bak_n / 2:
+                if cur_n < bak_n:
                     new_tracks.append(bak_tracks_by_type[ttype][bi])
                     restored += 1
                 else:
@@ -1511,32 +1938,63 @@ def _restore_streams_from_backup(draft_name):
             new_tracks.append(t)
     cur["tracks"] = new_tracks
 
-    # 写前备份当前草稿（保留一份 .before_restore.bak），备份失败则不恢复，避免改坏草稿
-    try:
-        shutil.copy2(content_path, content_path + ".before_restore.bak")
-    except OSError as e:
-        dprint(f"⚠️ 恢复前备份失败，保守起见跳过恢复: {e}")
-        return False
-
-    with open(content_path, "w", encoding="utf-8") as f:
-        json.dump(cur, f, ensure_ascii=False)
+    # 写回统一走 draft_io：不变量断言 → .before_restore.bak 备份 → 原子替换 → E1 留痕。
+    # DraftInvariantError 不在这里捕获，必须上抛（调用方也不得降级成继续导出）。
+    draft_io.write_draft_content(
+        cur, content_path, writer="stream_restore",
+        backup_suffix=".before_restore.bak")
     dprint(f"🛡️ 草稿轨道已恢复: {restored} 条轨 从备份还原，"
            f"当前 video/audio segments: {_seg_counts(cur)}")
     return True
 
 
+def _restore_streams_before_export(draft_name):
+    """导出前恢复检查的包装：草稿不变量失败必须上抛，其它异常只告警继续导出。"""
+    try:
+        return _restore_streams_from_backup(draft_name)
+    except draft_io.DraftInvariantError:
+        raise
+    except Exception as e:
+        dprint(f"⚠️ 恢复检查失败（继续导出）: {e}")
+        _flow(f"导出前轨道检查失败（继续导出）: {e}")
+        return False
+
+
 def run(draft_name, output_path, move_output=False, expected_duration=None,
         keep_open=False, fallback_dir=None, cold_start=False, resolution=None):
+    # 进度上下文每次任务重来：采样/已通知档位清零；预期总量在导出开始前采样一次
+    # （旧成品此刻还在原地，量到的就是上一版 size，等价于 job outputs 里那个数）
+    _PROGRESS_SAMPLES.clear()
+    _PROGRESS_TOASTED.clear()
+    _last_progress_write[0] = 0.0
+    total_bytes, total_source = _expected_export_bytes(output_path, expected_duration,
+                                                       draft_name)
     _TASK.update(draft=draft_name, output=output_path, move=move_output,
                  status="running", stage="准备", start_time=time.time(),
-                 expected_duration=expected_duration, real_file=None)
+                 expected_duration=expected_duration, real_file=None,
+                 expected_bytes=total_bytes, total_source=total_source)
+    _last_progress_toast[0] = _TASK["start_time"]  # 定时通知从任务开始计时（首次 300s）
+    dprint(f"进度口径：预期成品 {total_bytes/1073741824:.2f} GB（{total_source}）"
+           if total_bytes else "进度口径：无预期成品体积，百分比将显示「无估算」")
     dprint(f"任务: 导出【{draft_name}】 -> {output_path}（搬运={'开' if move_output else '关'}）")
     _flow(f"任务启动：导出【{draft_name}】→ {output_path}（搬运={'开' if move_output else '关'}，"
           f"最多 {_TASK['attempts_max']} 次尝试）")
 
-    # 1. 素材预检：源文件逐个 ffprobe，坏素材在启动剪映之前就报出来（不进重试）
+    # 1. 预检：先卡剪映版本，再验素材；两者都在启动剪映之前，不进重试。
+    #    只有两项都通过才置 _PREFLIGHT_DONE——预检失败时下一轮会重跑预检，
+    #    不会因为提前置位而跳过检查直接启剪映。
     if not _PREFLIGHT_DONE[0]:
-        _PREFLIGHT_DONE[0] = True
+        _TASK["stage"] = "环境预检"
+        try:
+            _jy_exe = jl.resolve_jianying_exe(log_fn=dprint)
+        except jl.JianyingLaunchError as exc:
+            msg = f"剪映版本预检不通过（仅支持 {jl.REQUIRED_JY_VERSION}）：{exc}"
+            _TASK["errors"].append(msg)
+            _TASK["stage"] = "环境预检失败"
+            _flow(msg)
+            raise Exception(msg)
+        dprint(f"✅ 剪映版本预检通过: {_jy_exe}")
+
         _TASK["stage"] = "素材预检"
         ok_n, problems = _preflight_media(draft_name)
         if problems:
@@ -1549,33 +2007,29 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
             _TASK["stage"] = "素材预检失败"
             _flow(f"素材预检不通过：{len(problems)} 个源文件损坏（{brief}{tail}）")
             raise Exception(f"素材预检不通过：{len(problems)} 个源文件损坏或缺失（{brief}{tail}）")
-        dprint(f"✅ 素材预检通过: {ok_n} 个源文件均可解码")
-        _flow(f"素材预检通过：{ok_n} 个源文件均可正常解码")
+        dprint(f"✅ 素材预检通过: {ok_n} 个源文件（缺失/损坏=0）")
+        _flow(f"素材预检通过：{ok_n} 个源文件通过校验")
+        _PREFLIGHT_DONE[0] = True
 
-    exporter = Exporter()
-
-    # 2. 确保在首页：--cold-start 时先冷启动（每部剧一次，避开"刚导完上一部"的
-    #    窗口存在但未就绪状态）；否则按原逻辑切回首页
+    # 2. 确保实例可用：三个入口（watcher / series_runner / 直调本脚本）都只表达
+    #    意图，是否复用、是否干净重启由实例管理器的唯一口径判定；复用前提是
+    #    "首页真能用"（能枚举到可交互控件），假死实例一律重启，不再带病复用。
     _TASK["phase"] = "cold_start"
-    if cold_start:
-        _cold_start_jianying(exporter)
-        try:
-            exporter.connect(retry=False)
-        except Exception as e:
-            dprint(f"⚠️ 冷启动后绑定窗口失败（open_draft 会再尝试）: {e}")
-    elif exporter.is_edit_page():
-        dprint("检测到在编辑页，将尝试先导出当前草稿（如果名字匹配）或切回首页")
-        # 这里简单处理：切回首页重来，确保状态一致
-        exporter.switch_to_home()
+    exporter = Exporter(auto_connect=False)
+    try:
+        ok = _get_manager(exporter).ensure_for_export(force_clean=cold_start)
+    except jy_instance.JyInstanceError as e:
+        raise Exception(f"冷启动失败：{e}")
+    if not ok:
+        raise Exception("冷启动失败：剪映未能停在可交互首页")
+    _rebind_from_manager(exporter)
+    dprint("✅ 实例就绪（可交互首页），开始导出流程")
+    _flow("实例就绪：可交互首页（复用/重启由管理器判定）")
 
     # 3. 导出前修复：剪映可能在 pipeline 发布后打开过草稿，
     # 自动合并串流 video segments 导致 crop 元数据丢失 → 音画不同步
-    try:
-        restored = _restore_streams_from_backup(draft_name)
-        _flow("导出前轨道检查：已从备份恢复串流片段" if restored else "导出前轨道检查：轨道正常，无需恢复")
-    except Exception as e:
-        dprint(f"⚠️ 恢复检查失败（继续导出）: {e}")
-        _flow(f"导出前轨道检查失败（继续导出）: {e}")
+    restored = _restore_streams_before_export(draft_name)
+    _flow("导出前轨道检查：已从备份恢复串流片段" if restored else "导出前轨道检查：轨道正常，无需恢复")
 
     # 2. 打开草稿
     _TASK["stage"] = "打开草稿"
@@ -1607,18 +2061,38 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
         else:
             raise
 
-    # 4. 收尾：回首页（优选关闭编辑页，失败自动重启兜底）。导出成功后界面停在编辑页/导出视图，
-    #    看起来像"卡死在导出界面"；失败不影响导出结果（成品已落盘校验）。
+    # 4. 收尾：先回首页把草稿关掉，再决定是否保留实例。
+    #    keep_open（批内复用）：实例留着，但必须停在首页——下一份导出会直接在
+    #    同一个实例里打开新草稿，停在编辑页会把上一份状态带过去。
+    #    单份导出：回首页后 WM_CLOSE 关闭，保持"用完就关"。
+    #    回首页失败时关实例兜底，下一次导出重新拉起一个干净的。
+    #    失败都不影响导出结果（成品已落盘校验）。
+    home_ok = False
+    try:
+        exporter.switch_to_home()
+        home_ok = True
+    except Exception as e:
+        dprint(f"⚠️ 导出后回首页失败（不影响导出结果）: {e}")
     if not keep_open:
         try:
-            exporter.switch_to_home()
+            if _get_manager(exporter).shutdown():
+                dprint("✅ 剪映已正常关闭（WM_CLOSE），实例不再空转")
+            else:
+                dprint("⚠️ 剪映未能在时限内关闭（不影响导出结果）")
         except Exception as e:
-            dprint(f"⚠️ 导出后回首页失败（不影响导出结果）: {e}")
+            dprint(f"⚠️ 导出后关闭剪映失败（不影响导出结果）: {e}")
+    elif not home_ok:
+        try:
+            _get_manager(exporter).shutdown()
+            dprint("⚠️ 回首页失败，已关闭实例；下一份导出会重新拉起")
+        except Exception as e:
+            dprint(f"⚠️ 回首页失败且关闭实例失败，下一份可能受影响: {e}")
 
 def subtitle_gate(draft_name, roots=None):
     """缺字幕导出闸门：返回 cover_job 的缺字幕集号（空列表=放行）。
 
-    roots 为空时读 pipeline/presets.json 的 watch.roots；找不到 job.json 时返回 []
+    roots 为空时读 export_config.get_watch_roots()（series_root + watch.roots 额外根）；
+    找不到 job.json 时返回 []
     （独立手敲本脚本、无任务目录时不误拦）。与 series_runner._job_dir_for 同规则。
     """
     try:
@@ -1631,7 +2105,7 @@ def subtitle_gate(draft_name, roots=None):
             if _pipeline_dir not in sys.path:
                 sys.path.insert(0, _pipeline_dir)
             import export_config as pc
-            roots = pc.get_watch_config().get("roots") or []
+            roots = pc.get_watch_roots()
         except Exception:
             roots = []
     hits = []
@@ -1655,6 +2129,31 @@ def subtitle_gate(draft_name, roots=None):
     return jm.subtitle_missing(best[0])
 
 
+def _post_export_gate(draft_name, output_path, require_cover=True):
+    """直调本脚本的收尾守卫：无 job 上下文，只跑 4/5/6（三件套→质检→收尾证据）。
+
+    require_cover=False 表示本次没有 cover_job（如准入）：三件套只验 mp4 + progress，
+    封面缺失只记录不判失败；mp4 / progress 缺失仍照常失败。
+
+    前置三项守卫（reap / 配置覆盖 / 归档旧产物）需要 job 目录，直调没有落点，
+    这里**显式**打印跳过说明——静默略过会让排查误以为守卫已经跑过。
+    由 series_runner 拉起时（JY_GUARD_PARENT=1）不重复执行，守卫由父进程统一跑。
+    """
+    import export_guard as eg
+    print("[guard] 无 job 上下文，跳过 reap / 配置覆盖 / 归档旧产物")
+    mp4 = _TASK.get("real_file") or output_path
+    if not os.path.isfile(mp4):
+        mp4 = output_path
+    # done 进度固定写在 output_path 旁（--move 与否都一样），显式传进去
+    res = eg.gate_after_export(
+        draft_name, mp4, job_dir=None, started_at=_TASK.get("start_time"),
+        verify=True, verify_script=os.path.join(_REPO_ROOT, "pipeline", "verify_export.py"),
+        creationflags=_NO_WINDOW, progress_path=output_path + ".progress.json",
+        require_cover=require_cover,
+        log=lambda m: dprint(f"[guard] {m}"))
+    return res["ok"], res["brief"]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="剪映自动化导出工具")
     parser.add_argument("draft_name", help="草稿名称")
@@ -1670,9 +2169,13 @@ if __name__ == "__main__":
     parser.add_argument("--retries", type=int, default=2,
                         help="UI 类失败重试次数（默认 2，即共 3 次尝试；非 UI 错误不重试）")
     parser.add_argument("--cold-start", action="store_true",
-                        help="导出前冷启动剪映（杀进程→拉起→等首页），避免上一部刚导完时 UI 假死")
+                        help="显式强制干净启动（杀进程→拉起→等可交互首页）；"
+                             "默认由实例管理器判定复用还是重启")
     parser.add_argument("--resolution", default=None, choices=["480P", "720P", "1080P", "2K", "4K"],
                         help="导出分辨率（默认 None=沿用剪映当前值）")
+    parser.add_argument("--no-cover", action="store_true",
+                        help="本次无 cover_job：导出后门禁只校验 mp4 + progress，"
+                             "封面缺失仅记录不判失败（显式声明，不靠文件存在性推断）")
 
     args = parser.parse_args()
 
@@ -1697,6 +2200,12 @@ if __name__ == "__main__":
                 keep_open=args.keep_open, fallback_dir=args.fallback_dir,
                 cold_start=args.cold_start and attempt == 1,
                 resolution=args.resolution)
+            if os.environ.get("JY_GUARD_PARENT") != "1":
+                gate_ok, gate_brief = _post_export_gate(
+                    args.draft_name, args.output_path, require_cover=not args.no_cover)
+                if not gate_ok:
+                    print(f"⛔ 导出后校验未通过: {gate_brief}")
+                    sys.exit(3)
             sys.exit(0)
         except Exception as e:
             reason = str(e)

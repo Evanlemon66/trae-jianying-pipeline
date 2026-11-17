@@ -32,6 +32,7 @@ import export_state as es  # noqa: E402
 
 cw.toast = lambda *a, **k: None
 cw.pc.get_watch_config = lambda: {}   # 默认 edit_pause_after=3，避免受本机 presets 影响
+cw.pc.get_watch_roots = lambda: []    # 本机 series_root 未配置也不影响：用例只用显式 --job
 
 fails = []
 

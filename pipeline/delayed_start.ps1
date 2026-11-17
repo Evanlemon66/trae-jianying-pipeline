@@ -39,6 +39,7 @@ $repoRoot   = Split-Path -Parent $scriptDir
 $logDir     = Join-Path $repoRoot 'pipeline\_work'
 $logFile    = Join-Path $logDir 'delayed_start.log'
 $consoleLog = Join-Path $logDir 'watcher_console.log'
+$pauseFile  = Join-Path $logDir 'watcher.pause'
 $watcherPy  = Join-Path $repoRoot 'lib\cover_watch.py'
 
 # 隐藏本进程的控制台窗口（脚本要挂机 30 分钟以上，避免窗口长期留在桌面）
@@ -149,6 +150,15 @@ function Invoke-DelayedStart {
     $jobJson  = Join-Path $coverJob 'job.json'
     $ecPath   = Join-Path $coverJob 'export_config.json'
 
+    # 暂停哨兵：已暂停就直接退出，不占用进程挂机 30 分钟
+    if (Test-Path -LiteralPath $pauseFile) {
+        $reason = ''
+        try { $reason = (Get-Content -LiteralPath $pauseFile -Raw -Encoding UTF8).Trim() } catch { }
+        if ($reason) { $reason = '（原因: ' + $reason + '）' }
+        Write-Log ("已暂停: 发现 $pauseFile$reason，不写裁剪配置、不拉起 watcher")
+        return 0
+    }
+
     Write-Log ("进程启动: pid=" + $PID + " DelayMinutes=" + $DelayMinutes + " WaitMinutes=" + $WaitMinutes +
                " JobDir=" + $JobDir + " CutSeconds=" + $CutSeconds)
 
@@ -222,6 +232,10 @@ function Invoke-DelayedStart {
     }
 
     # 4) 启动前必须确认没有 watcher 在跑；有就跳过启动只记日志
+    if (Test-Path -LiteralPath $pauseFile) {
+        Write-Log ("已暂停: 发现 $pauseFile（等待期间被暂停），写入已完成但不拉起 watcher")
+        return 0
+    }
     $running = @(Get-WatcherProcesses)
     if ($running.Count -gt 0) {
         Write-Log ("watcher 已在运行: pid=" + $running[0].ProcessId + "（共 " + $running.Count +

@@ -1,5 +1,4 @@
 import sys, os, time, json
-sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, os.path.abspath(".trae/skills/jianying-editor/scripts"))
 sys.path.insert(0, os.path.abspath(".trae/skills/jianying-editor/examples"))
 
@@ -7,7 +6,8 @@ import pyautogui
 import uiautomation as uia
 
 COORDS_PATH = os.path.abspath("jianying_coords.json")
-DRAFT_ROOT = os.path.join(os.environ["LOCALAPPDATA"], "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+from export_config import get_projects_root
+DRAFT_ROOT = get_projects_root()
 
 def load_coords():
     with open(COORDS_PATH, "r", encoding="utf-8") as f:
@@ -49,7 +49,10 @@ def ensure_foreground():
     if not hwnd:
         hwnd = ctypes.windll.user32.FindWindowW(None, "剪映专业版")
     if hwnd:
-        ctypes.windll.user32.ShowWindow(hwnd, 9)
+        # 已最大化就不碰窗口状态；未最大化才 SW_MAXIMIZE。
+        # 不用 SW_RESTORE(9)：它会把最大化窗口按还原尺寸显示=取消最大化。
+        if not ctypes.windll.user32.IsZoomed(hwnd):
+            ctypes.windll.user32.ShowWindow(hwnd, 3)
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(0.5)
 

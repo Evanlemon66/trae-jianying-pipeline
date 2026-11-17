@@ -7,14 +7,12 @@ import os
 import re
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import vc_bridge  # noqa: E402
+from export_config import get_projects_root  # noqa: E402
 
-JY_DRAFT_ROOT = os.path.join(
-    os.environ.get("LOCALAPPDATA", ""), "JianyingPro", "User Data", "Projects", "com.lveditor.draft"
-)
+JY_DRAFT_ROOT = get_projects_root()
 
 
 def _episode_offsets(workdir):
@@ -113,4 +111,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     main()

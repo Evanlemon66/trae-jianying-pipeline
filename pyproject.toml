@@ -13,3 +13,10 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 "scripts/vendor/**" = ["ALL"]
 "assets/**" = ["ALL"]
+
+[tool.pytest.ini_options]
+# 测试依赖见 requirements-dev.txt；minversion 会在 pytest 版本过低时直接报错退出。
+minversion = "8.0"
+# 只收集 tests/ 下的用例：仓库内 pipeline_ui/pylibs 自带第三方测试，
+# 不属于本项目测试面，默认收集会引入大量无关用例与依赖。
+testpaths = ["tests"]

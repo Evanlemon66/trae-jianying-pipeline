@@ -24,6 +24,10 @@ For generic editing requests, always follow the "Quick Edit Runtime Template" an
 3.  **配乐选择**：
     - **简单演示使用默认音乐**。实际项目，应优先检索并推荐 `data/cloud_music_library.csv` 中的相关曲目，或根据视频主题（如“科技”、“温暖”）进行关键词过滤。
     - 询问用户：“我发现了几首符合主题的云端音乐，要不要试试？（如：`Illuminate` - 科技感）”。
+4.  **路径唯一入口**：素材根 / 导出根 / 归档根 / 依赖根一律经 `pipeline/export_config.py` 解析
+    （`resolve_paths()` 或 `validate_config()`）；优先级为环境变量 > `pipeline/presets.json` > 系统派生探测。
+    业务根（`series_root` / `export_dir` / `deps_root`）**没有字面量默认值**，未配置直接抛 `ConfigError`（fail-closed）。
+    脚本内禁止写死盘符路径、禁止自行拼 `watch.roots`；watcher 有效扫描根统一用 `get_watch_roots()`。
 
 ##  规则指南 (Rules)
 

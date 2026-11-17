@@ -149,6 +149,7 @@
   }
   .toc a:hover { color: var(--ink); border-left-color: var(--accent); }
   .toc a .n { font-family: var(--font-mono); color: var(--accent); margin-right: 8px; font-size: 0.78rem; }
+  .toc a.sub { padding-left: 28px; font-size: 0.79rem; }
 
   /* ---------- Sections ---------- */
   section { margin-bottom: 76px; scroll-margin-top: 24px; }
@@ -406,10 +407,13 @@
     </p>
     <dl class="hero-meta">
       <div><dt>SKILL 名称</dt><dd>drama-cover-builder</dd></div>
-      <div><dt>规范版本</dt><dd>标题 v4.1 / 封面 v2</dd></div>
+      <div><dt>手册版本</dt><dd>v1.1 · 2026-11-14</dd></div>
       <div><dt>阶段</dt><dd>3 Stage + 2b 兜底</dd></div>
       <div><dt>触发词</dt><dd>短剧封面 / 做封面 / 抽帧</dd></div>
     </dl>
+    <p class="hero-desc" style="margin-top:20px;font-size:0.88rem;">
+      口径：以 skill 包内实现为准（<code class="inline">SKILL.md</code> / <code class="inline">references/cover-spec.md</code> / <code class="inline">references/handoff-contract.md</code> / <code class="inline">scripts/drama_cover.py</code>）。
+    </p>
   </div>
 </header>
 
@@ -424,12 +428,21 @@
       <a href="#s04"><span class="n">04</span>Stage 1 标题生成</a>
       <a href="#s05"><span class="n">05</span>12 条矩阵与门禁</a>
       <a href="#s06"><span class="n">06</span>Stage 2 封面出图</a>
+      <a href="#vertical-integrity" class="sub">竖版元素完整性 P0</a>
       <a href="#s07"><span class="n">07</span>Stage 2b Pillow 兜底</a>
       <a href="#s08"><span class="n">08</span>Stage 3 写入草稿</a>
-      <a href="#s09"><span class="n">09</span>审核与字数三层规则</a>
-      <a href="#s10"><span class="n">10</span>命令与 API 速查</a>
-      <a href="#s11"><span class="n">11</span>能力拆分分析</a>
-      <a href="#s12"><span class="n">12</span>落地风险与改进</a>
+      <a href="#draft-io" class="sub">落盘原语 draft_io</a>
+      <a href="#version-cover-binding" class="sub">版本封面绑定</a>
+      <a href="#s09"><span class="n">09</span>与 pipeline 集成</a>
+      <a href="#covers-manifest" class="sub">封面台账 covers_manifest</a>
+      <a href="#version-resolution" class="sub">组数即版本数</a>
+      <a href="#export-gate" class="sub">导出闸门</a>
+      <a href="#s10"><span class="n">10</span>审核与字数三层规则</a>
+      <a href="#s11"><span class="n">11</span>命令与 API 速查</a>
+      <a href="#s12"><span class="n">12</span>能力拆分分析</a>
+      <a href="#s13"><span class="n">13</span>落地风险与改进</a>
+      <a href="#s14"><span class="n">14</span>常见问题</a>
+      <a href="#s15"><span class="n">15</span>修改记录</a>
     </nav>
 
     <main>
@@ -541,7 +554,9 @@ flowchart TD
             <thead><tr><th>文件</th><th>内容</th><th>何时必读</th></tr></thead>
             <tbody>
               <tr><td class="mono">references/title-spec.md</td><td>标题唯一执行标准（方案层 / 版本层 / 机制族 / 白名单 / 质检）</td><td>生成或改标题时</td></tr>
-              <tr><td class="mono">references/cover-spec.md</td><td>出图硬约束、三版构图、尺寸、质检门禁</td><td>进入 Stage 2 时</td></tr>
+              <tr><td class="mono">references/cover-spec.md</td><td>出图硬约束与构图规范（含两条 P0）、尺寸、质检门禁</td><td>进入 Stage 2 时</td></tr>
+              <tr><td class="mono">references/handoff-contract.md</td><td>job.json / covers_manifest / 版本封面绑定的唯一契约</td><td>走 cover_job / ingest / 多版本时</td></tr>
+              <tr><td class="mono">references/runbook-cover-8p.md</td><td>8 步封面生产 runbook（含质检清单）</td><td>按流程生产 / 交接时</td></tr>
               <tr><td class="mono">references/scorecard.md</td><td>七维评分、硬门槛、推荐标注、落选稿去向</td><td>12 条出稿后</td></tr>
               <tr><td class="mono">references/platform-rules.md</td><td>审核红线、平台规格、烧字字数档位</td><td>Stage 2 前 / 涉及平台标题</td></tr>
               <tr><td class="mono">references/failure-cases.md</td><td>失败模式、翻车记录、已验证台账、升级触发条件</td><td>每部剧收尾 / 季度复盘</td></tr>
@@ -767,6 +782,20 @@ flowchart TD
           <span class="tag">实现依赖说明</span>
           <p><code class="inline">cover-spec.md</code> 描述的是 <code class="inline">image_edit</code> 并行 4 请求、<code class="inline">/user-anchors/</code> 登记锚点、<code class="inline">design-cli</code> 写画布这一套流程。若当前宿主没有这些工具，Stage 2 实际会退到宿主自带的图像生成能力或 Stage 2b 兜底——两种路线不能混在同一批交付里。</p>
         </div>
+
+        <h3 id="vertical-integrity">6.3 竖版元素完整性（P0，整张作废）</h3>
+        <p>竖版与横版是同一套元素要求：人物、动物、关键道具、场景元素必须齐全完整。判定基准是<strong>竖版扣掉顶部标题占位后的安全画面区</strong>。出现以下任一情况即判不合格，<strong>整张作废重出，不进入评分</strong>：</p>
+
+        <div class="grid-3">
+          <div class="card"><h4>横版有、竖版没有</h4><p>竖幅裁切丢掉关键道具 / 人物 / 场景。</p></div>
+          <div class="card"><h4>元素被切边</h4><p>只露局部、外形不可辨认，等同于元素缺失。</p></div>
+          <div class="card"><h4>标题压主体</h4><p>顶部标题区压住动物头部或主体。</p></div>
+        </div>
+
+        <div class="callout warn">
+          <span class="tag">两条 P0 可同时命中</span>
+          <p>横版、竖版同标准；<strong>动物完整性</strong>（不得截断头 / 四肢 / 尾）是另一条独立 P0，两条可同时命中。出图后人工 / VLM 复核，不引入检测模型；原文见 <code class="inline">references/cover-spec.md</code> 的两条 P0 否决项。</p>
+        </div>
       </section>
 
       <!-- 07 -->
@@ -856,11 +885,96 @@ python scripts/drama_cover.py write-draft --cover cover.jpg --draft-dir "&lt;草
           <div class="card"><h4>字段</h4><p>顶层 <code class="inline">cover</code> 字段已写入，且 <code class="inline">materials.drafts</code> 里有对应 composition。</p></div>
           <div class="card"><h4>可打开</h4><p>草稿目录能被剪映 5.9 正常打开，不报素材丢失。</p></div>
         </div>
+
+        <h3 id="draft-io">落盘原语：<code class="inline">draft_io.write_draft_content</code></h3>
+        <p><code class="inline">write-draft</code> 不再自己 <code class="inline">json.dump</code>，草稿文件写入统一走 <code class="inline">pipeline/draft_io.py</code>（全仓唯一写盘点），顺序固定：</p>
+
+        <div class="grid-4">
+          <div class="card"><h4>① 不变量校验</h4><p>按帧比较 <code class="inline">source</code> 素材时长与片段目标时长，允许 1 帧取整误差，并递归校验内层草稿；超限抛 <code class="inline">DraftInvariantError</code>。</p></div>
+          <div class="card"><h4>② 备份</h4><p>默认写 <code class="inline">&lt;draft_content.json&gt;.coverbak_&lt;ts&gt;</code>。</p></div>
+          <div class="card"><h4>③ 原子替换</h4><p>先写临时文件再 <code class="inline">os.replace</code>，不会出现写一半的 JSON。</p></div>
+          <div class="card"><h4>④ 新鲜度留痕</h4><p>可选写 sidecar。</p></div>
+        </div>
+
+        <div class="callout warn">
+          <span class="tag">失败即拒绝</span>
+          <p>校验不过就<strong>拒绝落盘</strong>并打印原因，旧草稿保持可用、不留半成品。skill 包外运行时若找不到 <code class="inline">pipeline/draft_io.py</code>，<code class="inline">save_draft()</code> 直接报错，不会退回裸 <code class="inline">json.dump</code>。</p>
+        </div>
+
+        <h3 id="version-cover-binding">版本封面绑定（B/C 组）</h3>
+        <p>多版本时，每份草稿的 <code class="inline">draft_cover.jpg</code> 必须取<strong>本组</strong>竖版图：基础版 <code class="inline">04_covers/cover_04_vertical.*</code>，扩展版 <code class="inline">04_covers/&lt;组&gt;/cover_04_vertical_&lt;组&gt;.*</code>，统一由 <code class="inline">job_manifest.resolve_profile_cover()</code> 解析。</p>
+
+        <div class="grid-3">
+          <div class="card"><h4>本组有竖版图</h4><p>直接用它写入该份草稿的 <code class="inline">draft_cover.jpg</code>。</p></div>
+          <div class="card"><h4>本组缺图</h4><p><strong>不回退 A 组</strong>，改用本剧视频抽帧兜底，台账记 <code class="inline">cover.source=frame</code>。</p></div>
+          <div class="card"><h4>无视频可抽</h4><p><strong>硬失败</strong>，报出缺图的组与张数，不进入导出。</p></div>
+        </div>
       </section>
 
       <!-- 09 -->
       <section id="s09">
-        <div class="sec-head"><span class="sec-num">09</span><h2>审核与字数：三层规则</h2></div>
+        <div class="sec-head"><span class="sec-num">09</span><h2>与 pipeline 集成</h2></div>
+
+        <p class="lead">pipeline.py 启动时自动注入 skill 路径；封面来源三档优先级：skill 抽帧 → <code class="inline">--cover-image</code> → <code class="inline">detect_cover_from_dir()</code>。pipeline 只管消费、不关心来源；多版本时以 <code class="inline">covers_manifest</code> 与本组竖版图为准。</p>
+
+        <h3 id="covers-manifest">9.1 cover_job 封面台账 <code class="inline">04_covers/covers_manifest.json</code></h3>
+        <p>走完整链路（<code class="inline">cover_job</code> + <code class="inline">ingest</code>）时，封面不是散图，而是逐张登记进台账。每条只认这些字段：</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>字段</th><th>必填</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">group</td><td>是</td><td>组名 <code class="inline">a</code> / <code class="inline">b</code> / <code class="inline">c</code>…，与版本名一致</td></tr>
+              <tr><td class="mono">slot</td><td>是</td><td><code class="inline">1</code> / <code class="inline">2</code> / <code class="inline">3</code> / <code class="inline">vertical</code></td></tr>
+              <tr><td class="mono">file</td><td>是</td><td>相对 job 目录的路径</td></tr>
+              <tr><td class="mono">sha256</td><td>是</td><td>以磁盘实算为准；台账里已写的值与磁盘不一致即报错</td></tr>
+              <tr><td class="mono">bytes</td><td>是</td><td>文件字节数</td></tr>
+              <tr><td class="mono">variant_of</td><td>扩展组必填</td><td>指向真实存在的 A 组同槽源图；<strong>基础版必须为空</strong></td></tr>
+              <tr><td class="mono">variant_of_sha256</td><td>扩展组必填</td><td>源图 sha256，必须与磁盘一致</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p><code class="inline">size</code> / <code class="inline">title_id</code> / <code class="inline">crop</code> 为可选字段。台账由 <code class="inline">ingest</code>（<code class="inline">job_manifest.sync_covers_manifest</code>）按磁盘实图重建，<strong>不要手写</strong>。</p>
+
+        <div class="callout warn">
+          <span class="tag">阻断规则</span>
+          <p>扩展组源图缺失、sha 不匹配、基础版写了 <code class="inline">variant_of</code> 都算错误：2026-11-14 之后创建的 job 直接阻断 <code class="inline">ingest</code>；存量 job 只告警，可用 <code class="inline">--strict-manifest</code> / <code class="inline">--lenient-manifest</code> 覆盖。</p>
+        </div>
+
+        <h3 id="version-resolution">9.2 版本判定：组数即版本数</h3>
+        <p>先读 <code class="inline">job.json</code> 已声明的组（<code class="inline">titles.selected_groups[].group</code> → <code class="inline">prompts.items[].group</code> → <code class="inline">workflow.preset_profile</code>）；job 缺失或不完整，才回落到 <code class="inline">03_prompts/prompts.json</code> 的 <code class="inline">items[].group</code>。</p>
+
+        <div class="callout ok">
+          <span class="tag">判定来源留痕</span>
+          <p>判定来源（<code class="inline">job</code> / <code class="inline">job+prompts</code> / <code class="inline">prompts</code> / <code class="inline">default</code>）写进计划与 watcher 日志。</p>
+        </div>
+
+        <p>组按 A/B/C… 排序，<strong>组序即版本序</strong>（A → <code class="inline">presets_a</code>、B → <code class="inline">presets_b</code>），<strong>组数即版本数</strong>。某组缺 <code class="inline">presets_&lt;组&gt;</code> 只把该组标 blocked，基础版照常导出。</p>
+
+        <h3 id="export-gate">9.3 导出闸门</h3>
+        <p>导出前两道硬闸，任一不过都不导出：</p>
+
+        <div class="grid-2">
+          <div class="card">
+            <h4>① 剪辑闸门</h4>
+            <p>最近一次 edit 失败且未修复（<code class="inline">failed</code> / <code class="inline">paused</code> / 退避中 / 退避窗口已到但尚未重跑成功）一律不进导出；窗口已过且已有草稿时，本轮改为<strong>重跑剪辑</strong>，不拿旧草稿导出。</p>
+          </div>
+          <div class="card">
+            <h4>② 产物闸门</h4>
+            <p>导出进程返回成功，但三件套（<code class="inline">.mp4</code> / <code class="inline">-封面.jpg</code> / <code class="inline">.mp4.progress.json</code>）缺任一件，或质检不过，整单判失败（<code class="inline">failure_class=verify_failed</code>），不写 <code class="inline">video.outputs</code>、不算已导出。</p>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <span class="tag">宁可停在草稿</span>
+          <p>两道闸门都按“缺一即失败”处理：宁可停在草稿等重跑，也不产出对不上的成片。</p>
+        </div>
+      </section>
+
+      <!-- 10 -->
+      <section id="s10">
+        <div class="sec-head"><span class="sec-num">10</span><h2>审核与字数：三层规则</h2></div>
 
         <p class="lead">三层规则不可混用。A 层长期有效，B 层易变必须标核实日期，C 层是项目自定、可直接执行。</p>
 
@@ -903,9 +1017,9 @@ python scripts/drama_cover.py write-draft --cover cover.jpg --draft-dir "&lt;草
         </div>
       </section>
 
-      <!-- 10 -->
-      <section id="s10">
-        <div class="sec-head"><span class="sec-num">10</span><h2>命令与 API 速查</h2></div>
+      <!-- 11 -->
+      <section id="s11">
+        <div class="sec-head"><span class="sec-num">11</span><h2>命令与 API 速查</h2></div>
 
         <div class="table-wrap">
           <table>
@@ -957,9 +1071,9 @@ dc.set_cover_composition(draft_dict, draft_dir, "cover.jpg")</pre>
         </div>
       </section>
 
-      <!-- 11 -->
-      <section id="s11">
-        <div class="sec-head"><span class="sec-num">11</span><h2>能力拆分分析</h2></div>
+      <!-- 12 -->
+      <section id="s12">
+        <div class="sec-head"><span class="sec-num">12</span><h2>能力拆分分析</h2></div>
 
         <p class="lead">结论先说：<strong>不建议按阶段拆成多个独立 skill</strong>。应该保留一个“伞形” skill，把解耦做在<strong>能力层</strong>（Python 库 / 命令行），而不是切在<strong>对话入口层</strong>。</p>
 
@@ -971,7 +1085,7 @@ dc.set_cover_composition(draft_dict, draft_dir, "cover.jpg")</pre>
           <div class="badge">KEEP AS ONE</div>
         </div>
 
-        <h3>11.1 拆开后会立刻遇到的三个问题</h3>
+        <h3>12.1 拆开后会立刻遇到的三个问题</h3>
 
         <div class="grid-3">
           <div class="card">
@@ -1007,7 +1121,7 @@ flowchart TD
           <figcaption>图 2 · 按阶段垂直切分后，每一条边界都会新增一次状态交接</figcaption>
         </figure>
 
-        <h3>11.2 逐维度判断</h3>
+        <h3>12.2 逐维度判断</h3>
         <div class="table-wrap">
           <table>
             <thead><tr><th>维度</th><th>拆分的收益</th><th>拆分的成本</th><th>建议</th></tr></thead>
@@ -1023,7 +1137,7 @@ flowchart TD
           </table>
         </div>
 
-        <h3>11.3 什么情况下才值得拆</h3>
+        <h3>12.3 什么情况下才值得拆</h3>
         <p>不是永远不拆，而是要有明确触发条件。满足任意两条，再考虑拆分：</p>
         <div class="grid-2">
           <div class="card">
@@ -1044,7 +1158,7 @@ flowchart TD
           </div>
         </div>
 
-        <h3>11.4 现在更适合做的三处内部解耦</h3>
+        <h3>12.4 现在更适合做的三处内部解耦</h3>
         <div class="table-wrap">
           <table>
             <thead><tr><th>解耦点</th><th>做法</th><th>收益</th></tr></thead>
@@ -1062,9 +1176,9 @@ flowchart TD
         </div>
       </section>
 
-      <!-- 12 -->
-      <section id="s12">
-        <div class="sec-head"><span class="sec-num">12</span><h2>落地风险与改进建议</h2></div>
+      <!-- 13 -->
+      <section id="s13">
+        <div class="sec-head"><span class="sec-num">13</span><h2>落地风险与改进建议</h2></div>
 
         <p class="lead">以下是读代码与规范后发现的实际落差，按影响排序。不是规范设计问题，而是“文档写了、脚本没接上”的实现缺口。</p>
 
@@ -1109,6 +1223,40 @@ flowchart TD
         <div class="callout">
           <span class="tag">维护节奏</span>
           <p>每部剧收尾补记 5 行到 <code class="inline">failure-cases.md</code>；季度或满 5 部剧通读台账，按 §4 的四个触发条件判断是否启动 v5。没有数据支撑就不改规范。</p>
+        </div>
+      </section>
+
+      <!-- 14 -->
+      <section id="s14">
+        <div class="sec-head"><span class="sec-num">14</span><h2>常见问题</h2></div>
+
+        <h3 id="faq-manifest-sha"><code class="inline">covers_manifest.json</code> 报 sha256 / bytes 不一致怎么办？</h3>
+        <p>别手改台账。台账按磁盘实图重建：确认 <code class="inline">04_covers/</code> 下的图片没被替换或删除，然后重跑 <code class="inline">ingest</code>（必要时加 <code class="inline">--strict-manifest</code> 定位到具体 group / slot）。扩展组还要确认 <code class="inline">variant_of</code> 指向的 A 组源图仍在、sha 未变。</p>
+
+        <h3 id="faq-version-cover">B/C 版为什么没有沿用 A 版封面？</h3>
+        <p>契约要求版本封面各用各的。本组缺竖版图时改为视频抽帧兜底（台账 <code class="inline">cover.source=frame</code>），不回退 A 组；连可抽帧的视频都没有就直接失败，避免张冠李戴。</p>
+      </section>
+
+      <!-- 15 -->
+      <section id="s15">
+        <div class="sec-head"><span class="sec-num">15</span><h2>修改记录</h2></div>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>日期</th><th>版本</th><th>改动</th></tr></thead>
+            <tbody>
+              <tr>
+                <td class="mono">2026-11-14</td>
+                <td class="mono">v1.1</td>
+                <td>对齐 skill 当前实现：新增竖版元素完整性 P0、<code class="inline">covers_manifest</code> 字段收紧（group / slot / file / sha256 / bytes + <code class="inline">variant_of</code>）、B/C 缺竖版改抽帧兜底（<code class="inline">cover.source=frame</code>）、版本判定 job 优先 / prompts 兜底、<code class="inline">draft_io.write_draft_content</code> 落盘顺序、导出双闸门；本机路径改占位符。</td>
+              </tr>
+              <tr>
+                <td class="mono">2026-10-27</td>
+                <td class="mono">v1.0</td>
+                <td>按当时架构整理：skill 作为三阶段独立模块、标题规范 v3、Pillow 横版 2848×1600、write-draft 原生 composition、pipeline / batch_runner 接入。</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </section>
 

@@ -44,6 +44,25 @@ def _stub_export(monkeypatch, tmp_path, *, script_exists=True, lock_ok=True, tim
     return SimpleNamespace(acquire=acquire, release=release, rmtree=rmtree, remove=remove)
 
 
+def test_draft_duration_candidate_from_admission_config(monkeypatch, tmp_path):
+    """_draft_duration_s 的兜底候选来自 presets.json admission.draft_name，不再 import 常量。"""
+    name = 'cfg_draft'
+    d = tmp_path / name
+    d.mkdir()
+    (d / 'draft_content.json').write_text(
+        '{"duration": 12000000}', encoding='utf-8')
+    monkeypatch.setitem(sys.modules, 'ui_recognize_translate', SimpleNamespace(
+        DRAFT_ROOT=str(tmp_path), _active_draft_name=lambda: 'stale'))
+    monkeypatch.setitem(sys.modules, 'export_config', SimpleNamespace(
+        get_admission_config=lambda: {'draft_name': name}))
+    assert ui_pipeline._draft_duration_s() == 12.0
+
+    # 配置里没有 draft_name → 跳过该候选，不抛错
+    monkeypatch.setitem(sys.modules, 'export_config', SimpleNamespace(
+        get_admission_config=lambda: {}))
+    assert ui_pipeline._draft_duration_s() is None
+
+
 def test_missing_export_script_is_failure(monkeypatch, tmp_path):
     env = _stub_export(monkeypatch, tmp_path, script_exists=False)
     popen = Mock()

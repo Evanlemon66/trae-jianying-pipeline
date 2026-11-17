@@ -38,6 +38,25 @@ PUBLISH_DIRS = (
     "06_publish/receipts",
 )
 
+
+def prompt_groups(job_dir: str) -> list[str]:
+    """版本声明的唯一真源：03_prompts/prompts.json 的 items[].group（a 优先排序）。"""
+    pp = os.path.join(job_dir, "03_prompts", "prompts.json")
+    if not os.path.isfile(pp):
+        return []
+    try:
+        with open(pp, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    groups: set[str] = set()
+    for it in (data.get("items") or []):
+        g = str((it or {}).get("group") or "").strip().lower()
+        if re.fullmatch(r"[a-z][a-z0-9]{0,7}", g):
+            groups.add(g)
+    return sorted(groups, key=lambda g: (g != "a", g))
+
+
 # prepare 建剧时预建的完整目录集（含发布阶段占位目录）
 JOB_DIRS = BASE_DIRS + PUBLISH_DIRS
 
@@ -271,6 +290,21 @@ def default_cleanup() -> dict[str, Any]:
     }
 
 
+def _freshness_defaults() -> dict[str, Any]:
+    """产物新鲜度空骨架；freshness 模块缺失时退回最小结构（不影响主契约）。"""
+    try:
+        from freshness import default_freshness
+        return default_freshness()
+    except Exception:
+        return {
+            "schema": 1, "canon": "c1", "enabled": True, "ignore": [],
+            "edges": {"prompts_to_draft": {"state": "unknown"},
+                      "draft_to_video": {"state": "unknown"},
+                      "cover_to_draft": {"state": "unknown"}},
+            "manual_confirmed": {},
+        }
+
+
 def build_job(series: str, *, host: str = "trae") -> dict[str, Any]:
     stamp = datetime.now().astimezone()
     slug = sanitize_name(series)
@@ -320,6 +354,7 @@ def build_job(series: str, *, host: str = "trae") -> dict[str, Any]:
         # 派生结论：缺字幕集号清单（ASR 三档全失败/最终零字幕时写入，
         # 重新剪辑且字幕非空后移除），导出前硬拦依据，见 handoff-contract §2。
         "derived": {"subtitle_missing": []},
+        "freshness": _freshness_defaults(),
         "cleanup": default_cleanup(),
         "history": [],
     }
@@ -772,8 +807,10 @@ def validate_job(job: dict[str, Any], job_dir: Optional[str] = None) -> list[str
                 errors.append(f"标题提示词文件不存在: {prompt_file}")
 
     # 绝对路径白名单：video.export_dir / export_file 是 pipeline 的实际导出位置，
-    # 位于任务目录之外，必须允许绝对路径。
-    abs_ok = {("video", "export_dir"), ("video", "export_file")}
+    # 位于任务目录之外，必须允许绝对路径；last_edit_error 是错误摘要文本
+    # （可能以盘符路径开头），不是路径字段。
+    abs_ok = {("video", "export_dir"), ("video", "export_file"),
+              ("video", "last_edit_error")}
     for section in ("input", "titles", "prompts", "video", "cleanup"):
         for key, value in (job.get(section) or {}).items():
             if (section, key) in abs_ok:
@@ -813,6 +850,48 @@ def update_job(job_dir: str, patch: dict[str, Any], *,
     errors = validate_job(job, job_dir)
     if errors:
         raise ValueError("job.json 校验失败: " + "；".join(errors))
+    save_job(job, job_dir)
+    return job
+
+
+def record_edit_state(job_dir: str, *, state: str, rc: Optional[int] = None,
+                      error: Optional[str] = None,
+                      failure_class: Optional[str] = None,
+                      attempts: Optional[int] = None,
+                      consecutive_failures: Optional[int] = None,
+                      next_retry_at: Optional[str] = None) -> dict[str, Any]:
+    """把 edit 结果落进 job.json（video.edit_state / video.last_edit_error）。
+
+    与 update_job 的唯一差异：**不做 validate_job 硬校验**。edit 失败的典型原因
+    正是目录/文件不完整（validate 本来就不通过），而这里必须把 rc、状态、错误
+    摘要落账——否则调度侧只能从 watcher.log 的一行字猜，下一轮读不到 blocked
+    语义。job.json 仍只由本模块写：读 → 深合并 → revision+1 → history → 原子落盘。
+
+    next_retry_at 由调用方按 .edit_state.json 的 epoch 转成 ISO（本模块不读
+    edit_state，避免两个状态机互相依赖）。
+    """
+    entry = {
+        "state": str(state or "").strip() or "unknown",
+        "blocked": str(state or "").strip().lower() in ("retrying", "paused", "failed"),
+        "rc": rc,
+        "at": now_iso(),
+        "attempts": int(attempts or 0),
+        "consecutive_failures": int(consecutive_failures or 0),
+        "next_retry_at": next_retry_at,
+        "failure_class": failure_class,
+        "error": error,
+    }
+    patch = {"video": {
+        "edit_state": entry,
+        "last_edit_error": None if entry["state"] == "done" else error,
+    }}
+    job = load_job(os.path.join(job_dir, "job.json"))
+    _deep_merge(job, patch)
+    job["revision"] = int(job.get("revision", 1)) + 1
+    job.setdefault("history", []).append({
+        "at": now_iso(), "event": "edit_state",
+        "detail": f"{entry['state']}" + (f" rc={rc}" if rc is not None else ""),
+        "revision": job["revision"]})
     save_job(job, job_dir)
     return job
 
@@ -1881,6 +1960,51 @@ def record_video(job_dir: str, *, export_dir: Optional[str] = None,
     return update_job(job_dir, patch, event="video_recorded", detail=detail)
 
 
+def set_outputs_blocked(job_dir: str, entries: list[dict[str, Any]],
+                        *, all_profiles: Optional[list[str]] = None,
+                        dry_run: bool = False) -> list[str]:
+    """把缺 presets_<组> 的版本登记为可追溯的 blocked 状态（不阻断其余版本）。
+
+    entries: [{"profile": "b", "reason": "missing_presets", "missing": "presets_b"}]
+    all_profiles: 本次声明的全部版本；不在 entries 里的旧 blocked 条目会被清除
+                  （补齐 presets 后自动恢复为可导出）。
+    已 exported / cleaned 的版本永不覆盖。返回台账实际发生变化的版本名列表。
+    """
+    job = load_job(os.path.join(job_dir, "job.json"))
+    outputs = dict((job.get("video") or {}).get("outputs") or {})
+    blocked = {str(e.get("profile") or "").strip().lower(): e for e in entries or []
+               if str(e.get("profile") or "").strip()}
+    changed: list[str] = []
+    for prof, e in blocked.items():
+        prev = dict(outputs.get(prof) or {})
+        if str(prev.get("state") or "").lower() in ("exported", "cleaned"):
+            continue
+        new = {
+            "draft": prev.get("draft"),
+            "state": "blocked",
+            "reason": str(e.get("reason") or "missing_presets"),
+            "missing": str(e.get("missing") or f"presets_{prof}"),
+            "at": prev.get("at") if prev.get("state") == "blocked" else now_iso(),
+            "history": list(prev.get("history") or []),
+        }
+        if prev != new:
+            outputs[prof] = new
+            changed.append(prof)
+    for prof in all_profiles or []:
+        p = str(prof or "").strip().lower()
+        prev = dict(outputs.get(p) or {})
+        if p in blocked or str(prev.get("state") or "").lower() != "blocked":
+            continue
+        # 预设补齐：清掉过期 blocked 标记，让该版本重新参与调度
+        outputs.pop(p, None)
+        changed.append(p)
+    if not changed or dry_run:
+        return changed
+    update_job(job_dir, {"video": {"outputs": outputs}},
+               event="output_blocked", detail="；".join(changed))
+    return changed
+
+
 def _backfill_hashes_inplace(job: dict[str, Any], job_dir: str) -> list[str]:
     """在内存 job 上原位补算 null hash，返回补算字段列表（不落盘）。"""
     filled: list[str] = []
@@ -2196,6 +2320,43 @@ def detect_account_cover_sets(job_dir: str) -> dict[str, dict[Any, str]]:
     return sets
 
 
+def resolve_profile_cover(job_dir: str, profile: Any = None) -> Optional[str]:
+    """取某个预设组对应的竖版封面绝对路径（没有则 None）。
+
+    账号组目录（`04_covers/b_group`、`04_covers/b` 等）优先；A 组/未指定组回落到
+    `job.vertical_cover`，再回落到 04_covers 根目录的契约竖版图。
+    用途：克隆/重建某版本草稿时，封面必须跟着版本走，不能沿用源草稿的封面。
+    """
+    key = str(profile or "").strip().lower()
+    if key.startswith("presets_"):
+        key = key[len("presets_"):]
+    for suf in ("_group", "-group", "组"):
+        if key.endswith(suf):
+            key = key[: -len(suf)].strip("_-")
+            break
+
+    sets = detect_account_cover_sets(job_dir)
+    p = (sets.get(key) or {}).get("vertical") if key else None
+    if p and os.path.isfile(p):
+        return p
+    if key not in ("", "a", "base"):
+        # 非 A 组必须有自己组的竖版封面，绝不静默回落到 A 的图
+        return None
+
+    try:
+        job = load_job(os.path.join(job_dir, "job.json"))
+    except Exception:
+        job = {}
+    rel = (job.get("vertical_cover") or {}).get("file")
+    if rel:
+        p = os.path.join(job_dir, rel.replace("/", os.sep))
+        if os.path.isfile(p):
+            return p
+    found, _ = detect_cover_files(job_dir, apply=False)
+    p = found.get("vertical")
+    return p if p and os.path.isfile(p) else None
+
+
 def account_cover_errors(job_dir: str) -> list[str]:
     """账号封面组完整性：只要某账号的封面出现过，就必须 4 张齐全。
 
@@ -2208,6 +2369,178 @@ def account_cover_errors(job_dir: str) -> list[str]:
         if missing:
             errors.append(f"账号 {prof} 封面组不完整（缺 {'、'.join(missing)}）")
     return errors
+
+
+COVERS_MANIFEST_REL = "04_covers/covers_manifest.json"
+
+# 封面台账硬校验生效时间：此时间之后创建的 job 视为新 job，台账错误直接阻断；
+# 更早创建的 job（历史数据）只告警并继续，避免存量第一次 ingest 就被历史问题炸掉。
+# 需要临时改变判定时可用 `ingest --strict-manifest` / `--lenient-manifest` 覆盖。
+MANIFEST_STRICT_SINCE = "2026-11-14T00:00:00+08:00"
+
+
+def _manifest_strict(job: dict[str, Any]) -> bool:
+    """新 job → True（硬校验）；历史 job → False（告警继续）。"""
+    raw = job.get("created_at")
+    if not raw:
+        return False
+    try:
+        created = datetime.fromisoformat(str(raw))
+        cutoff = datetime.fromisoformat(MANIFEST_STRICT_SINCE)
+    except ValueError:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=cutoff.tzinfo)
+    return created >= cutoff
+
+
+def _manifest_fix_hint(err: str) -> str:
+    """把台账错误翻译成「怎么补」一句话，随告警一起打印。"""
+    if "variant_of 必须为空" in err:
+        return "删除该条台账的 variant_of 字段后重跑 ingest"
+    if "无对应文件" in err:
+        return "把 A 组同槽源图放回 04_covers，或改正 variant_of 指向后重跑 ingest"
+    if "sha256" in err:
+        return "确认换图无误后重跑 ingest 刷新台账（或恢复原图）"
+    if "解析失败" in err:
+        return "修复或删除 covers_manifest.json 后重跑 ingest"
+    return "修正后重跑 ingest"
+
+
+def _manifest_entries(data: Any) -> list[dict[str, Any]]:
+    """容错读取 covers_manifest：裸数组 / {"items":[]} / {"covers":[]}。"""
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in ("covers", "items"):
+            v = data.get(key)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+    return []
+
+
+def _resolve_cover_source(job_dir: str, ref: Any) -> Optional[str]:
+    """variant_of 溯源：支持 job 相对路径 / 04_covers 相对路径 / 契约 stem（按扩展名找）。"""
+    covers = os.path.join(job_dir, "04_covers")
+    r = str(ref or "").strip()
+    if not r:
+        return None
+    rel = r.replace("\\", os.sep).replace("/", os.sep)
+    for p in ((rel if os.path.isabs(rel) else os.path.join(job_dir, rel)),
+              os.path.join(covers, rel)):
+        if os.path.isfile(p):
+            return os.path.abspath(p)
+    stem = os.path.splitext(os.path.basename(rel))[0].lower()
+    if stem in _SLOT_OF_STEM:
+        for ext in sorted(IMAGE_EXTS):
+            p = os.path.join(covers, stem + ext)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def sync_covers_manifest(job_dir: str, *, apply: bool = True
+                         ) -> tuple[list[dict[str, Any]], list[str]]:
+    """把 04_covers 的实图同步成可执行的 covers_manifest 台账。
+
+    每条至少写 `group`、`slot`、`file`、`sha256`；扩展组（B/C…）另写
+    `variant_of`（指向真实存在的 A 组同槽源图）与 `variant_of_sha256`。
+    `sha256` 与源图 sha 均以磁盘实算为准：台账已写的值对不上即报错，绝不带病落盘。
+    返回 (entries, errors)；errors 非空时调用方必须硬失败。
+    """
+    covers = os.path.join(job_dir, "04_covers")
+    if not os.path.isdir(covers):
+        return [], []
+    base, _ = detect_cover_files(job_dir, apply=False)
+    groups: dict[str, dict[Any, str]] = {}
+    if base:
+        groups["a"] = dict(base)
+    for prof, slots in detect_account_cover_sets(job_dir).items():
+        if prof == "a":
+            groups.setdefault("a", {}).update(slots)
+        else:
+            groups[prof] = slots
+    if not groups:
+        return [], []
+
+    manifest_path = os.path.join(job_dir, COVERS_MANIFEST_REL)
+    original: Any = None
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8-sig") as f:
+                original = json.load(f)
+        except (OSError, ValueError) as e:
+            return [], [f"{COVERS_MANIFEST_REL} 解析失败：{e}"]
+    old: dict[tuple[str, Any], dict[str, Any]] = {}
+    for e in _manifest_entries(original):
+        g = str(e.get("group") or "").strip().lower()
+        s = str(e.get("slot") or "").strip().lower()
+        slot = "vertical" if s in ("4", "vertical", "v", "竖版") else (
+            int(s) if s in ("1", "2", "3") else s)
+        if g and slot:
+            old[(g, slot)] = e
+
+    errors: list[str] = []
+    entries: list[dict[str, Any]] = []
+    ordered = (["a"] if "a" in groups else []) + [
+        g for g in sorted(groups) if g != "a"]
+    for g in ordered:
+        for slot in CANONICAL_COVER_STEMS:
+            p = groups[g].get(slot)
+            if not p or not os.path.isfile(p):
+                continue
+            prev = old.get((g, slot)) or {}
+            rel = os.path.relpath(p, job_dir).replace(os.sep, "/")
+            actual = sha256_file(p)
+            tag = f"{g}/{slot}"
+            recorded = prev.get("sha256")
+            if recorded and recorded != actual:
+                errors.append(f"{tag}: sha256 与文件不一致（台账 {recorded[:12]}…，"
+                              f"实际 {actual[:12]}…）")
+            entry: dict[str, Any] = dict(prev)
+            entry.update({"group": g, "slot": slot, "file": rel,
+                          "sha256": actual, "bytes": os.path.getsize(p)})
+            dims = _image_size(p)
+            entry["size"] = list(dims) if dims else prev.get("size")
+            entry.setdefault("title_id", None)
+            entry.setdefault("crop", None)
+            if g == "a":
+                if prev.get("variant_of"):
+                    errors.append(f"{tag}: 基础版是源封面，variant_of 必须为空")
+                entry["variant_of"] = None
+                entry.pop("variant_of_sha256", None)
+            else:
+                src = _resolve_cover_source(job_dir, prev.get("variant_of")) or \
+                    base.get(slot) or \
+                    _resolve_cover_source(job_dir, CANONICAL_COVER_STEMS[slot])
+                if not src:
+                    errors.append(
+                        f"{tag}: 扩展组卷面必须能溯源到源封面，但 "
+                        f"variant_of={prev.get('variant_of')!r} 无对应文件"
+                        f"（也未找到 A 组 {CANONICAL_COVER_STEMS[slot]}）")
+                    continue
+                src_rel = os.path.relpath(src, job_dir).replace(os.sep, "/")
+                src_sha = sha256_file(src)
+                recorded_src = prev.get("variant_of_sha256")
+                if recorded_src and recorded_src != src_sha:
+                    errors.append(f"{tag}: 源图 sha256 对不上（台账 "
+                                  f"{recorded_src[:12]}…，实际 {src_sha[:12]}…）")
+                entry.update({"variant_of": src_rel,
+                              "variant_of_sha256": src_sha})
+            entries.append(entry)
+
+    if apply and entries:
+        if isinstance(original, dict):
+            key = "covers" if isinstance(original.get("covers"), list) else (
+                "items" if isinstance(original.get("items"), list) else "covers")
+            payload: Any = dict(original)
+            payload[key] = entries
+            payload["updated_at"] = now_iso()
+        else:
+            payload = entries
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    return entries, errors
 
 
 def detect_cover_files(job_dir: str, *, apply: bool = True) -> tuple[dict[Any, str], list[str]]:
@@ -2423,7 +2756,8 @@ def normalize_job_shape(job: dict[str, Any], job_dir: Optional[str] = None) -> l
     return notes
 
 
-def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
+def ingest_job(job_dir: str, *, dry_run: bool = False,
+               strict_manifest: Optional[bool] = None) -> dict[str, Any]:
     """Stage 2 收口：从落盘产物（prompts.json + 4 张契约图）重建 job.json。
 
     收登记、规范化（selected.slot 中文→数字）、补 hash、推进 stage（只进不退）。
@@ -2573,6 +2907,21 @@ def ingest_job(job_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
         _fill(job.setdefault("vertical_cover", {}), vp, "vertical")
     else:
         report["missing_covers"].append("vertical")
+
+    # ── 封面台账：group / slot / file / sha256 / variant_of(+源图 sha) 以磁盘实算为准
+    # 新 job 出错 → 硬失败；历史 job → 只告警并继续（告警写清缺什么、怎么补）。
+    strict = _manifest_strict(job) if strict_manifest is None else bool(strict_manifest)
+    manifest, manifest_errors = sync_covers_manifest(job_dir, apply=not dry_run)
+    report["covers_manifest"] = {"entries": len(manifest),
+                                 "errors": manifest_errors, "strict": strict}
+    if manifest_errors:
+        if strict:
+            raise ValueError("封面台账校验失败：" + "；".join(manifest_errors))
+        for err in manifest_errors:
+            warn = f"封面台账: {err}（补法：{_manifest_fix_hint(err)}）"
+            print(f"[warn] {warn}")
+            report.setdefault("warnings", []).append(warn)
+        report["covers_manifest"]["warnings"] = list(manifest_errors)
 
     # ── 参考图 hash（null 且文件在则补）
     inp = job.get("input") or {}
@@ -2924,6 +3273,10 @@ def _main(argv: Optional[list[str]] = None) -> int:
     p_ing = sub.add_parser("ingest", help="Stage 2 收口：收 prompts+covers、规范化、补 hash、推进 stage")
     p_ing.add_argument("--job", required=True)
     p_ing.add_argument("--dry-run", action="store_true")
+    p_ing.add_argument("--strict-manifest", action="store_true",
+                       help="强制封面台账硬校验（默认：新 job 硬校验、历史 job 告警）")
+    p_ing.add_argument("--lenient-manifest", action="store_true",
+                       help="强制封面台账只告警（用于历史数据迁移）")
 
     p_cut = sub.add_parser("set-cut", help="设置/清除导出裁剪秒数 video.cut_s（默认 null 不裁剪）")
     p_cut.add_argument("--job", required=True)
@@ -3079,7 +3432,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "ingest":
         try:
-            result = ingest_job(job_dir, dry_run=args.dry_run)
+            result = ingest_job(job_dir, dry_run=args.dry_run,
+                                strict_manifest=(True if args.strict_manifest else
+                                                 False if args.lenient_manifest else None))
         except (ValueError, FileNotFoundError, json.JSONDecodeError) as e:
             print(f"[FAIL] {e}")
             return 1

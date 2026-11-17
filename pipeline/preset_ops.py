@@ -40,6 +40,9 @@ from pipeline import (  # noqa: E402
     write_preset_manifest,
 )
 
+import job_manifest as jm  # noqa: E402  # 版本封面解析（与 ingest/契约共用一套组目录规则）
+from jy_cover import set_cover_composition, set_draft_cover  # noqa: E402
+
 LEGACY_PRESET_MATERIAL_PREFIX = "我的预设"
 
 
@@ -218,6 +221,70 @@ def _missing_media_paths(draft, limit=50):
     return out
 
 
+def _profile_key(preset_profile):
+    """预设组名归一：presets_b / b_group / B组 → b（与 resolve_profile_cover 同口径）。"""
+    key = preset_profile_name(preset_profile).strip().lower()
+    for suf in ("_group", "-group", "组"):
+        if key.endswith(suf):
+            key = key[:-len(suf)].strip("_-")
+            break
+    return key
+
+
+def _is_version_profile(preset_profile):
+    """是否为扩展版本组（B/C…）。A/基础版/未指定走源草稿封面。"""
+    return _profile_key(preset_profile) not in ("", "a", "base")
+
+
+def _freshness():
+    """产物新鲜度模块（best-effort；缺失不影响主流程）。"""
+    try:
+        _lib = os.path.join(os.path.dirname(_HERE), "lib")
+        if _lib not in sys.path:
+            sys.path.insert(0, _lib)
+        import freshness
+        return freshness
+    except Exception:
+        return None
+
+
+def _first_local_video(draft):
+    """源草稿主轨里第一个可抽帧的本地视频（按轨道/片段顺序，预设素材 path 为空会跳过）。"""
+    index = _material_index(draft)
+    for track in draft.get("tracks") or []:
+        if track.get("type") != "video":
+            continue
+        for seg in track.get("segments") or []:
+            entry = index.get(seg.get("material_id"))
+            if not entry:
+                continue
+            m = entry[1]
+            p = m.get("path")
+            if m.get("type") != "video" or not isinstance(p, str) or not p.strip():
+                continue
+            if os.path.isabs(p) and os.path.isfile(p):
+                return p
+    return None
+
+
+def _missing_group_cover_message(job_dir, group, video, reason=""):
+    """组封面缺失且抽帧失败时的硬失败消息：说清缺哪一组、哪几张、该补什么。"""
+    have = {}
+    if job_dir:
+        have = jm.detect_account_cover_sets(job_dir).get(group) or {}
+    labels = {1: "横版1", 2: "横版2", 3: "横版3", "vertical": "竖版"}
+    missing = [label for slot, label in labels.items() if slot not in have]
+    locate = (f"04_covers/{group}_group/cover_04_vertical_{group}.*" if job_dir
+              else "未定位到 cover_job，无法查找该组封面")
+    why = reason or ("源草稿主轨没有可直接抽帧的本地视频" if not video
+                     else f"从 {os.path.basename(video)} 抽帧失败")
+    return (
+        f"预设组 {group} 缺竖版封面，且无法抽帧兜底（{why}）：绝不沿用 A 版封面。\n"
+        f"  应补齐：{locate}\n"
+        f"  组内缺失：{'、'.join(missing) if missing else '竖版'}\n"
+        f"  处理：补齐该组 4 张封面后重试，或确认源草稿主轨视频可读后重跑。")
+
+
 def _read_stable_source(content_path, probes=4, interval=0.6):
     """读取源草稿，并确认读取窗口内剪映没有在写它。
 
@@ -253,11 +320,16 @@ def _read_stable_source(content_path, probes=4, interval=0.6):
 
 
 def clone_draft_with_presets(source, target_name=None, preset_profile=None,
-                             presets=None, overwrite=False):
+                             presets=None, overwrite=False, job_dir=None,
+                             cover_image=None, cover_fallback="abort"):
     """复制已剪辑草稿 → 剥离旧预设层 → 合并 preset_profile 的预设 → 发布为独立新草稿。
 
     presets 为 None 时按 preset_profile 从 presets.json 解析。
-    返回统计 dict。
+    版本封面：cover_image 显式优先；否则按 job_dir + preset_profile 从该组竖版封面
+    取图（B/C 组绝不沿用源草稿的 A 封面）；B/C 组缺组封面时默认用源草稿主轨视频抽帧
+    兜底并在台账记 cover.source=frame，无法抽帧则硬失败。
+    cover_fallback="source"：缺组封面时不做抽帧，直接复用源草稿封面
+    （台账记 cover.source=source_draft）。返回统计 dict。
     """
     src_dir, _src_content, src_name = _resolve_source(source)
     if presets is None:
@@ -352,18 +424,83 @@ def clone_draft_with_presets(source, target_name=None, preset_profile=None,
     if presets and not new_manifest["tracks"]:
         print("  ⚠️ 新预设合并后没有任何轨道，请检查预设内容是否为组合预设")
 
+    # 版本封面：克隆不会自动带封面（draft_cover 是目录级文件，A/B 会共用同一张），
+    # 必须按该组自己的竖版封面重写 composition + draft_cover.jpg。
+    # B/C 组缺组封面时绝不沿用源草稿（=A 版）的封面：先用源草稿主轨视频抽帧兜底
+    # （台账记 cover.source=frame，不冒充生成图）；连可抽帧的视频都没有就硬失败。
+    _profile = _profile_key(preset_profile)
+    cover_src = cover_image or (jm.resolve_profile_cover(job_dir, preset_profile)
+                                if job_dir else None)
+    cover_source = (("explicit" if cover_image else
+                     ("group" if _is_version_profile(preset_profile) else "base"))
+                    if cover_src else None)
+    cover_frame_video = None
+    cover_written = False
+    if not cover_src and _is_version_profile(preset_profile):
+        if cover_fallback == "source":
+            # 开关打开：组封面缺失时直接沿用源草稿封面（stage 是完整拷贝，无需重写）
+            cover_source = "source_draft"
+            cover_written = False
+            print(f"  ℹ️ 预设组 {_profile} 缺竖版封面：复用源草稿封面"
+                  "（cover.source=source_draft）")
+        else:
+            cover_frame_video = _first_local_video(draft)
+            frame_ok = False
+            if cover_frame_video:
+                try:
+                    frame_ok = set_draft_cover(stage_dir,
+                                               extract_from_video=cover_frame_video)
+                except Exception as e:  # ffmpeg 失败/无 ffmpeg 都落到下面的硬失败
+                    print(f"  ⚠️ 抽帧兜底失败: {e}")
+            if not frame_ok:
+                raise RuntimeError(_missing_group_cover_message(
+                    job_dir, _profile, cover_frame_video))
+            cover_src = os.path.join(stage_dir, "draft_cover.jpg")  # 抽帧已直接落盘
+            cover_source = "frame"
+            cover_written = True
+            print(f"  ⚠️ 预设组 {_profile} 缺竖版封面：已从 "
+                  f"{os.path.basename(cover_frame_video)} 抽帧兜底（cover.source=frame）")
+    elif not cover_src:
+        print("  ⚠️ 未指定扩展版本组（A/基础版）：沿用源草稿封面")
+    if cover_src:
+        set_cover_composition(draft, stage_dir, cover_src)
+
     now_us = int(time.time() * 1_000_000)
     draft["id"] = gen_uuid()
     draft["name"] = target_name
     draft["create_time"] = now_us
     draft["update_time"] = now_us
     save_draft(draft, content_path)
+    # 台账：说明本版封面来源（group=该组竖版图 / explicit=显式传入 / frame=抽帧兜底）
+    new_manifest["cover"] = {
+        "source": cover_source or "source_draft",
+        "group": _profile or None,
+        "file": ("draft_cover.jpg" if cover_source in ("frame", "source_draft")
+                 else cover_src),
+        "extracted_from": cover_frame_video,
+    }
     write_preset_manifest(stage_dir, new_manifest)
+    if cover_src and not cover_written:
+        set_draft_cover(stage_dir, cover_image=cover_src)
+        print(f"  🖼️ 版本封面: {os.path.basename(cover_src)} → draft_cover.jpg")
 
     target, final_content = publish_staged_draft(
         stage_dir, target_name, draft.get("duration", 0))
     # 导出前恢复用的备份必须同步成 B 的内容，否则 robust_auto_export 会用 A 的预设轨恢复
     _write_pipeline_backup(final_content, draft)
+    # 写时确权：克隆发布完成后在最终草稿上记 E1/E3（job 缺失时内部 no-op）
+    _fr = _freshness()
+    if _fr and job_dir:
+        try:
+            _cover_arg = (os.path.join(target, "draft_cover.jpg")
+                          if cover_source in ("frame", "source_draft")
+                          else cover_src)
+            _fr.record_draft_write(job_dir, final_content, "preset_clone")
+            _fr.record_cover(job_dir,
+                             _fr.version_for_draft(job_dir, target_name),
+                             target, _cover_arg)
+        except Exception as _fe:
+            print(f"  [warn] 记录版本新鲜度失败（不影响主流程）: {_fe}")
 
     return {
         "source": src_name,
@@ -372,6 +509,11 @@ def clone_draft_with_presets(source, target_name=None, preset_profile=None,
         "content_path": final_content,
         "presets": [p["name"] for p in new_manifest["presets"]],
         "profile": preset_profile,
+        # 抽帧兜底时 staging 路径发布后会失效，返回成品草稿里的 draft_cover.jpg
+        "cover": (os.path.join(target, "draft_cover.jpg")
+                  if cover_source == "frame" else cover_src),
+        "cover_source": cover_source or "source_draft",
+        "cover_extracted_from": cover_frame_video,
         "stripped": stat,
         "duration_us": draft.get("duration", 0),
     }

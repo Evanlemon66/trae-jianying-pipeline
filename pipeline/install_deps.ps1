@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+﻿﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   剪映 pipeline 一键依赖安装（Windows / PowerShell 5.1+）
@@ -12,9 +12,12 @@
     - whisper 兜底模型分级: 显存>=12G -> large-v3-turbo；>=6G -> medium；>=3G -> small；
       >=1.5G -> base；纯 CPU 内存>=16G -> small(int8)；>=8G -> base；更低 -> tiny
     - ASR 链路固定: 云端(videocaptioner) -> 本地 Paraformer(int8, CPU) -> faster-whisper(分级)
-  所有工具/模型/缓存统一放 -DepsRoot（未指定时依次读 JY_DEPS_ROOT -> presets.json 的 deps_root
-  -> 兜底 D:\AI_Deps），并写入用户级环境变量：
+  所有工具/模型/缓存统一放 -DepsRoot（未指定时依次读 JY_DEPS_ROOT -> presets.json 的 deps_root，
+  都没有直接报错，不再写死任何盘符），并写入用户级环境变量：
     HF_HUB_CACHE / TORCH_HOME / OLLAMA_MODELS / PATH(ffmpeg) / pip cache-dir
+  需要管理员的三项（长路径开关 / VC++ Redistributable / 缺失 ffmpeg 的 winget 安装）
+  统一由 pipeline\install_deps_admin.ps1 处理；Console 会先跑两边 -DetectOnly，
+  只有存在管理员项时才弹一次 UAC，随后主脚本以普通权限继续。
   每次运行都会在 pipeline\_env_profile.json 写入机器画像，pipeline 运行时据此选择
   whisper 模型/设备；-DetectOnly 只探测+写画像，不安装任何组件。
 
@@ -22,6 +25,7 @@
   powershell -ExecutionPolicy Bypass -File pipeline\install_deps.ps1
   powershell -ExecutionPolicy Bypass -File pipeline\install_deps.ps1 -DetectOnly
   powershell -ExecutionPolicy Bypass -File pipeline\install_deps.ps1 -TorchChannel cpu -SkipOllama
+  powershell -ExecutionPolicy Bypass -File pipeline\install_deps.ps1 -IncludeTest
 #>
 param(
     [string]$DepsRoot = "",
@@ -34,7 +38,8 @@ param(
     [switch]$SkipOllama,
     [switch]$SkipModels,
     [switch]$SkipPlaywrightBrowser,
-    [switch]$SkipWhisperWarmup
+    [switch]$SkipWhisperWarmup,
+    [switch]$IncludeTest                       # 额外安装 requirements-dev.txt（pytest 等），仅开发/验证用
 )
 
 $ErrorActionPreference = "Stop"
@@ -98,24 +103,24 @@ $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemor
 Ok "RAM: ${ramGB}GB"
 $summary += "RAM: ${ramGB}GB"
 
-# --- 依赖根目录：-DepsRoot 参数 -> JY_DEPS_ROOT -> presets.json deps_root -> 兜底 D:\AI_Deps ---
+# --- 依赖根目录：-DepsRoot 参数 -> JY_DEPS_ROOT -> presets.json deps_root；都没有直接报错 ---
 $presetFile = Join-Path $PSScriptRoot "presets.json"
 $presetDeps = $null
+$presetParseError = $null
 if (Test-Path $presetFile) {
     try {
         $presetCfg = Get-Content -Path $presetFile -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($presetCfg.deps_root) { $presetDeps = [string]$presetCfg.deps_root }
-    } catch { Warn "presets.json 解析失败，忽略其中的 deps_root" }
+    } catch { $presetParseError = $_.Exception.Message }
 }
 if (-not $DepsRoot) { $DepsRoot = $env:JY_DEPS_ROOT }
 if (-not $DepsRoot) { $DepsRoot = $presetDeps }
-if (-not $DepsRoot) { $DepsRoot = "D:\AI_Deps" }
+if (-not $DepsRoot) {
+    $reason = if ($presetParseError) { "presets.json 解析失败: $presetParseError" } else { "presets.json 的 deps_root 为空" }
+    throw "未配置依赖根目录（$reason）。请用 -DepsRoot 显式指定，或设置 JY_DEPS_ROOT，或在 pipeline/presets.json 填写 deps_root。"
+}
 if ($presetDeps -and ($DepsRoot -ne $presetDeps)) {
     Warn "本次 DepsRoot=$DepsRoot 与 presets.json deps_root=$presetDeps 不一致，请同步（否则运行时仍按配置找工具）"
-}
-if ($DepsRoot -like "D:\*" -and -not (Test-Path "D:\")) {
-    Warn "本机没有 D 盘，DepsRoot 回退为 C:\AI_Deps"
-    $DepsRoot = "C:\AI_Deps"
 }
 Ok "DepsRoot: $DepsRoot"
 $summary += "DepsRoot: $DepsRoot"
@@ -210,6 +215,28 @@ $dirs = @{
 foreach ($d in $dirs.Values) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
 Ok "目录已创建: $DepsRoot\{tools\ffmpeg\bin, models\{huggingface\hub,torch,paraformer}, Ollama\models, pip_cache}"
 
+# 系统长路径开关：模型/缓存路径很容易超过 260 字符（需管理员）。
+# 非管理员运行时不报错、也不静默跳过：明确提示改由 install_deps_admin.ps1 处理。
+$isAdmin = ([Security.Principal.WindowsPrincipal](
+    [Security.Principal.WindowsIdentity]::GetCurrent())
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($isAdmin) {
+    try {
+        $fsKey = "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem"
+        $lp = (Get-ItemProperty -Path $fsKey -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled
+        if ($lp -ne 1) {
+            New-ItemProperty -Path $fsKey -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force | Out-Null
+            Ok "已开启系统长路径支持（LongPathsEnabled=1，重启后对已有进程生效）"
+        } else {
+            Ok "系统长路径支持已开启"
+        }
+    } catch {
+        Warn "长路径开关设置失败：$($_.Exception.Message)"
+    }
+} else {
+    Warn "当前非管理员：长路径 / VC++ Redistributable / 缺失 ffmpeg 由 install_deps_admin.ps1 处理（Console 会自动弹一次 UAC）"
+}
+
 # 用户级环境变量（已存在且相同则跳过）
 $envMap = @{
     HF_HUB_CACHE  = $dirs.hfhub
@@ -234,21 +261,88 @@ Step 3 $TOTAL "安装 torch / torchaudio（$TorchChannel）"
 # ============================================================
 $pipIdx = @()
 if ($PipIndexUrl) { $pipIdx = @("-i", $PipIndexUrl) }
-if ($TorchChannel -eq "cpu") {
-    & $Py @PyPre -m pip install --upgrade torch torchaudio @pipIdx
+
+# pip >= 24：新版依赖解析与 --index-url 行为更稳；低于 24 先升级 pip/setuptools/wheel
+$pipVer = ((& $Py @PyPre -m pip --version 2>&1) -join " ")
+if ($pipVer -match 'pip\s+(\d+)\.') {
+    if ([int]$Matches[1] -lt 24) {
+        Info "当前 $pipVer 低于 24，先升级 pip / setuptools / wheel"
+        & $Py @PyPre -m pip install --upgrade pip setuptools wheel @pipIdx | Out-Null
+    } else {
+        Ok "pip 版本满足要求：$pipVer"
+    }
 } else {
-    & $Py @PyPre -m pip install --upgrade torch torchaudio --index-url "https://download.pytorch.org/whl/$TorchChannel"
+    Warn "无法识别 pip 版本：$pipVer"
 }
-if ($LASTEXITCODE -ne 0) { throw "torch 安装失败" }
+
+# 版本校验：torch/torchaudio 已装且 CUDA 通道与本次选择一致 → 跳过联网重装
+$torchProbe = @'
+import sys
+want = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
+try:
+    import torch, torchaudio  # noqa: F401
+except Exception as exc:
+    print("TORCH_MISS " + str(exc).splitlines()[0])
+    raise SystemExit(0)
+have = (torch.version.cuda or "").replace(".", "")
+if want.startswith("cu"):
+    ok = (have == want[2:])
+elif want == "cpu":
+    ok = (have == "")
+else:
+    ok = True
+print("TORCH_OK" if ok else ("TORCH_MISS cuda=" + (have or "none") + " want=" + want))
+'@
+$torchState = (($torchProbe | & $Py @PyPre - $TorchChannel 2>&1) -join " ")
+if ($torchState -match "TORCH_OK") {
+    Ok "torch / torchaudio 已满足 $TorchChannel，跳过 pip 重装"
+} else {
+    Info "torch 校验未通过：$torchState"
+    if ($TorchChannel -eq "cpu") {
+        & $Py @PyPre -m pip install --upgrade torch torchaudio @pipIdx
+    } else {
+        & $Py @PyPre -m pip install --upgrade torch torchaudio --index-url "https://download.pytorch.org/whl/$TorchChannel"
+    }
+    if ($LASTEXITCODE -ne 0) { throw "torch 安装失败" }
+}
 & $Py @PyPre -c "import torch; print('  torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
 
 # ============================================================
 Step 4 $TOTAL "安装 requirements.txt 全部 Python 包"
 # ============================================================
 $reqFile = Join-Path $PSScriptRoot "..\requirements.txt"
-& $Py @PyPre -m pip install -r $reqFile @pipIdx
-if ($LASTEXITCODE -ne 0) { throw "requirements.txt 安装失败" }
-Ok "requirements.txt 安装完成"
+# 版本校验：requirements.txt 里所有 `==` 定版均已装且版本一致 → 跳过 pip
+$reqProbe = @'
+import importlib.metadata as md, re, sys
+def vt(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+miss = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.split("#", 1)[0].strip()
+    m = re.match(r"^([A-Za-z0-9_.\-]+)\s*(==|>=)\s*([A-Za-z0-9_.\-+]+)$", line)
+    if not m:
+        continue
+    name, op, ver = m.group(1), m.group(2), m.group(3)
+    try:
+        have = md.version(name)
+    except md.PackageNotFoundError:
+        miss.append(name + " 缺失")
+        continue
+    if op == "==" and have != ver:
+        miss.append(name + " " + have + "!=" + ver)
+    elif op == ">=" and vt(have) < vt(ver):
+        miss.append(name + " " + have + "<" + ver)
+print("REQ_OK" if not miss else "REQ_MISS " + " | ".join(miss))
+'@
+$reqState = (($reqProbe | & $Py @PyPre - $reqFile 2>&1) -join " ")
+if ($reqState -match "REQ_OK") {
+    Ok "requirements.txt 全部版本已满足，跳过 pip install"
+} else {
+    Info "待补齐：$reqState"
+    & $Py @PyPre -m pip install -r $reqFile @pipIdx
+    if ($LASTEXITCODE -ne 0) { throw "requirements.txt 安装失败" }
+    Ok "requirements.txt 安装完成"
+}
 
 # ============================================================
 Step 5 $TOTAL "funasr-onnx 元数据补丁（numpy pin 过时会引发 pip 纠正性降级）"
@@ -453,13 +547,33 @@ print(f"tokens.json -> tokens.txt ({len(tokens)} 行)")
 $summary += "Models: $(if ($SkipModels) {'skipped'} else {"paraformer+vad / demucs / whisper $WhisperModel"})"
 
 # ============================================================
+Step 9b $TOTAL "测试依赖 requirements-dev.txt（默认跳过，-IncludeTest 才装）"
+# ============================================================
+# pytest 只用于跑 tests/，终端用户不需要；默认不碰，避免给运行环境塞开发包。
+if ($IncludeTest) {
+    $devReq = Join-Path $PSScriptRoot "..\requirements-dev.txt"
+    if (-not (Test-Path $devReq)) { throw "缺少 requirements-dev.txt: $devReq" }
+    Info "安装测试依赖: $devReq"
+    & $Py @PyPre -m pip install -r $devReq @pipIdx
+    if ($LASTEXITCODE -ne 0) { throw "测试依赖安装失败（requirements-dev.txt）" }
+    $pytestVer = [string]((& $Py @PyPre -m pytest --version 2>&1) | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or -not $pytestVer) { throw "pytest 不可用: $pytestVer" }
+    Ok "pytest 可用: $pytestVer"
+    $summary += "Test deps: requirements-dev.txt ($pytestVer)"
+} else {
+    Info "跳过测试依赖（需要跑 tests/ 时加 -IncludeTest）"
+    $summary += "Test deps: skipped"
+}
+
+# ============================================================
 Step 10 $TOTAL "验证汇总"
 # ============================================================
 $checkCode = @'
 import importlib.util, shutil, os
 mods = ["torch", "demucs", "faster_whisper", "funasr_onnx", "videocaptioner",
         "audio_separator", "numpy", "PIL", "uiautomation", "playwright", "psutil",
-        "requests", "cv2", "imageio", "websockets", "edge_tts", "pymediainfo", "pynput"]
+        "requests", "cv2", "imageio", "websockets", "edge_tts", "pymediainfo", "pynput",
+        "pyautogui", "plyer", "rapidocr_onnxruntime"]
 bad = 0
 for m in mods:
     ok = importlib.util.find_spec(m) is not None
@@ -503,6 +617,27 @@ if prof:
             ok = False
         print(("  [OK] " if ok else "  [MISS] ") + f"ollama 模型 {om}")
         bad += 0 if ok else 1
+# --- 运行库 / 媒体库 / numpy 一致性（只报告，不计入 bad）---
+try:
+    import ctypes
+    ctypes.WinDLL("vcruntime140.dll")
+    ctypes.WinDLL("vcruntime140_1.dll")
+    print("  [OK] VC++ Redistributable x64（vcruntime140 / 140_1 可加载）")
+except Exception as e:
+    print("  [WARN] VC++ Redistributable x64 缺失或不可加载（onnxruntime/torch 可能起不来）: " + str(e))
+try:
+    import pymediainfo
+    if pymediainfo.MediaInfo.can_parse():
+        print("  [OK] MediaInfo DLL 可用")
+    else:
+        print("  [WARN] pymediainfo 可导入但找不到 MediaInfo DLL（vendor 脚本会自动回退 ffprobe）")
+except Exception as e:
+    print("  [WARN] pymediainfo 不可用（vendor 脚本回退 ffprobe）: " + str(e))
+try:
+    import numpy
+    print("  [OK] numpy " + numpy.__version__ + " (global)")
+except Exception as e:
+    print("  [WARN] numpy 检查失败: " + str(e))
 print(f"EXIT_BAD={bad}")
 '@
 $env:PARA_HOME = Join-Path $DepsRoot "models\paraformer"

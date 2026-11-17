@@ -8,17 +8,22 @@
   ④ record_video 置 exported
   ⑤ validate 接受三值、拒绝非法值
   ⑥ 无 job.json 时 clean 照常删除，回写链接跳过并记录
+  ⑩ build_plan 分支顺序：cleaned 终态优先于「无草稿」，edit_retry 优先于终态
 
 运行：python tests\\test_export_state.py（纯临时目录，不碰真实剧）
 """
 import contextlib, io, json, os, shutil, sys, tempfile
+from unittest import mock
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "lib"))
 sys.path.insert(0, os.path.join(_ROOT, "pipeline"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import job_manifest as jm  # noqa: E402
 import stream_manifest as sm  # noqa: E402
 import export_state as es  # noqa: E402
+import cover_watch as cw  # noqa: E402
+from bundle_fixture import make_bundle  # noqa: E402
 
 fails = []
 
@@ -62,13 +67,7 @@ def make_series(name, *, with_job=True):
     work = os.path.join(TMP, f"pipeline/_work_{name}_deadbeef")
     os.makedirs(work, exist_ok=True)
     bundle = os.path.join(TMP, "L", name)
-    os.makedirs(bundle, exist_ok=True)
-    with open(os.path.join(bundle, f"{name}.mp4"), "wb") as f:
-        f.write(b"m" * 10240)
-    with open(os.path.join(bundle, f"{name}-封面.jpg"), "wb") as f:
-        f.write(b"c" * 1024)
-    with open(os.path.join(bundle, f"{name}.mp4.progress.json"), "w", encoding="utf-8") as f:
-        json.dump({"progress": 100}, f)
+    make_bundle(bundle, name)
     draft = os.path.join(TMP, "drafts", name)
     os.makedirs(draft, exist_ok=True)
     sm.record(name, source_dir=src, jycache_dir=jy, workdir=work,
@@ -259,6 +258,36 @@ except RuntimeError as e:
 check("失败后原 mp4 已回滚", os.path.isfile(mp4))
 check("失败后封面仍在原位", os.path.isfile(cover))
 check("失败后未留下 v3 半套", not os.path.exists(os.path.join(d, "剧A.v3.mp4")))
+
+print("\n== ⑩ build_plan 分支顺序 ==")
+# ① 终态优先：cleaned + 无草稿 → 不得改道回剪辑（否则"已清理"会重新长出成品）
+p = make_series("esI")
+jd = p["jd"]
+job = read_job(jd)
+job["video"]["export_state"] = "cleaned"
+jm.save_job(job, jd)
+with mock.patch.object(cw, "find_stream_draft", return_value=None):
+    plan = cw.build_plan(jd, read_job(jd), {"export_policy": "immediate"}, 0,
+                         notify=False, write_log=False)
+check("cleaned+无草稿 不走 edit", plan.get("action") != "edit", plan)
+check("cleaned 原因为已清理", "cleaned" in plan.get("reason", ""), plan)
+
+# ② edit_retry 优先：剪辑失败待重跑 + 台账 exported → 仍走 edit，不拿旧草稿导出
+p = make_series("esJ")
+jd = p["jd"]
+job = read_job(jd)
+job["video"]["export_state"] = "exported"
+jm.save_job(job, jd)
+with open(os.path.join(jd, ".edit_state.json"), "w", encoding="utf-8") as f:
+    json.dump({"version": 1, "status": "retrying", "attempts": 1,
+               "next_retry_at": 0, "phase": "edit"}, f)
+# 只隔离台账⇄磁盘闸门：本用例测的是分支顺序，不是产物齐全性。
+with mock.patch.object(cw, "find_stream_draft", return_value=p["draft"]), \
+        mock.patch.object(cw, "_output_conflicts", return_value=[]):
+    plan = cw.build_plan(jd, read_job(jd), {"export_policy": "immediate"}, 0,
+                         notify=False, write_log=False)
+check("edit_retry+exported 走 edit", plan.get("action") == "edit", plan)
+check("原因说明重跑剪辑", "重跑剪辑" in plan.get("reason", ""), plan)
 
 print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
 sys.exit(1 if fails else 0)

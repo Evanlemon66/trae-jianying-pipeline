@@ -38,7 +38,7 @@ def get_track_summary(json_path):
 def main():
     if len(sys.argv) < 2:
         print("用法: python watch_jianying.py <草稿名>")
-        print("监控 %LOCALAPPDATA% 下的草稿目录变化")
+        print("监控统一配置解析出的草稿根目录变化")
         print()
         drafts = get_all_drafts()
         print("当前草稿列表:")

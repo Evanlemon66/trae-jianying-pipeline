@@ -20,6 +20,14 @@ import ui_core  # noqa: E402
 
 
 def _has_no_window_flag(node):
+    # 启动参数已收口到 ui_core._launch_flags()：Popen 侧只引用这个函数，
+    # 具体标志位由下面的功能测试覆盖（必须含 CREATE_NO_WINDOW）。
+    # 模块内常量（_NO_WINDOW / NO_WINDOW）也在白名单，其定义另有静态校验。
+    if isinstance(node, ast.Name) and node.id in ('_NO_WINDOW', 'NO_WINDOW'):
+        return True
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in ('_launch_flags', 'launch_flags')):
+        return True
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == 'getattr' and len(node.args) == 3):
         return False
@@ -29,11 +37,18 @@ def _has_no_window_flag(node):
             and isinstance(default, ast.Constant) and default.value == 0)
 
 
+def test_launch_flags_hide_window_and_detach_job():
+    """剪映启动：隐藏控制台；默认脱离作业，回退模式不脱离。"""
+    import subprocess
+    assert ui_core._launch_flags() & getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    assert ui_core._launch_flags() & ui_core._BREAKAWAY_FROM_JOB
+    assert not (ui_core._launch_flags(breakaway=False) & ui_core._BREAKAWAY_FROM_JOB)
+    assert ui_core._launch_flags(breakaway=False) & getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+
 @pytest.mark.parametrize(('relative_path', 'command'), [
-    ('pipeline_ui/ui_core.py', 'Popen'),
-    ('pipeline_ui/ui_nav.py', 'tasklist'),
-    ('pipeline_ui/ui_nav.py', 'taskkill'),
-    ('.trae/skills/jianying-editor/examples/jy_instance.py', 'taskkill'),
+    ('lib/jianying_launch.py', 'Popen'),
+    ('lib/jianying_proc.py', 'tasklist'),
 ])
 def test_subprocess_calls_explicitly_hide_windows(relative_path, command):
     with open(os.path.join(_ROOT, relative_path), encoding='utf-8') as f:
@@ -53,6 +68,45 @@ def test_subprocess_calls_explicitly_hide_windows(relative_path, command):
     assert len(calls) == 1
     flags = [kw.value for kw in calls[0].keywords if kw.arg == 'creationflags']
     assert len(flags) == 1 and _has_no_window_flag(flags[0])
+
+
+def test_taskkill_has_single_entry():
+    """结束剪映（按镜像名 /IM）的 taskkill 只允许出现在 lib/jianying_proc.py。
+
+    cover_watch 里按 /PID 杀自己的导出子进程不属于剪映进程收尾，不在此约束内。
+    """
+    allowed = os.path.join('lib', 'jianying_proc.py')
+    offenders = []
+    for dirpath, dirnames, filenames in os.walk(_ROOT):
+        dirnames[:] = [d for d in dirnames
+                       if d not in {'.git', '__pycache__', '.venv', 'node_modules'}]
+        for fn in filenames:
+            if not fn.endswith('.py'):
+                continue
+            path = os.path.join(dirpath, fn)
+            rel = os.path.relpath(path, _ROOT)
+            if rel == allowed:
+                continue
+            try:
+                with open(path, encoding='utf-8', errors='ignore') as f:
+                    tree = ast.parse(f.read())
+            except (OSError, SyntaxError):
+                continue
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == 'subprocess'
+                        and node.func.attr in ('run', 'call', 'check_output', 'Popen')):
+                    continue
+                texts = []
+                for a in list(node.args) + [kw.value for kw in node.keywords]:
+                    if isinstance(a, ast.List):
+                        texts += [e.value for e in a.elts
+                                  if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+                if 'taskkill' in texts and (
+                        '/IM' in texts or any('JianyingPro' in t for t in texts)):
+                    offenders.append(rel)
+    assert not offenders, f'taskkill 只允许出现在 {allowed}，发现: {sorted(set(offenders))}'
 
 
 @pytest.mark.parametrize('rect', [
@@ -171,6 +225,8 @@ def test_open_draft_updates_current_window_to_new_editor(monkeypatch):
     monkeypatch.setattr(ui_nav, 'connect_jianying',
                         lambda *args, **kwargs: next(connections))
     monkeypatch.setattr(ui_nav, '_find_draft_ctrl_any', lambda _name: ctrl)
+    # open_draft 现在会在剪映未运行时自动冷启动拉起；单测必须钉住“已在运行”避免真的启动客户端
+    monkeypatch.setattr(ui_nav, '_jianying_running', lambda: True)
     monkeypatch.setattr(ui_nav, 'op_mark', lambda *args: None)
     monkeypatch.setattr(ui_nav, 'dprint', lambda *args: None)
     monkeypatch.setattr(ui_nav.time, 'sleep', lambda _seconds: None)
@@ -186,7 +242,7 @@ def test_empty_cut_track_is_blocked_before_save_or_publish(monkeypatch):
     for name in ('create_empty_draft', 'inject_videos_into_draft',
                  'merge_preset_into_draft', 'publish_staged_draft',
                  'find_preset_by_name', 'save_draft',
-                 'resolve_presets', 'write_preset_manifest'):
+                 'resolve_presets', 'set_draft_cover', 'write_preset_manifest'):
         setattr(pipeline, name, lambda *args, **kwargs: None)
     pipeline.DRAFT_ROOT = 'unused'
     monkeypatch.setitem(sys.modules, 'pipeline', pipeline)
@@ -239,3 +295,77 @@ def test_empty_cut_track_is_blocked_before_save_or_publish(monkeypatch):
     assert result['duration_s'] == 0.0
     assert '裁剪后主轨时长为 0' in result['error']
     assert '已取消保存和发布' in result['error']
+
+
+def test_wmi_launch_reports_return_code(monkeypatch):
+    """breakaway 被拒后走 WMI：ReturnValue=0 视为成功，其它码返回 False。"""
+    import subprocess
+    seen = {}
+
+    def fake_run(argv, **_kwargs):
+        seen['argv'] = argv
+        return types.SimpleNamespace(stdout='0\n', stderr='')
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    assert ui_core._wmi_launch(r'C:\fake\JianyingPro.exe') is True
+    script = seen['argv'][-1]
+    assert 'Invoke-CimMethod' in script and 'JianyingPro.exe' in script
+    assert "CurrentDirectory='" in script
+
+    monkeypatch.setattr(subprocess, 'run', lambda *_a, **_k: types.SimpleNamespace(
+        stdout='9\n', stderr='boom'))
+    assert ui_core._wmi_launch(r'C:\fake\JianyingPro.exe') is False
+
+
+def _load_init_draft(monkeypatch):
+    """用 pipeline 占位模块加载 init_draft（不 import 真实 pipeline/不碰 UI）。"""
+    pipeline = types.ModuleType('pipeline')
+    for name in ('create_empty_draft', 'inject_videos_into_draft',
+                 'merge_preset_into_draft', 'publish_staged_draft',
+                 'find_preset_by_name', 'save_draft',
+                 'resolve_presets', 'set_draft_cover', 'write_preset_manifest'):
+        setattr(pipeline, name, lambda *args, **kwargs: None)
+    pipeline.DRAFT_ROOT = 'unused'
+    monkeypatch.setitem(sys.modules, 'pipeline', pipeline)
+    monkeypatch.delitem(sys.modules, 'init_draft', raising=False)
+    return importlib.import_module('init_draft')
+
+
+def test_init_draft_defaults_derive_from_admission_config(monkeypatch, tmp_path):
+    """独立 CLI 缺省值：draft_name / 剧集目录 / glob / limit / range 全部来自 admission 段。"""
+    module = _load_init_draft(monkeypatch)
+    root = tmp_path / 'root'
+    series = root / 'B_有视频'
+    series.mkdir(parents=True)
+    (series / '第1集.mp4').write_bytes(b'')
+
+    monkeypatch.setitem(sys.modules, 'export_config', types.SimpleNamespace(
+        get_admission_config=lambda: {
+            'draft_name': 'cfg_draft',
+            'video': {'glob': '第*集.mp4', 'limit': 3, 'range': '2-4'},
+        },
+        get_series_root=lambda: str(root),
+    ))
+    d = module.admission_defaults()
+    assert d['draft_name'] == 'cfg_draft'
+    assert d['video_dir'] == str(series)
+    assert d['video_glob'] == '第*集.mp4'
+    assert d['video_limit'] == 3
+    assert d['video_range'] == '2-4'
+
+
+def test_init_draft_missing_config_fails_explicitly(monkeypatch):
+    """admission 段缺失：推导直接报错，不回落写死剧名/路径。"""
+    module = _load_init_draft(monkeypatch)
+    monkeypatch.setitem(sys.modules, 'export_config', types.SimpleNamespace(
+        get_admission_config=lambda: {},
+        get_watch_config=lambda: {},
+    ))
+    with pytest.raises(ValueError) as ei:
+        module.admission_defaults()
+    assert 'admission' in str(ei.value)
+
+    result = module.init_draft(open_after=False)
+    assert result['ok'] is False
+    assert 'admission' in result['error']
+

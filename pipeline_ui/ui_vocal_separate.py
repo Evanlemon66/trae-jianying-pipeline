@@ -261,6 +261,26 @@ def _count_blue(img, x0, y0, x1, y1):
 
 # ================= 面板滚动 =================
 
+def _wheel_panel(x, y, notches):
+    """在右侧属性面板上发滚轮（正=上滚，负=下滚，单位=1 个滚轮档）。
+
+    为什么不用 pyautogui.scroll：2026-11-15 探针实测，同一坐标下 pyautogui.scroll
+    对剪映 Qt 属性面板零位移，ctypes mouse_event(WHEEL) 立即生效；并且
+    WM_MOUSEWHEEL 走焦点窗口，必须先 SetCursorPos 把鼠标指针移进面板再发。
+    """
+    import ctypes
+    u = ctypes.windll.user32
+    u.SetCursorPos(int(x), int(y))
+    time.sleep(0.12)
+    n = int(notches)
+    if not n:
+        return
+    delta = 120 if n > 0 else -120
+    for _ in range(min(abs(n), 30)):
+        u.mouse_event(0x0800, 0, 0, delta, 0)   # MOUSEEVENTF_WHEEL
+        time.sleep(0.04)
+
+
 def _scroll_panel_to_bottom(win):
     """滚动音频面板到与准入**完全一致**的终态：先回顶部 2 轮 → 再下滚 1 轮×3。
 
@@ -273,18 +293,20 @@ def _scroll_panel_to_bottom(win):
     from ui_calibration import get_param
     wr = get_window_rect(win)
     mx = int((wr[0] + wr[2]) * float(get_param('vocal_switch', 'scroll_mx_ratio')))
-    my = int((wr[1] + wr[3]) * float(get_param('vocal_switch', 'scroll_my_ratio')))
+    # y 锚点必须落在右侧面板可视区内：面板底边≈时间线上沿（本布局 ≈0.49×H），
+    # 用 0.30×H 保证在面板内（旧值 0.48×H 会压到分界线/时间线，滚轮打空）。
+    my = int(wr[1] + wr[3] * float(get_param('vocal_switch', 'scroll_my_ratio_search')))
     rounds_top = int(get_param('vocal_switch', 'scroll_rounds_top'))
     rounds_each = int(get_param('vocal_switch', 'scroll_rounds_each'))
-    delta = int(get_param('vocal_switch', 'scroll_delta'))
+    up_notches = int(get_param('vocal_switch', 'scroll_notches_top'))
+    down_notches = int(get_param('vocal_switch', 'scroll_notches_each'))
     sleep_t = float(get_param('vocal_switch', 'scroll_sleep_after'))
     op_mark('滚轮', f'音频面板回顶部×{rounds_top}+下滚×{rounds_each}({mx},{my})')
-    pyautogui.moveTo(mx, my)
     for _ in range(rounds_top):
-        pyautogui.scroll(-delta)          # scroll_delta 为负（向下），取反即向上
+        _wheel_panel(mx, my, up_notches)
         time.sleep(sleep_t)
     for _ in range(rounds_each):
-        pyautogui.scroll(delta)
+        _wheel_panel(mx, my, -down_notches)
         time.sleep(sleep_t)
 
 
@@ -306,22 +328,20 @@ def scroll_until_vocal_visible(win, max_rounds=10):
 
     # ① 滚回顶部
     top_rounds = int(get_param('vocal_switch', 'scroll_rounds_top'))
-    up_delta = -int(get_param('vocal_switch', 'scroll_delta'))  # 负值变正值往上滚
+    up_notches = int(get_param('vocal_switch', 'scroll_notches_top'))
     sleep_t = float(get_param('vocal_switch', 'scroll_sleep_after'))
     op_mark('滚轮', f'音频面板滚回顶部({mx},{my}) ×{top_rounds}')
-    pyautogui.moveTo(mx, my)
     for _ in range(top_rounds):
-        pyautogui.scroll(up_delta)
+        _wheel_panel(mx, my, up_notches)
         time.sleep(sleep_t)
 
     # ② 逐轮向下滚 + OCR 检查
     each_rounds = int(get_param('vocal_switch', 'scroll_rounds_each'))
-    down_delta = int(get_param('vocal_switch', 'scroll_delta'))
+    down_notches = int(get_param('vocal_switch', 'scroll_notches_each'))
     for i in range(max_rounds):
         op_mark('滚轮', f'音频面板第{i + 1}轮下滚({mx},{my}) ×{each_rounds}')
-        pyautogui.moveTo(mx, my)
         for _ in range(each_rounds):
-            pyautogui.scroll(down_delta)
+            _wheel_panel(mx, my, -down_notches)
             time.sleep(sleep_t)
         pos = find_text_in_window(win, '人声分离', region=(WW // 2, 0, WW, WH))
         if pos:
@@ -336,147 +356,179 @@ def scroll_until_vocal_visible(win, max_rounds=10):
 VOCAL_CONFIRMED_AT = None   # 开关确认成功时刻；wait_vocal_done 用它起算真实分离耗时
 
 
-def ensure_vocal_on(win, max_retries=7, vocal_box=None) -> bool:
+def _vocal_row_box(win, WW=None, WH=None):
+    """OCR 定位「人声分离」标签框（绝对屏幕坐标），失败返回 None。
+
+    find_text_box 返回 (left, top, right, bottom) 绝对坐标；region 是窗口相对坐标。
     """
-    确保人声分离开关为开启状态（多选安全）。
-    定位优先级（用户口径：JSON 优先，失败回退 OCR）：
-      ① vocal_box：复用面板校验那一次 OCR 的「人声分离」标签框（零额外开销）
-      ② JSON vocal_switch.switch_click_coord：滚动终态与准入统一后的实测点击点，直点
-      ③ OCR 实时定位：find_text_box 推导对勾位置（兜底）
-    验证链不变：蓝像素 ≥ blue_on_min → 否则轮询播放器标题「人声分离处理中」(banner)。
-    策略：点击+验证收敛——多选片段时对勾只反映第一个片段状态（实测 17 段仅第 1 段开，
-    对勾仍显示蓝 125），"已是开启"不可信，故仍需先点一次再验证。
-    每次点击后截图验证，最多 max_retries 次。
+    try:
+        from ocr_locate import find_text_box
+        if WW is None or WH is None:
+            r = get_window_rect(win)
+            WW, WH = r[2], r[3]
+        return find_text_box(win, '人声分离', region=(WW // 2, 0, WW, WH))
+    except Exception:
+        return None
+
+
+def _vocal_checkbox_blue(img, WL, WT, WW, WH, box, s):
+    """在「人声分离」行内测蓝勾（开态）。
+
+    搜索窗 = 标签左缘往左 45 逻辑px ~ 标签左缘往右 6 逻辑px，行中心上下 22 逻辑px。
+    返回 (蓝像素数, 质心绝对坐标) —— 质心就是复选框实测中心（上一轮实测 (1860,554)）。
+    """
+    box_left = int(box[0])
+    row_cy = (int(box[1]) + int(box[3])) // 2
+    x0 = max(0, box_left - WL - int(round(45 * s)))
+    x1 = min(int(WW), box_left - WL + int(round(6 * s)))
+    y0 = max(0, row_cy - WT - int(round(22 * s)))
+    y1 = min(int(WH), row_cy - WT + int(round(22 * s)))
+    n, c = _count_blue(img, x0, y0, x1, y1)
+    if n and c:
+        return n, (int(WL) + c[0], int(WT) + c[1])
+    return 0, None
+
+
+def _vocal_row_shows_processing(win, box):
+    """该行右侧是否出现「处理中」或百分比；命中返回关键词，否则 None。"""
+    try:
+        from ocr_locate import find_text_box
+        WL, WT, WW, WH = get_window_rect(win)
+        s = _ui_scale(win)
+        x0 = max(0, int(box[0]) - WL + int(round(24 * s)))
+        y0 = max(0, int(box[1]) - WT - int(round(8 * s)))
+        y1 = min(WH, int(box[3]) - WT + int(round(8 * s)))
+        if x0 >= WW or y1 <= y0:
+            return None
+        for kw in ('处理中', '%'):
+            if find_text_box(win, kw, region=(x0, y0, WW, y1)):
+                return kw
+    except Exception:
+        return None
+    return None
+
+
+def ensure_vocal_on(win, max_retries=1, vocal_box=None) -> bool:
+    """
+    确保人声分离开关为开启状态（**单次点击 + 轮询确认**，不重复点）。
+
+    定位（用户口径）：不再用「OCR 文字框 − 4.5px」。
+      开态：在标签左侧搜蓝像素簇，取包围盒质心 = 复选框实测中心（上一轮 (1860,554)）；
+      关态（灰勾）：用实测几何中心 = 标签左缘 + checkbox_offset(−8 逻辑px)×dpi。
+    点击前**必须重扫该行 y**（两次取样，位移 >10 逻辑px 以新值为准），且不使用任何
+    历史 JSON 坐标——上一轮 attempt1/2 的 57px 过期坐标由此杜绝。
+
+    点击策略：只点一下。点击前已是蓝勾 → 不点，直接判已开（缓存命中同路径，
+    避免把已开的开关点回去；多选下"对勾只反映首段"的风险由后续分离对账兜底）。
+
+    确认：点击后轮询最多 confirm_poll_timeout（默认 20s），命中「蓝勾出现」
+    「该行处理中/百分比」「播放器处理中」任一即成功。缓存命中的典型形态是
+    "蓝勾出现但无百分比、audioAlg 不新增"——按已开处理，结果正确性交给 extract
+    的分离对账三条拦截。
+
+    保留 max_retries 形参兼容调用方，内部固定单次点击。
     """
     global VOCAL_CONFIRMED_AT
 
     from ui_calibration import get_param, update_param
     BLUE_ON = int(get_param('vocal_switch', 'blue_on_min'))
+    CONFIRM_TIMEOUT = float(get_param('vocal_switch', 'confirm_poll_timeout', 20))
+    t_start = time.time()
+    clicks = 0
+
     WL, WT, WW, WH = get_window_rect(win)
+    s = _ui_scale(win)
 
-    def _pos_from_box(box):
-        """OCR 标签框 → 对勾坐标（checkbox_offset 为逻辑偏移，×dpi_scale）"""
-        s = _ui_scale(win)
-        dx, dy = get_param('vocal_switch', 'checkbox_offset', [-3, 0])
-        return (int(box[0] + int(round(dx * s))),
-                (box[1] + box[3]) // 2 + int(round(dy * s)))
+    box = vocal_box or _vocal_row_box(win, WW, WH)
+    if not box:
+        dprint("  ⚠️ 未定位到「人声分离」行，滚动后重试")
+        win, _ = scroll_until_vocal_visible(win, max_rounds=4)
+        box = _vocal_row_box(win)
+    if not box:
+        dprint("  ❌ 仍定位不到「人声分离」行 → enable 失败")
+        return False
 
-    def _ocr_checkbox():
-        try:
-            from ocr_locate import find_text_box
-            box = find_text_box(win, '人声分离', region=(WW // 2, 0, WW, WH))
-            if not box:
-                return None
-            return _pos_from_box(box)
-        except Exception:
-            return None
+    def _fresh_box():
+        """点击前重扫：两次 OCR 取行 y，位移 >10 逻辑px 用新值并记录修正。"""
+        nonlocal box
+        b1 = _vocal_row_box(win) or box
+        y1 = (int(b1[1]) + int(b1[3])) // 2
+        time.sleep(0.4)
+        b2 = _vocal_row_box(win) or b1
+        y2 = (int(b2[1]) + int(b2[3])) // 2
+        if abs(y2 - y1) > int(round(10 * s)):
+            dprint(f"  📍 点击前行 y 重扫修正：{y1} → {y2}（旧坐标作废）")
+        box = b2
+        return b2
 
-    ocr_pos = None
-    click_pt = None
-    if vocal_box:                                   # ① 复用面板校验的 OCR 结果
-        ocr_pos = _pos_from_box(vocal_box)
-        dprint(f"  [ocr] '人声分离' 标签框复用 → 对勾 {ocr_pos}")
-    if ocr_pos is None:
-        saved = get_param('vocal_switch', 'switch_click_coord', None)   # ② JSON 直点
-        if saved and len(saved) == 2:
-            click_pt = (int(saved[0]), int(saved[1]))
-            dprint(f"  [json] 人声分离开关实测点击点 {click_pt}（首选）")
-    if ocr_pos is None and click_pt is None:        # ③ OCR 实时定位兜底
-        ocr_pos = _ocr_checkbox()
-        if ocr_pos:
-            dprint(f"  [ocr] '人声分离' → 对勾 {ocr_pos}")
+    box = _fresh_box()
+    img = np.array(capture_region(WL, WT, WW, WH))
+    n0, c0 = _vocal_checkbox_blue(img, WL, WT, WW, WH, box, s)
+    if n0 >= BLUE_ON and c0:
+        dprint(f"  ✅ 点击前已是开启状态（蓝勾 {n0}px @{c0}，点击 0 次）")
+        if VOCAL_CONFIRMED_AT is None:
+            VOCAL_CONFIRMED_AT = time.time()
+        update_param('vocal_switch', 'switch_click_coord', [int(c0[0]), int(c0[1])])
+        return True
 
-    for attempt in range(max_retries):
+    # 单次点击：关态没有蓝簇，用实测几何偏移（标签左缘 −8 逻辑px ≈ 复选框中心）
+    dx = int(round(float(get_param('vocal_switch', 'checkbox_offset', [-8, 0])[0]) * s))
+    tx = int(box[0]) + dx
+    ty = (int(box[1]) + int(box[3])) // 2
+    dprint(f"  点击开关 ({tx}, {ty}) [复选框中心/关态几何]（单次点击，不重试）")
+    op_mark('点击', f'人声分离开关({tx},{ty})[单次]')
+    pyautogui.click(tx, ty)
+    clicks = 1
+    try:
+        time.sleep(0.15)
+        shot = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_vocal_click_single.png')
+        Image.fromarray(np.array(capture_region(WL, WT, WW, WH)).astype('uint8')).save(shot)
+        dprint(f"  📸 点击后截图: {shot}")
+    except Exception as e:
+        dprint(f"  ⚠️ 点击后截图失败: {e}")
+
+    # 轮询确认：蓝勾 / 该行处理中或百分比 / 播放器处理中，任一命中即成功
+    t0 = time.time()
+    last_ocr = 0.0
+    while time.time() - t0 < CONFIRM_TIMEOUT:
+        time.sleep(0.5)
         win, _ = connect_jianying()
-
-        # 每次重试都重新 OCR 定位：点击可能展开/收起行，面板布局会变；
-        # JSON 直点只试第一次（失败说明坐标已漂移）
-        if attempt > 0:
-            click_pt = None
-            fresh = _ocr_checkbox()
+        WL, WT, WW, WH = get_window_rect(win)
+        img = np.array(capture_region(WL, WT, WW, WH))
+        nb, cb = _vocal_checkbox_blue(img, WL, WT, WW, WH, box, s)
+        if nb >= BLUE_ON and cb:
+            dprint(f"  ✅ 已确认开启：蓝勾 {nb}px @{cb}"
+                   f"（{time.time() - t0:.1f}s，点击 {clicks} 次）")
+            if VOCAL_CONFIRMED_AT is None:
+                VOCAL_CONFIRMED_AT = time.time()
+            update_param('vocal_switch', 'switch_click_coord', [int(tx), int(ty)])
+            return True
+        if player_status_text(win) == 'processing':
+            dprint(f"  ✅ 已确认开启：播放器「处理中」"
+                   f"（{time.time() - t0:.1f}s，点击 {clicks} 次）")
+            if VOCAL_CONFIRMED_AT is None:
+                VOCAL_CONFIRMED_AT = time.time()
+            update_param('vocal_switch', 'switch_click_coord', [int(tx), int(ty)])
+            return True
+        if time.time() - last_ocr >= 2.0:
+            last_ocr = time.time()
+            fresh = _vocal_row_box(win)
             if fresh:
-                if fresh != ocr_pos:
-                    dprint(f"  [ocr] 重新定位: {ocr_pos} → {fresh}")
-                ocr_pos = fresh
-
-        anchor = None if (ocr_pos or click_pt) else find_vocal_anchor(win)
-        if not anchor and not ocr_pos and not click_pt:
-            dprint(f"  ⚠️ 未找到面板下拉锚点（尝试 {attempt + 1}），渐进滚动搜索")
-            win, _ = scroll_until_vocal_visible(win, max_rounds=8)
-            continue
-
-        # 蓝像素检测带：ComboBox 锚带 + 对勾邻域 + JSON 点击点邻域，取最大
-        # 检测带/点击偏移均为逻辑量（100% DPI 口径）→ ×dpi_scale
-        s = _ui_scale(win)
-        bands = []
-        if anchor:
-            left_x, C = anchor
-            bands.append((left_x - int(round(4 * s)) - WL, left_x + int(round(28 * s)) - WL,
-                          C - int(round(135 * s)) - WT, C - int(round(70 * s)) - WT))
-        if ocr_pos:
-            bands.append((ocr_pos[0] - int(round(12 * s)) - WL,
-                          ocr_pos[0] + int(round(12 * s)) - WL,
-                          ocr_pos[1] - int(round(10 * s)) - WT,
-                          ocr_pos[1] + int(round(10 * s)) - WT))
-        if click_pt:
-            bands.append((click_pt[0] - int(round(12 * s)) - WL,
-                          click_pt[0] + int(round(12 * s)) - WL,
-                          click_pt[1] - int(round(10 * s)) - WT,
-                          click_pt[1] + int(round(10 * s)) - WT))
-
-        # 点击坐标：OCR 对勾（横移覆盖复选框容差）> JSON 直点 > 锚点候选
-        if ocr_pos:
-            raw_offs = get_param('vocal_switch', 'click_offsets')
-            CLICK_OFFS = [int(round(v * s)) for v in raw_offs]
-            sx = ocr_pos[0] + CLICK_OFFS[attempt % len(CLICK_OFFS)]
-            sy = ocr_pos[1]
-            tag = 'OCR'
-        elif click_pt:
-            sx, sy = click_pt
-            tag = 'JSON'
-        elif anchor:
-            y_pair = get_param('vocal_switch', 'switch_y_offset_pair')
-            x_off = int(get_param('vocal_switch', 'switch_x_offset'))
-            sy = C - (int(round(y_pair[0] * s)) if attempt % 2 == 0 else int(round(y_pair[1] * s)))
-            sx = left_x + int(round(x_off * s))
-            tag = '候选'
-        else:
-            continue
-        dprint(f"  点击开关 ({sx}, {sy}) [{tag}]（尝试 {attempt + 1}/{max_retries}）")
-        op_mark('点击', f'人声分离开关({sx},{sy})[{tag}] 尝试{attempt + 1}')
-        pyautogui.click(sx, sy)
-        time.sleep(1.2)
-
-        # 验证双判据：① 对勾蓝像素（即时） ② 播放器标题「人声分离处理中/等待处理」
-        img2 = np.array(capture_region(WL, WT, WW, WH))
-        blue_n2 = max((_count_blue(img2, *b)[0] for b in bands), default=0)
-        if blue_n2 >= BLUE_ON:
-            dprint(f"  ✅ 人声分离已开启（蓝像素 {blue_n2}）")
-            if VOCAL_CONFIRMED_AT is None:
-                VOCAL_CONFIRMED_AT = time.time()
-            update_param('vocal_switch', 'switch_click_coord', [int(sx), int(sy)])
-            return True
-
-        # 蓝像素未中 → 轮询 banner（0.5s 一次，最多 12s；banner 出现有延迟实测 ~11s，
-        # 且一旦出现会持续整个处理期）。读到「人声分离处理中」立即算成功并停止——
-        # 不再重复点击，防止把已成功的开关点回去
-        hit = False
-        poll_timeout = float(get_param('vocal_switch', 'banner_poll_timeout'))
-        poll_interval = float(get_param('vocal_switch', 'banner_poll_interval'))
-        t_end = time.time() + poll_timeout
-        while time.time() < t_end:
-            if player_status_text(win) == 'processing':
-                hit = True
-                break
-            time.sleep(poll_interval)
-        if hit:
-            dprint("  ✅ 播放器标题「人声分离处理中」→ 勾选真实生效（轮询命中）")
-            if VOCAL_CONFIRMED_AT is None:
-                VOCAL_CONFIRMED_AT = time.time()
-            update_param('vocal_switch', 'switch_click_coord', [int(sx), int(sy)])
-            return True
-        dprint(f"  ⚠️ 点击后未开启（蓝像素 {blue_n2}，banner 12s 未现），重新定位重试")
-
+                oy = (int(box[1]) + int(box[3])) // 2
+                ny = (int(fresh[1]) + int(fresh[3])) // 2
+                if abs(ny - oy) > int(round(10 * s)):
+                    dprint(f"  📍 确认中行 y 漂移 {oy} → {ny}，按新位置判断")
+                    box = fresh
+            kw = _vocal_row_shows_processing(win, box)
+            if kw:
+                dprint(f"  ✅ 已确认开启：该行出现「{kw}」"
+                       f"（{time.time() - t0:.1f}s，点击 {clicks} 次）")
+                if VOCAL_CONFIRMED_AT is None:
+                    VOCAL_CONFIRMED_AT = time.time()
+                update_param('vocal_switch', 'switch_click_coord', [int(tx), int(ty)])
+                return True
+    dprint(f"  ❌ 单次点击后 {int(CONFIRM_TIMEOUT)}s 内未见蓝勾/处理中/百分比 → enable 失败"
+           f"（点击 {clicks} 次，总耗时 {time.time() - t_start:.1f}s）")
     return False
 
 
@@ -501,7 +553,7 @@ def find_vocal_switch(win):
         if not box:
             return None
         s = _ui_scale(win)
-        dx, dy = get_param('vocal_switch', 'checkbox_offset', [-3, 0])
+        dx, dy = get_param('vocal_switch', 'checkbox_offset', [-8, 0])
         vx = int(box[0] + int(round(dx * s)))
         vy = (box[1] + box[3]) // 2 + int(round(dy * s))
         dprint(f"  [ocr] 右半 '人声分离' box={box} → 对勾 ({vx}, {vy})")
@@ -801,13 +853,30 @@ def player_status_text(win, debug=False) -> str:
 def wait_vocal_done(win, timeout=600, appear_timeout=120) -> dict:
     """
     等「人声分离等待处理」→「播放器」。
-      阶段A：按 End 跳最后一帧触发刷新，轮询等 'processing' 出现（超时按云缓存秒回处理）
+      阶段A：按 End 跳最后一帧触发刷新，轮询等 'processing' 出现（appear_timeout）
       阶段B：等 'idle'（标题栏恢复「播放器」= 处理完成）
-    返回 {'ok': bool, 'seen_processing': bool, 'elapsed_s': int}
+
+    判据：
+      - 见到「处理中」且随后恢复「播放器」→ ok=True（reason='done'）。
+      - 见到「处理中」但超时仍未恢复「播放器」→ ok=False（reason='timeout'）。
+      - 开关已确认开启、且在 cache_hit_window（默认 30s，上限 60s）内始终没有
+        「处理中」提示 → 判定算法缓存命中，ok=True（reason='cache_hit'），
+        不等满 120s。缓存命中的正确性由 extract 的分离对账三条兜底：
+        草稿里没出 audio 轨时 _check_separation 会直接失败。
+      - 开关未确认开启且全程无「处理中」→ ok=False（reason='never_started'）。
+    返回 {'ok','seen_processing','reason','elapsed_s'}
     """
     from ui_core import send_keys
+    from ui_calibration import get_param
     global VOCAL_CONFIRMED_AT
     t0 = time.time()
+    # 缓存命中观察窗：足够看到「等待处理」提示（正常 1-3s 内出现），又不拖长重跑耗时
+    try:
+        cache_window = float(get_param('vocal_switch', 'cache_hit_window', 30))
+    except Exception:
+        cache_window = 30.0
+    cache_window = max(10.0, min(60.0, cache_window))
+    switch_on = VOCAL_CONFIRMED_AT is not None
     # 真实分离耗时从「开关确认成功」起算（含排队等待），而非等待阶段自己开始观察的时刻
     anchor = VOCAL_CONFIRMED_AT if VOCAL_CONFIRMED_AT else t0
     if VOCAL_CONFIRMED_AT:
@@ -833,31 +902,41 @@ def wait_vocal_done(win, timeout=600, appear_timeout=120) -> dict:
             except Exception:
                 pass
             break
-        time.sleep(3)
+        el = time.time() - t0
+        if switch_on and el >= cache_window:
+            dprint(f"  ✅ 判定缓存命中：开关已确认开启，{int(el)}s 内无「人声分离等待处理」"
+                   f"（窗口 {int(cache_window)}s）→ 结果已在缓存，继续流程")
+            dprint("     兜底：extract 分离对账三条会核验草稿是否真的新增了 audio 轨")
+            return {'ok': True, 'seen_processing': False, 'reason': 'cache_hit',
+                    'elapsed_s': int(time.time() - anchor)}
+        time.sleep(2)
     if not seen:
-        dprint("  ⚠️ 未见「等待处理」提示（云缓存秒回？），直接按已完成处理")
+        dprint(f"  ❌ {appear_timeout}s 内从未出现「人声分离等待处理」→ 判定从未开始处理，"
+               f"不能按已完成处理")
+        return {'ok': False, 'seen_processing': False, 'reason': 'never_started',
+                'elapsed_s': int(time.time() - t0)}
 
-    if seen:
-        dprint(f"  验证B：等标题栏恢复「播放器」（最多 {timeout}s）")
-        t1 = time.time()
-        while time.time() - t1 < timeout:
-            time.sleep(5)
-            win, _ = connect_jianying()
-            op_mark('按键', 'End（轮询末帧查完成）')
-            send_keys(win, '{End}')
-            time.sleep(1.0)
-            st = player_status_text(win)
-            if st == 'idle':
-                true_elapsed = int(time.time() - anchor)
-                dprint(f"  ✅ 处理完成（真实耗时 {true_elapsed}s，自开关确认起算；"
-                       f"等待阶段观察耗时 {int(time.time() - t0)}s）")
-                return {'ok': True, 'seen_processing': True,
-                        'elapsed_s': true_elapsed}
-            el = int(time.time() - t1)
-            if el % 30 < 6:
-                dprint(f"  ...处理中（{el}s）status={st}")
-        dprint(f"  ⚠️ 超时 {timeout}s，按已完成处理")
-    return {'ok': True, 'seen_processing': seen, 'elapsed_s': int(time.time() - t0)}
+    dprint(f"  验证B：等标题栏恢复「播放器」（最多 {timeout}s）")
+    t1 = time.time()
+    while time.time() - t1 < timeout:
+        time.sleep(5)
+        win, _ = connect_jianying()
+        op_mark('按键', 'End（轮询末帧查完成）')
+        send_keys(win, '{End}')
+        time.sleep(1.0)
+        st = player_status_text(win)
+        if st == 'idle':
+            true_elapsed = int(time.time() - anchor)
+            dprint(f"  ✅ 处理完成（真实耗时 {true_elapsed}s，自开关确认起算；"
+                   f"等待阶段观察耗时 {int(time.time() - t0)}s）")
+            return {'ok': True, 'seen_processing': True, 'reason': 'done',
+                    'elapsed_s': true_elapsed}
+        el = int(time.time() - t1)
+        if el % 30 < 6:
+            dprint(f"  ...处理中（{el}s）status={st}")
+    dprint(f"  ❌ 已确认开始处理，但 {timeout}s 内未恢复「播放器」→ 判定未完成")
+    return {'ok': False, 'seen_processing': True, 'reason': 'timeout',
+            'elapsed_s': int(time.time() - t0)}
 
 
 def wait_timeline_ready(win, timeout=90):

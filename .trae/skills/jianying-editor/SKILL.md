@@ -77,24 +77,25 @@ Read the individual rule files for specific tasks and constraints:
 
 ## 📦 导出完成后的归档（pipeline 侧）
 
-导出成功不等于归档：剧集默认留在 `watch.roots` 下，只是 `video.status=done` 不再触发导出。需要「下线」时用 `pipeline/archive_job.py` 显式归档：
+导出成功不等于归档：剧集默认留在有效扫描根下（`series_root` + `watch.roots` 额外根），只是 `video.status=done` 不再触发导出。需要「下线」时用 `pipeline/archive_job.py` 显式归档：
 
 **多版本成品命名（先对齐台账再归档）**：
 
 - 基础版草稿/成品**不加后缀**（不写 `_a`），台账版本名记 `a`；扩展版 `<基础草稿>_<版本>`，版本名 `[a-z][a-z0-9]{0,7}`（`b`/`c`/`b2`），**一版一后缀**。
 - 同版本重跑：草稿重建后写 `_export_stale.json`，重导**不覆盖**旧成品，而把旧成品改名保留三件套 `<成品>.v<n>.mp4`、`<成品>.v<n>-封面.jpg`、`<成品>.v<n>.mp4.progress.json`；任一改名失败整组回滚并硬失败。从成品名反查版本：先剥 `.v<n>`，再看 `_<版本>` 后缀。
 - 各版本成品与状态记 `job.json.video.outputs.<版本>`（`{draft, export_dir, export_file, size_bytes, state, exported_at, history[]}`），每个版本独立判断「导过就不再导」；顶层 `video.export_file/export_dir/draft_name` 只是基础版聚合。命名细则见 `drama-cover-builder/references/handoff-contract.md` §2.1。
+- **版本封面**：`draft_cover.jpg` 是草稿目录级文件，克隆会共享；每个版本草稿必须写入本组竖版图（基础版 `04_covers/cover_04_vertical.*`，扩展版 `04_covers/<组>/cover_04_vertical_<组>.*`），由 `job_manifest.resolve_profile_cover` 解析。克隆/重建入口没写封面＝缺陷，B/C 版不得沿用 A 版封面。
 
 - `job.json.stage=archived` 是合法 stage，含义是「该剧已归档、不再参与调度」；由归档脚本写入，watcher 的触发判定对它**硬拦**，`--phase` / `--once` / `--job` 都绕不过去（硬拦发生在阶段/单剧过滤之前）。
 - 准入（默认需同时满足，`--force` 可跳过）：① `publish.status=published` 或 `video.export_state=cleaned`；② **所有声明版本都已完成**——`video.outputs` 里每个版本的 `state` ∈ `exported` / `cleaned`，任一版本未导出则跳过归档。首次归档时 `.watcher.lock` 的 pid 存活（活锁）或 `.export_state.json` `status=exporting` 会拒绝（续做只校验位置与目标）。
-- 归档池位置：`archive_root` 不能等于或位于 `watch.roots` 之下；`watch.roots` 为空时脚本直接拒绝执行（fail-closed）。建议与 roots 同盘、独立根（如 `D:/短剧_存档`）。
+- 归档池位置：`archive_root` 不能等于或位于任一有效扫描根之下；有效扫描根为空（`series_root` 未配置或解析失败）时脚本直接拒绝执行（fail-closed）。有效扫描根统一由 `pipeline/export_config.get_watch_roots()` 解析，建议与素材根同盘、独立根（如 `<归档根>`）。
 - 断点可重入：`stage` 已 archived、源目录仍在而目标不存在时，重跑同一命令即续做移动；先写 stage 再搬目录，因此移动失败也不会再被调度。
 - 归档会同步改写 `pipeline/_stream_manifests/*.json` 的 `paths.source_dir`；不改写会导致后续 `stream_manifest.py clean` 按旧路径找不到源。
 - `publish.status` 当前只有手工 `python lib/job_manifest.py publish-record ...` 会写 `published`，自动发布链没有写入路径（暂未实现）；不要依据它判断「已发布」。
 
 ```powershell
-python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档" --dry-run
-python pipeline/archive_job.py --job "<cover_job>" --archive-root "D:/短剧_存档"
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>" --dry-run
+python pipeline/archive_job.py --job "<cover_job>" --archive-root "<归档根>"
 ```
 
 完整契约见 `drama-cover-builder/references/handoff-contract.md` §7.4。
@@ -150,6 +151,16 @@ Use these templates and scripts for complex tasks:
   ```bash
   python <SKILL_ROOT>/scripts/api_validator.py
   ```
+
+## 🩺 环境自检（仓库根）
+
+新机器 / 新路径先跑一条只读自检：
+
+```bash
+python pipeline/doctor.py
+```
+
+逐项报告仓库布局、Python 依赖（测试依赖 pytest 独立成项，仅跑 `tests/` 用，非阻断）、ffmpeg/ffprobe、剪映安装与版本、剪映进程/桌面会话、各配置路径、草稿根索引，以及 watcher 计划任务/watcher 运行态。每项给出「通过 / 缺什么 / 怎么补」；只有阻断项 `[缺失]` 才返回退出码 1。不会启停剪映或 watcher，也不会跑导出。
 
 ## 🚀 快速开始示例
 

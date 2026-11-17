@@ -33,6 +33,8 @@ import json
 import ctypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pipeline"))
+from export_config import get_projects_root
 
 import pyautogui
 import uiautomation as uia
@@ -41,7 +43,7 @@ from PIL import ImageGrab
 
 from ui_core import (
     dprint, connect_jianying, ensure_maximized,
-    click_desc, send_keys, get_window_rect, select_main_track,
+    click_desc, send_keys, get_window_rect, select_main_track, deselect_all,
     op_mark, op_timeline, take_op_marks, op_stage, op_event,
 )
 from ui_track_ops import scan_tracks
@@ -482,8 +484,7 @@ def resolve_recognize_defaults(win):
     }
 
 # 草稿完成检测（draft_content.json 的 materials.texts 数量；自动取最近修改的草稿）
-DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                          "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+DRAFT_ROOT = get_projects_root()
 CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ui_calibration.json')
 
 
@@ -561,6 +562,30 @@ def _draft_english_text_count():
         if letters >= 2 and visible and letters / visible > ratio:
             n += 1
     return n
+
+
+def _draft_text_pack():
+    """读当前草稿，按字幕终检同一判据（verify_draft.text_pack_issues）查成轨结构异常。
+
+    识别/翻译偶发把整批译文压到同一时刻、每条各自单独成轨（32轨/629条 text 那类），
+    只数字幕增量的验收看不出这种产出。返回判据 dict；草稿读不到时返回 {'error': ...}，
+    由调用方按未通过处理（不允许静默放过）。
+    """
+    name = _active_draft_name()
+    if not name:
+        return {'error': '找不到当前草稿 draft_content.json'}
+    p = os.path.join(DRAFT_ROOT, name, "draft_content.json")
+    err = None
+    for _ in range(3):          # 剪映可能正在二次落盘，读到半截 JSON 时短暂重试
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            from verify_draft import text_pack_issues   # pipeline 目录已在 sys.path
+            return text_pack_issues(d)
+        except Exception as e:
+            err = f'{type(e).__name__}: {e}'
+            time.sleep(0.6)
+    return {'error': err}
 
 
 def _switch_blue_count(cx=None, cy=None, win=None):
@@ -1201,9 +1226,14 @@ def run_recognize_translate(target_lang: str = "英语",
         # --- Step 1: Home + Ctrl+A 选主轨 ---
         dprint("\n[1/4] Home + Ctrl+A 选主轨")
         try:
-            select_main_track()
+            sel_ok = select_main_track()
         except Exception as e:
             dprint(f"  ⚠️ 键盘操作异常: {e}")
+            sel_ok = False
+        if not sel_ok:
+            return {'ok': False, 'duration_s': round(time.time() - t0, 1),
+                    'error': '选中主轨失败：Home 后时间码未回到 00:00:00 '
+                             '或主轨未全部白描边（未激活字幕面板）'}
 
         # --- Step 2: 点顶部 Tab "字幕" + 面板入口 "识别字幕" ---
         dprint("\n[2/4] 激活字幕面板")
@@ -1342,8 +1372,30 @@ def run_recognize_translate(target_lang: str = "英语",
                f"英文译文 +{eng_added}，判定迟到完成")
         success = True
 
+    # 成轨结构闸门（与 pipeline 字幕终检 verify_draft.text_pack_issues 同一判据）：
+    # 条数增量达标 ≠ 结果可用。剪映偶发把整批译文压到同一时刻、每条各自单独成轨
+    # （实测 25 条英文同落 647.733s/33ms → 32 轨/629 条 text），只看增量会静默放过。
+    pack_fail = None
+    pack = None
     fail_reason = None
-    if not success:
+    if success:
+        pack = _draft_text_pack()
+        if pack.get('error'):
+            pack_fail = f"成轨结构检查失败（{pack['error']}）"
+        else:
+            from verify_draft import pack_brief, pack_warn_brief
+            summary = pack_brief(pack)
+            if summary:
+                pack_fail = f"字幕成轨结构异常：{summary}"
+            else:
+                warn = pack_warn_brief(pack)
+                if warn:
+                    dprint(f"  ⚠️ 成轨结构告警（零时长未达阻断阈值，不阻断）：{warn}")
+        if pack_fail:
+            success = False
+            fail_reason = pack_fail
+
+    if not success and not fail_reason:
         if fast_fail_reason:
             fail_reason = fast_fail_reason
         else:
@@ -1362,6 +1414,23 @@ def run_recognize_translate(target_lang: str = "英语",
         time.sleep(2)   # 等时间线渲染稳定
         _record_subtitle_tracks(pre_text)
 
+    # --- 清选择：Ctrl+A 是全选识别范围的唯一手段，识别完必须清掉，
+    #     否则后续滚动/点击会带着全选（一次误点删除按钮即删空主轨）---
+    #     成轨结构闸门判失败时同样要清（此时界面已回到可操作状态）
+    if success or pack_fail:
+        try:
+            w2 = None
+            try:
+                w2, _ = connect_jianying(retry=False)
+            except Exception:
+                pass
+            ds = deselect_all(w2 or win)
+        except Exception as e:
+            raise RuntimeError(f'清选择异常: {type(e).__name__}: {e}')
+        if not ds.get('ok'):
+            raise RuntimeError(f"清选择失败（{ds.get('reason')}），"
+                               f"未点击固定坐标兜底；全选残留会让后续滚动/点击有删主轨风险")
+
     # --- 操作时间线：每个鼠标/键盘操作逐条耗时（阶段分组待用户定义）---
     if op_timeline('[recognize] 操作时间线'):
         take_op_marks()   # 输出后清空，供下个模块独立计时
@@ -1375,6 +1444,7 @@ def run_recognize_translate(target_lang: str = "英语",
         'translate_lang_ok': lang_ok,
         'text_tracks_delta': curr_text - pre_text,
         'english_texts_added': eng_added,
+        'text_pack': pack,
     }
 
 

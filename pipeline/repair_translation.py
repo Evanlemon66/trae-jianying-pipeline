@@ -26,14 +26,12 @@ import sys
 import time
 import uuid
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import pipeline as pl  # noqa: E402
+import draft_io  # noqa: E402  草稿写盘唯一原语
 
-DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                          "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+DRAFT_ROOT = pl.DRAFT_ROOT
 
 
 def _load_draft(name):
@@ -214,10 +212,8 @@ def main():
         print(f"⚠️ 全片仍有 {left_total} 条英文字幕夹带中文（供应商未按 prompt 音译），"
               f"可再执行一次本脚本重试")
     if total_fixed > 0:
-        backup = path + f".repairbak_{int(time.time())}"
-        shutil.copy2(path, backup)
-        with io.open(path, "w", encoding="utf-8") as f:
-            json.dump(draft, f, ensure_ascii=False)
+        backup = draft_io.write_draft_content(
+            draft, path, backup_suffix=".repairbak_{ts}", writer="repair_translation")
         print(f"💾 已写回草稿（备份: {os.path.basename(backup)}），共修复 {total_fixed} 条英文字幕")
     else:
         print("无可写回的修复内容")
@@ -259,4 +255,5 @@ def _set_seg_text(draft, seg, new_text, template_seg):
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     main()

@@ -25,7 +25,8 @@ _REPO_ROOT = os.path.dirname(_HERE)
 CONFIG_PATH = os.path.join(_HERE, "presets.json")
 _LEGACY_CONFIG_PATH = os.path.join(_HERE, "vc_config.json")  # 旧版翻译配置文件（兼容读取）
 
-sys.stdout.reconfigure(encoding="utf-8")
+# 本模块是库：不在导入期动全局 sys.stdout（编码由调用方 batch_runner/pipeline 负责）。
+# 独立 CLI 自检时在 __main__ 里再设置。
 
 _SRT_TIME_RE = re.compile(
     r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})"
@@ -655,6 +656,7 @@ def _rewrite_cjk_ollama(host, model, texts, idxs, timeout=600):
 # ────────────────────────── CLI 自检 ──────────────────────────
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")  # 独立运行时才需要，库导入期不动全局流
     import argparse
     parser = argparse.ArgumentParser(description="VideoCaptioner bridge self-test")
     parser.add_argument("media", help="音视频文件")

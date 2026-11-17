@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import ctypes
@@ -28,6 +29,22 @@ from functools import wraps
 from contextlib import contextmanager
 
 import uiautomation as uia
+
+# 启动共用层：exe 定位/版本校验/拉起/等待就绪/早死重拉统一走 lib/jianying_launch.py
+_LIB_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'lib'))
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+import jianying_launch as jl  # noqa: E402
+
+# 实例判定唯一口径：与导出链共用 examples/jy_instance.py 的 ensure_for_export
+_EXAMPLES_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', '.trae', 'skills',
+    'jianying-editor', 'examples'))
+if _EXAMPLES_DIR not in sys.path:
+    sys.path.insert(0, _EXAMPLES_DIR)
+import jy_instance  # noqa: E402
+import jy_page_detect as jpd  # noqa: E402 （窗口枚举/判页/激活的唯一实现）
 
 PROPERTY_ID_FULLDESC = 30159   # LegacyIAccessible.Description（剪映语义标记都在这）
 
@@ -636,7 +653,8 @@ def _resolve_prop(ctrl, prop_id):
 
 
 def _ctrl_desc(ctrl):
-    return (_resolve_prop(ctrl, PROPERTY_ID_FULLDESC) or "").lower()
+    """Description 小写口径（唯一实现在 jy_page_detect.ctrl_desc）。"""
+    return jpd.ctrl_desc(ctrl)
 
 
 def _ctrl_name(ctrl):
@@ -662,54 +680,16 @@ def _ctrl_rect(ctrl):
 
 
 # ================= 窗口连接 =================
-# Win32 原生查找（不走 UIA COM 树）：UIA 枚举在本机会被卡住 2min+（编辑页加载/僵尸窗口），
-# 而窗口"是否出现"用 EnumWindows 毫秒级即可判定——命中后按句柄直绑 UIA 控件，绕开枚举卡顿。
+# 窗口枚举 / 类名匹配 / 判页 统一在 lib/jy_page_detect.py（启动链与业务链共用一份）。
+# 本模块保留同名函数作为薄封装，既有调用方与测试不用改。
 def _enum_top_windows():
-    """EnumWindows 枚举可见顶层窗口 → [(hwnd, class_name, title)]。纯 Win32，毫秒级。"""
-    import ctypes
-    from ctypes import wintypes
-    out = []
-    user32 = ctypes.windll.user32
-    _Proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    buf = ctypes.create_unicode_buffer(512)
-    # 64 位句柄截断防御：不设 argtypes 时 hwnd 默认按 32 位 c_int 传
-    user32.EnumWindows.argtypes = [_Proc, wintypes.LPARAM]
-    user32.IsWindowVisible.argtypes = [wintypes.HWND]
-    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-
-    def _cb(hwnd, _lp):
-        try:
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            buf.value = ''
-            user32.GetClassNameW(hwnd, buf, 512)
-            cls = buf.value or ''
-            buf.value = ''
-            user32.GetWindowTextW(hwnd, buf, 512)
-            out.append((int(hwnd), cls, buf.value or ''))
-        except Exception:
-            pass
-        return True
-
-    try:
-        user32.EnumWindows(_Proc(_cb), 0)
-    except Exception:
-        pass
-    return out
+    """EnumWindows 枚举可见顶层窗口 → [(hwnd, class_name, title)]（实现在 jpd）。"""
+    return jpd.enum_top_windows()
 
 
 def _good_class_native(cls):
-    c = (cls or '').lower()
-    if c.startswith('homepage_qmltype') or c.startswith('mainwindow_qmltype'):
-        return True
-    if c.startswith('jianying'):
-        return True
-    # 实测（2026-10）：冷启动后剪映主窗口类名是 Qt622QWindowIcon（Qt 6 通用顶层类，
-    # 而非历史观察的 HomePage_QMLTYPE）。title 含「剪映」前提已保证不误抓其他 Qt 应用。
-    if c.endswith('qwindowicon'):
-        return True
-    return False
+    """剪映主窗口类名匹配（可配置集合，含 Qt*QWindowIcon；实现在 jpd）。"""
+    return jpd.window_class_ok(cls)
 
 
 def find_jianying_native():
@@ -719,18 +699,26 @@ def find_jianying_native():
 
 
 def enum_jianying_windows():
-    """所有剪映真窗口（首页+编辑页可能同时存在）→ [(hwnd, cls, title)]。Win32 毫秒级。"""
-    try:
-        return [(h, c, t) for h, c, t in _enum_top_windows()
-                if '剪映' in t and _good_class_native(c)]
-    except Exception:
-        return []
+    """所有剪映真窗口（首页+编辑页可能同时存在）→ [(hwnd, cls, title)]（实现在 jpd）。"""
+    return jpd.enum_jianying_windows()
 
 
 # ================= HWND 持久化恢复（e2e cdp-recovery 模式）=================
 # 第一次绑定成功后缓存 HWND；下次优先 attach 到这个句柄（省掉 Win32 枚举 + UIA 搜索）。
 # 恢复前必须验证 identity（标题含剪映 + 类名合法）——连到错误的窗口比不连更糟。
 _LAST_HWND = {'hwnd': 0, 'cls': '', 'title': '', 'page': None}
+
+# 连接路径计时开关（纯观测）：JY_NAV_TRACE=1 时打印每次 connect 的各步耗时
+_NAV_TRACE = os.environ.get('JY_NAV_TRACE') == '1'
+
+
+def _nvtrace(stage: str, t0: Optional[float] = None, extra: str = '') -> None:
+    if not _NAV_TRACE:
+        return
+    now = time.time()
+    dur = '' if t0 is None else f' dur={now - t0:.3f}s'
+    hms = time.strftime('%H:%M:%S', time.localtime(now)) + f'.{int(now * 1000) % 1000:03d}'
+    print(f'[nav-trace] {hms} {stage}{dur} {extra}'.rstrip(), flush=True)
 
 
 def hwnd_identity_ok(hwnd):
@@ -769,13 +757,17 @@ def _try_reattach_cached_hwnd():
     hwnd = _LAST_HWND.get('hwnd') or 0
     if not hwnd:
         return None
+    _t = time.time()
     ident = hwnd_identity_ok(hwnd)
+    _nvtrace('cache-identity', _t, f'hwnd={hwnd} ok={bool(ident)}')
     if not ident:
         ddebug(f"  [hwnd] 缓存句柄 {hwnd} 已失效/不可见 → 重新查找")
         invalidate_hwnd_cache()
         return None
     title, cls = ident
+    _t = time.time()
     bound = _bind_uia_by_hwnd(hwnd, cls)
+    _nvtrace('cache-bind', _t, f'hwnd={hwnd} page={bound[1] if bound else None}')
     if not bound or bound[0] is None:
         return None
     win, pt = bound
@@ -798,7 +790,9 @@ def _bind_uia_by_hwnd(hwnd, known_cls=None, cache=True, activate=True):
     cache=False 用于候选窗口探测（只有最终选中的窗口才写缓存）。
     activate=False 用于探测（避免反复抢焦点/置顶）。"""
     try:
+        _t = time.time()
         win = uia.ControlFromHandle(hwnd)
+        _nvtrace('from-handle', _t, f'hwnd={hwnd} ok={win is not None}')
         if win is not None:
             bound = _activate_and_classify(win, known_cls, activate=activate)
             if bound and bound[0] is not None and cache:
@@ -823,11 +817,16 @@ def _select_best_native():
     """原生枚举所有剪映窗口 → 逐个判页 → edit 优先，其次 home。
     打开草稿会在**新窗口**打开编辑页，所以必须全量扫描而不能只认一个句柄。"""
     hits = enum_jianying_windows()
+    _nvtrace('enum-windows', extra='; '.join(
+        f'hwnd={h} cls={c} title={t!r}' for h, c, t in hits) or 'none')
     if not hits:
         return None, None
     best_edit = best_home = None
     for hwnd, cls, title in hits:
+        _t = time.time()
         bound = _bind_uia_by_hwnd(hwnd, cls, cache=False, activate=False)
+        _nvtrace('bind-candidate', _t,
+                 f'hwnd={hwnd} page={bound[1] if bound else None}')
         if not bound or bound[0] is None:
             continue
         win, pt = bound
@@ -840,20 +839,51 @@ def _select_best_native():
         # 所有窗口都判不出页（编辑页加载中）：先绑第一个可见窗口，page=None
         hwnd, cls, title = hits[0]
         ddebug(f"  [hwnd] {len(hits)} 个剪映窗口均判不出页（加载中）→ 绑定 hwnd={hwnd}")
-        return _bind_uia_by_hwnd(hwnd, cls) or (None, None)
+        _t = time.time()
+        _bound = _bind_uia_by_hwnd(hwnd, cls)
+        _nvtrace('bind-first-loading', _t,
+                 f'hwnd={hwnd} page={_bound[1] if _bound else None}')
+        return _bound or (None, None)
     hwnd, cls, win, pt = chosen
-    try:
-        win.SetActive()
-        win.SetTopmost(True)
-        time.sleep(0.2)
-        win.SetTopmost(False)
-    except Exception:
-        pass
+    # 选中窗口后置前：记录真实激活结果（失败只告警，不影响选窗/判页）
+    _t = time.time()
+    jpd.activate_window(win, hwnd=hwnd, log=ddebug)
+    _nvtrace('activate-selected', _t, f'hwnd={hwnd} page={pt}')
     _LAST_HWND['hwnd'] = hwnd
     _LAST_HWND['cls'] = cls
     _LAST_HWND['page'] = pt
     ddebug(f"  [hwnd] 选定窗口 hwnd={hwnd} cls={cls} page={pt}（候选 {len(hits)} 个）")
     return win, pt
+
+
+# 枚举为空时的短等重枚举（切草稿会先销毁旧窗、后建新窗，中间有可见性空档）
+_WINDOW_REAPPEAR_WAIT_S = 2.0
+_WINDOW_REAPPEAR_STEP_S = 0.3
+
+
+def _wait_jianying_window(timeout: float = _WINDOW_REAPPEAR_WAIT_S):
+    """枚举为空时短等：每 300ms 重枚举一次，返回 (hits, pid_alive)。
+
+    pid_alive=True 表示按剪映进程 pid 枚举到了不可见顶层窗口：实例还在，
+    只是窗口尚未可见/标题未就绪 —— 这是瞬态，继续轮询即可，不是「没窗口」。
+    """
+    deadline = time.time() + max(0.0, float(timeout))
+    pid_alive = False
+    while True:
+        hits = enum_jianying_windows()
+        if hits:
+            return hits, pid_alive
+        try:
+            pids = jpd.jianying_pids()
+            if pids:
+                pid_alive = pid_alive or any(
+                    jl.window_pid(h) in pids and jpd.window_class_ok(c)
+                    for h, c, _t in jpd.enum_top_windows(visible_only=False))
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return [], pid_alive
+        time.sleep(_WINDOW_REAPPEAR_STEP_S)
 
 
 def connect_jianying(retry=True, max_wait=60):
@@ -865,159 +895,139 @@ def connect_jianying(retry=True, max_wait=60):
     Qt*QWindowIcon 开头的窗口（标题必须含「剪映」），排除 Chrome_WidgetWin_1 假窗口。
     """
     # ⓪ HWND 持久化恢复：句柄有效且能判页才复用（最快路径）
+    _t_all = time.time()
+    _t = time.time()
     cached = _try_reattach_cached_hwnd()
+    _nvtrace('cache', _t, f'hit={bool(cached)} page={cached[1] if cached else None}')
     if cached:
+        _nvtrace('connect-total', _t_all, f'page={cached[1]} via=cache')
         return cached
 
     # ① Win32 原生全量扫描（毫秒级）：枚举所有剪映窗口 → 判页 → edit 优先
+    _t = time.time()
+    _hits = enum_jianying_windows()
     win, pt = _select_best_native()
+    _nvtrace('native', _t, f'hits={len(_hits)} page={pt}')
     if win is not None:
+        _nvtrace('connect-total', _t_all, f'page={pt} via=native')
         return win, pt
 
-    # ② 直接找（UIA 兜底，兼容 Qt6 通用顶层类）
-    for hint in ["剪映专业版"]:
-        try:
-            win = uia.WindowControl(searchDepth=1, Name=hint)
-            if win.Exists(0):
-                cls = win.ClassName or ""
-                if _good_class_native(cls):
-                    return _activate_and_classify(win)
-                # 假窗口，继续找
-                dprint(f"跳过假窗口 ClassName={cls!r}")
-        except Exception:
-            continue
+    # ①b 枚举为空：先短等重枚举，不再直接走 UIA 兜底。
+    # 打开草稿会「销毁首页窗口 → 再建编辑页窗口」，中间有 <1s 的可见性空档；
+    # 实测此时 UIA 按名搜索固定 20.3s（exists=False），随后的
+    # GetRootControl().GetChildren() 还要 22.0s，合计 40s+ 全是白等。
+    _t = time.time()
+    _hits2, _pid_seen = _wait_jianying_window()
+    _nvtrace('wait-window', _t, f'hits={len(_hits2)} pid_alive={_pid_seen}')
+    if _hits2:
+        win, pt = _select_best_native()
+        _nvtrace('native-retry', _t, f'hits={len(_hits2)} page={pt}')
+        if win is not None:
+            _nvtrace('connect-total', _t_all, f'page={pt} via=native-retry')
+            return win, pt
 
-    # 兜底：遍历顶层窗口
-    try:
-        for w in uia.GetRootControl().GetChildren():
-            try:
-                if "剪映" in (w.Name or "") and _good_class_native(w.ClassName or ""):
-                    return _activate_and_classify(w)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    if retry:
+    # 短等后仍无窗口：按 pid 能看到不可见窗口（_pid_seen=True）说明实例还在、
+    # 窗口没建好，直接返回让调用方按自己的节奏再试；进程根本没在跑则走拉起。
+    # 非标准类名的窗口由实例管理器里的按名兜底负责，不在这里用 20s 级 UIA 搜索。
+    _nvtrace('uia-fallback', extra=f'skip pid_alive={_pid_seen}')
+    if retry and not _pid_seen:
         dprint("未找到剪映窗口，尝试启动...")
         return launch_and_connect(max_wait=max_wait)
+    _nvtrace('connect-total', _t_all, 'page=None')
     return None, None
 
 
-def launch_and_connect(exe_path=None, max_wait=60):
-    import subprocess, winreg
-
-    if not exe_path:
-        # 5.9 硬编码优先
-        p59 = r"D:\剪映5.9\JianyingPro\5.9.0.11632\JianyingPro.exe"
-        if os.path.exists(p59):
-            exe_path = p59
-        else:
-            try:
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                    r"Software\Microsoft\Windows\CurrentVersion\Uninstall") as key:
-                    for i in range(winreg.QueryInfoKey(key)[0]):
-                        sk_name = winreg.EnumKey(key, i)
-                        with winreg.OpenKey(key, sk_name) as sk:
-                            try:
-                                dn = winreg.QueryValueEx(sk, "DisplayName")[0]
-                                if "剪映专业版" in dn:
-                                    ico = winreg.QueryValueEx(sk, "DisplayIcon")[0]
-                                    exe_path = os.path.join(os.path.dirname(ico), "JianyingPro.exe")
-                                    break
-                            except Exception:
-                                continue
-            except Exception:
-                pass
-
-    if not exe_path or not os.path.exists(exe_path):
-        raise RuntimeError("未找到剪映可执行文件，请手动启动后再试")
-
-    dprint(f"启动: {exe_path}")
-    subprocess.Popen([exe_path], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-
-    t_launch = time.time()
-    last_log = 0.0
-    last_diag = 0.0
-    while time.time() - t_launch < max_wait:
-        time.sleep(2)
-        el = time.time() - t_launch
-        # Win32 原生检测（毫秒级，不受 UIA 枚举卡顿影响）。
-        # all_jy = 标题含剪映的所有可见窗口（含 Chrome_WidgetWin_1 假窗口/初始化中窗口）
-        t_chk = time.time()
-        try:
-            all_jy = [(h, c, t) for h, c, t in _enum_top_windows() if '剪映' in t]
-        except Exception:
-            all_jy = []
-        chk_s = time.time() - t_chk
-        if chk_s > 3:
-            dprint(f"  [diag] 本轮 Win32 窗口枚举耗时 {chk_s:.1f}s（异常，正常应 <0.1s）")
-        if el - last_log >= 15:
-            last_log = el
-            if all_jy:
-                cls_set = ', '.join(sorted({c for _, c, _ in all_jy}))
-                dprint(f"  ...剪映启动等待中（{el:.0f}s）已检测到窗口: {cls_set}")
-            else:
-                dprint(f"  ...剪映启动等待中（{el:.0f}s）（尚未检测到剪映任何窗口）")
-        # 真 QML 窗口（HomePage/MainWindow）出现 → 立即返回
-        real = [(h, c, t) for h, c, t in all_jy if _good_class_native(c)]
-        if real:
-            hwnd, cls, title = real[0]
-            dprint(f"  剪映窗口已出现（{el:.0f}s）cls={cls}")
-            bound = _bind_uia_by_hwnd(hwnd, cls)
-            if bound and bound[0] is not None:
-                return bound
-            # 句柄绑定失败（极少见）→ UIA 搜索兜底
-            try:
-                win = uia.WindowControl(searchDepth=1, Name='剪映专业版')
-                if win.Exists(2):
-                    return _activate_and_classify(win)
-            except Exception:
-                pass
-        elif all_jy and el - last_diag >= 30:
-            # 只有假窗口/初始化中窗口：进程已拉起，QML 主窗口还没创建（肉眼看到的
-            # 任务栏图标/闪屏属于这种）→ 每 30s 提示一次，说明检测没有瞎等
-            last_diag = el
-            dprint(f"  [diag] 剪映进程已拉起，主窗口初始化中（{el:.0f}s）: "
-                   f"{sorted({c for _, c, _ in all_jy})}")
-    raise RuntimeError(f"启动后 {max_wait}s 内未找到剪映窗口")
+# ================= 剪映可执行文件解析（版本强校验，实现已并入共用启动层） =================
+# 5.9 是 UI 自动化唯一适配版本；本机若还装了新版（如 8.9/11.x），注册表命中
+# 往往是新版 —— 解析结果必须校验 exe 文件版本，绝不静默拉起错误版本。
+REQUIRED_JY_VERSION = jl.REQUIRED_JY_VERSION
+_JY_EXE_NAME = jl.EXE_NAME
+# 让剪映脱离调用方所在的作业对象：终端/父进程结束时不会把剪映连带回收
+# （否则会留下 .locked / template.tmp 等残留，下次打开触发恢复提示）。
+_BREAKAWAY_FROM_JOB = jl.BREAKAWAY_FROM_JOB
 
 
-_PAGE_FEATS = (
-    ('edit', 'maintimelineroot'),    # 实测：编辑页时间线根节点，深度仅 2
-    ('edit', 'vesettingpanel'),      # 右侧设置面板展开时才有（辅助特征）
-    ('home', 'homepagedrafttitle'),  # 首页草稿卡片
-)
+def _launch_flags(breakaway=True):
+    """剪映启动参数：隐藏控制台窗口 +（默认）脱离当前作业（实现在共用层）。"""
+    return jl.launch_flags(breakaway=breakaway)
+
+
+def _exe_file_version(path):
+    return jl.exe_file_version(path)
+
+
+def _jy_version_of(exe_path):
+    return jl.jianying_version_of(exe_path)
+
+
+def _registry_jianying_exes():
+    return jl.registry_jianying_exes()
+
+
+def resolve_jianying_exe(required=REQUIRED_JY_VERSION):
+    """解析剪映可执行文件并强制校验版本（实现在共用层，带来源清单）。"""
+    return jl.resolve_jianying_exe(required, log_fn=dprint)
+
+
+def _wmi_launch(exe_path):
+    """用 WMI 在终端作业之外拉起剪映（实现在共用层，保留本函数供既有测试/调用方）。"""
+    return jl.wmi_launch(exe_path, log_fn=dprint)
+
+
+def launch_and_connect(exe_path=None, max_wait=60, retries=0, readiness='window'):
+    """拉起/复用剪映并等到首页，返回已绑定的 (win, page)。
+
+    统一入口：本函数不再自己拉起，直接转调 `launch_via_manager`
+    （内部即 `JyInstance.ensure_for_export`）。原先的 readiness='window'
+    "有窗口就算就绪"口径已废弃——它会把初始化中的半成品窗口当成可用实例，
+    也是探针脚本绕过重试预算的来源。
+
+    保留形参只为兼容既有调用方：
+      max_wait  冷启动就绪墙钟（小于 120s 时按 120s 处理，避免冷启动被截断）
+      retries   已失效（重拉预算统一在实例管理器的 LaunchBudget 里）
+      readiness 已失效（就绪口径固定为「首页真能枚举出可交互控件」）
+    """
+    if readiness != 'home':
+        dprint(f"  [launch] readiness={readiness!r} 已废弃，统一按首页可交互判就绪")
+    return launch_via_manager(force_clean=False,
+                              timeout=max(jl.HOME_READY_TIMEOUT_S, float(max_wait)),
+                              exe_path=exe_path)
+
+
+
+def launch_via_manager(readiness='home', force_clean=False, timeout=120.0,
+                       exe_path=None):
+    """准入冷启动：复用导出链的实例判定（`JyInstance.ensure_for_export`）。
+
+    与 `launch_and_connect` 的区别：就绪口径固定为 home（首页真能枚举出可交互
+    控件），复用/软关/宽限/干净重启全部由实例管理器判定，准入不再自己维护
+    "窗口出现即就绪"的第二套口径。失败时原样抛出管理器异常，保留
+    `[launch_failed:…]` / `[window_missing]` / `[window_activate_timeout]` 标记，
+    供失败分类与台账使用。
+
+    返回 `_activate_and_classify` 的 `(win, page)`。
+    """
+    if readiness != 'home':
+        raise ValueError(f"准入只支持 readiness='home'（收到 {readiness!r}）")
+    exe = exe_path or resolve_jianying_exe()
+    mgr = jy_instance.JyInstance(find_exe=lambda: exe, log=dprint)
+    mgr.ensure_for_export(force_clean=force_clean, timeout=timeout, entry='admit')
+    win = mgr.backend.rebind_window()
+    if win is None:
+        raise RuntimeError('[window_missing] 实例已就绪但绑定主窗口失败')
+    return _activate_and_classify(win)
+
+
+_PAGE_FEATS = tuple(jpd.PAGE_FEATS)
 
 
 def _detect_page(win):
-    """按 FullDescription 特征判页（Qt 通用窗口类名判不出页时唯一依据）。
-    实测（2026-11 剪映 5.9/Qt6）：首页与编辑页标题都叫「剪映专业版」，
-    编辑页必有 MainTimeLineRoot（深度 2）；旧的 VESettingPanel 在未展开设置面板时不存在。
-    单次遍历同时检测所有特征、命中 edit 即提前返回，避免首页重复全树扫描。"""
-    found = {'edit': False, 'home': False}
+    """按 Description 特征判页（唯一实现在 jy_page_detect.detect_page）。
 
-    def walk(ctrl, depth):
-        if depth > 10 or found['edit']:
-            return
-        desc = _ctrl_desc(ctrl)
-        for pt, feat in _PAGE_FEATS:
-            if feat in desc:
-                found[pt] = True
-        if found['edit']:
-            return
-        try:
-            for c in ctrl.GetChildren():
-                walk(c, depth + 1)
-        except Exception:
-            pass
-
-    walk(win, 0)
-    if found['edit']:
-        return 'edit'
-    if found['home']:
-        return 'home'
-    return None
+    首页与编辑页标题都叫「剪映专业版」，Qt 通用窗口类名也判不出页；
+    特征：MainTimeLineRoot/VESettingPanel → edit，HomePageDraftTitle → home。
+    """
+    return jpd.detect_page(win)
 
 
 # ================= S3-A2：窗口放置策略（参数化） =================
@@ -1175,27 +1185,21 @@ def _ensure_window_placement(win):
 
 
 def _activate_and_classify(win, known_cls=None, activate=True):
+    _t_act = _t_page = None
     if activate:
-        try:
-            win.SetActive()
-            win.SetTopmost(True)
-            time.sleep(0.2)
-            win.SetTopmost(False)
-        except Exception:
-            pass
+        # 激活是独立动作：记录图标化/前台窗口/SetActive/SetForegroundWindow 的真实
+        # 结果，失败只告警（日志 [activate] … [warn]），不影响下面的判页与成败。
+        _t_act = time.time()
+        jpd.activate_window(win, log=dprint)
         _ensure_window_placement(win)
+        _nvtrace('activate', _t_act, f'hwnd={getattr(win, "NativeWindowHandle", 0)}')
 
-    # 优先用 Win32 已测得的类名（避免 UIA 属性读取再被卡）
-    cls = known_cls or (win.ClassName or "")
-    if "MainWindow" in cls:
-        return win, "edit"
-    elif "HomePage" in cls:
-        return win, "home"
-    # Qt 通用类名（Qt622QWindowIcon）：desc 特征判页
-    pt = _detect_page(win)
-    if pt:
-        return win, pt
-    return win, None
+    # 判页统一走 jy_page_detect（Description 特征优先，类名仅兜底提示）
+    cls = known_cls or (getattr(win, "ClassName", "") or "")
+    _t_page = time.time()
+    pt = jpd.detect_page(win, known_cls=cls)
+    _nvtrace('detect-page', _t_page, f'page={pt} cls={cls!r}')
+    return win, pt
 
 
 def ensure_maximized(win):
@@ -1527,21 +1531,305 @@ def send_keys(win, keys):
         return False
 
 
-def select_main_track(settle=0.5):
+# ================= 窗口最大化前提（准入）：所有操作都在最大化窗口下执行 =================
+def _is_zoomed(hwnd):
+    """IsZoomed：窗口当前是否最大化。句柄无效/调用失败一律返回 False。"""
+    try:
+        return bool(ctypes.windll.user32.IsZoomed(int(hwnd)))
+    except Exception:
+        return False
+
+
+def _maximize_hwnd(hwnd):
+    """SW_MAXIMIZE 恢复最大化。
+
+    **不用 SW_RESTORE(9)**：它的语义是"按还原尺寸显示"，对最大化窗口就是取消最大化
+    （2026-11-15 准入事故根因：2560×1368 最大化 → 1920×1080 居中）。
     """
-    Home 回时间线首 + Ctrl+A 全选主轨片段。
+    try:
+        ctypes.windll.user32.ShowWindow(int(hwnd), 3)   # SW_MAXIMIZE
+        return _is_zoomed(hwnd)
+    except Exception:
+        return False
+
+
+def require_maximized(win, expect_rect=None):
+    """把"最大化"当断言而不是假设（准入前提）。
+
+    已最大化 → 完全不碰窗口状态；未最大化（被最小化/被还原）→ SW_MAXIMIZE 恢复，
+    再复测 IsZoomed 与窗口 rect。返回 (ok, rect, fixed)：
+      ok=False  恢复后仍非最大化，或恢复后 rect 与 expect_rect 不一致
+                → 调用方必须中止（此前按旧 rect 算出的坐标已失配）
+    """
+    try:
+        hwnd = int(getattr(win, 'NativeWindowHandle', 0) or 0)
+    except Exception:
+        hwnd = 0
+    rect = get_window_rect(win)
+    if not hwnd:
+        dprint("  ⚠️ 最大化断言：拿不到窗口句柄，按当前 rect 继续（不可测）")
+        return True, rect, False
+    if _is_zoomed(hwnd):
+        return True, rect, False
+    dprint(f"  ⚠️ 最大化断言：窗口未最大化（IsZoomed=0, rect={rect}）→ SW_MAXIMIZE 恢复")
+    try:
+        op_event('window', '窗口未最大化，恢复为最大化', before=list(rect) if rect else None)
+    except Exception:
+        pass
+    _maximize_hwnd(hwnd)
+    time.sleep(0.5)
+    rect2 = get_window_rect(win)
+    if not _is_zoomed(hwnd):
+        dprint(f"  ⛔ 最大化断言失败：SW_MAXIMIZE 后 IsZoomed 仍为 0（rect={rect2}），中止")
+        return False, rect2, True
+    if expect_rect is not None and tuple(expect_rect) != tuple(rect2):
+        dprint(f"  ⛔ 最大化断言：恢复后 rect {rect2} 与预期 {tuple(expect_rect)} 不一致，"
+               f"此前坐标已失配，中止")
+        return False, rect2, True
+    dprint(f"  ✅ 最大化已恢复：rect {rect}→{rect2}")
+    return True, rect2, True
+
+
+def ensure_keyboard_focus(win=None):
+    """把**键盘焦点**（不是"窗口置前"）强制落到剪映窗口，并复核 hwndFocus 归属。
+
+    实测过这种态：GetForegroundWindow 已经是剪映，但键盘焦点在桌面
+    （UIA 焦点控件 = PaneControl '桌面 1'）。此时鼠标点击照常生效，
+    Home / Ctrl+A / Ctrl+Shift+S 全部被丢弃（2026-11-15 准入实测：只有点中的
+    那 1 段是选中态、播放头停在 End 位置）。所以"窗口在前台"不能当键能用的证据，
+    必须用 GetGUIThreadInfo 的 hwndFocus 复核它属于剪映进程。
+    返回 True = 复核通过（键可以正常送达）。
+    """
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    if win is None:
+        win, _page = connect_jianying(retry=False)
+    if not win:
+        dprint("  ❌ 键盘焦点守卫：找不到剪映窗口")
+        return False
+    try:
+        hwnd = int(getattr(win, 'NativeWindowHandle', 0) or 0)
+    except Exception:
+        hwnd = 0
+    if not hwnd:
+        dprint("  ❌ 键盘焦点守卫：拿不到剪映窗口句柄")
+        return False
+
+    def _focus_owner():
+        """返回 (hwndFocus, 是否属于剪映进程)。"""
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [('cbSize', wintypes.DWORD), ('flags', wintypes.DWORD),
+                        ('hwndActive', wintypes.HWND), ('hwndFocus', wintypes.HWND),
+                        ('hwndCapture', wintypes.HWND), ('hwndMenuOwner', wintypes.HWND),
+                        ('hwndMoveSize', wintypes.HWND), ('hwndCaret', wintypes.HWND),
+                        ('rcCaret', wintypes.RECT)]
+        gti = GUITHREADINFO()
+        gti.cbSize = ctypes.sizeof(GUITHREADINFO)
+        tid = u.GetWindowThreadProcessId(hwnd, None)
+        if not u.GetGUIThreadInfo(tid, ctypes.byref(gti)) or not gti.hwndFocus:
+            return 0, False
+        fpid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(gti.hwndFocus, ctypes.byref(fpid))
+        jpid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(jpid))
+        return int(gti.hwndFocus), fpid.value == jpid.value
+
+    fhwnd, ok = _focus_owner()
+    if not ok:
+        try:
+            if u.GetForegroundWindow() != hwnd:
+                u.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            win.SetActive()
+        except Exception:
+            pass
+        try:
+            win.SetFocus()
+        except Exception:
+            pass
+        time.sleep(0.2)
+        fhwnd, ok = _focus_owner()
+    if not ok:
+        # 前台锁（SetForegroundWindow 被系统拒绝）的标准绕法：
+        # 先 Alt 轻点解除前台锁，再走 AttachThreadInput 把输入队列挂到当前线程。
+        k32 = ctypes.windll.kernel32
+        for _ in range(2):
+            try:
+                u.keybd_event(0x12, 0, 0, 0)
+                u.keybd_event(0x12, 0, 2, 0)
+                time.sleep(0.15)
+                # 只在"没最大化"时恢复最大化；已最大化则完全不碰窗口状态。
+                # 不能用 SW_RESTORE(9)：它会把最大化窗口按还原尺寸显示=取消最大化。
+                if not _is_zoomed(hwnd):
+                    u.ShowWindow(hwnd, 3)      # SW_MAXIMIZE
+                u.BringWindowToTop(hwnd)
+                u.SetForegroundWindow(hwnd)
+                fg = u.GetForegroundWindow()
+                cur = k32.GetCurrentThreadId()
+                fg_tid = u.GetWindowThreadProcessId(fg, None)
+                if fg_tid and fg_tid != cur:
+                    u.AttachThreadInput(cur, fg_tid, True)
+                u.SetForegroundWindow(hwnd)
+                u.SetActiveWindow(hwnd)
+                u.SetFocus(hwnd)
+                if fg_tid and fg_tid != cur:
+                    u.AttachThreadInput(cur, fg_tid, False)
+                try:
+                    u.SwitchToThisWindow(hwnd, True)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            time.sleep(0.3)
+            fhwnd, ok = _focus_owner()
+            if ok:
+                break
+    dprint(f"  ⌨️ 键盘焦点守卫: hwndFocus={fhwnd} 属于剪映进程={ok}")
+    return ok
+
+
+_TC_RE = re.compile(
+    r'^\s*(\d{2})\s*[:：;]\s*(\d{2})\s*[:：;]\s*(\d{2})(?:\s*[:：;]\s*(\d{2}))?\s*$')
+
+
+def _read_playhead_timecode(win):
+    """读播放器控制条左下的「当前时间码」（紧挨着右侧那个是总时长，取最左的）。
+
+    返回 (原始文本, 纯数字串, 错误说明)；读不到时前两项为 None/''。
+    """
+    reg = (0, 0, 0, 0)
+    try:
+        from ocr_locate import _ocr_window
+        _wl, _wt, _ww, _wh = get_window_rect(win)
+        # 播放器控制条（当前时间 / 总时长）在预览区左下，按窗口比例取，避免分辨率耦合
+        reg = (int(_ww * 0.395), int(_wh * 0.470), int(_ww * 0.620), int(_wh * 0.570))
+        items = _ocr_window(win, region=reg)
+    except Exception as e:
+        return None, '', f'OCR 异常 {type(e).__name__}: {e}'
+    cand = []
+    for text, (cx, _cy), _score, _box in items:
+        m = _TC_RE.match(str(text))
+        if not m:
+            continue
+        cand.append((cx, str(text).strip(), ''.join(g for g in m.groups() if g)))
+    if not cand:
+        texts = [str(t) for t, *_ in items]
+        return None, '', f'区域 x[{reg[0]},{reg[2]}] y[{reg[1]},{reg[3]}] 未识别到时间码（OCR={texts}）'
+    cand.sort(key=lambda c: c[0])
+    return cand[0][1], cand[0][2], ''
+
+
+def _main_outline_segments(win, ymid, half_h=40):
+    """数主轨片段的白描边 → (段数, 竖线 x 列表, 失败原因)。
+
+    口径（2026-11-15 用 2560×1368 实测截图校准）：选中片段有白色竖边框；
+    在主轨条带 ymid±40 内，某列 ≥55% 高度是近白色（min(R,G,B) ≥ 200）即一条白边线，
+    相邻列合并成一条。主轨是连续选中，线数 = 段数 + 1。
+    实测：Ctrl+A 全选 → 6 条线（5 段）；只选中第 01 集 → 2 条线（1 段）。
+    """
+    import numpy as np
+    tr = _find_timeline_rect(win)
+    if not tr:
+        return None, [], '取不到时间线矩形'
+    _wl, _wt, ww, _wh = get_window_rect(win)
+    y0, y1 = int(ymid) - int(half_h), int(ymid) + int(half_h) + 1
+    x0 = int(tr[0]) + int(0.075 * ww)      # 跳过轨道头图标列，保留第一段左边框
+    x1 = int(tr[2]) - 4
+    try:
+        img = np.array(capture_region(x0, y0, max(1, x1 - x0), max(1, y1 - y0)))
+    except Exception as e:
+        return None, [], f'条带截图失败 {type(e).__name__}: {e}'
+    if img.ndim != 3 or img.shape[2] < 3:
+        return None, [], f'条带截图通道异常 shape={tuple(img.shape)}'
+    band = img[:, :, :3].astype(int)
+    white = band.min(axis=2) >= 200
+    need = int(round(band.shape[0] * 0.55))
+    cols = [x for x in range(band.shape[1]) if int(white[:, x].sum()) >= need]
+    lines = []
+    for x in cols:
+        if lines and x - lines[-1][1] <= 2:
+            lines[-1][1] = x
+        else:
+            lines.append([x, x])
+    xs = [x0 + (a + b) // 2 for a, b in lines]
+    return max(0, len(lines) - 1), xs, ''
+
+
+def select_main_track(settle=0.5, win=None, main_row=None, expect_segments=None):
+    """
+    Home 回时间线首 → Ctrl+A 全选主轨片段，并用可验证的取证判定选中是否成立。
     高频操作（识别字幕/分离音频/导出前都要用），统一封装。
     用 pyautogui 物理按键（剪映时间线只认真实输入焦点，SendKeys 对 Home 不可靠）。
+
+    ⚠️ 不点片段：点片段只会选中被点的那一段，Home/Ctrl+A 一旦被丢弃就停在那儿
+    （2026-11-15 用户两次实测 + 截图：只选中第 01 集）。分离音频前置的正确序列
+    就是 Home + Ctrl+A；键盘焦点问题由 ensure_keyboard_focus 负责，不在这步用点击绕过。
+
+    判据（两条都成立才算选中）：
+      1) Home 后播放器时间码回到 00:00:00（OCR 播放器控制条最左侧时间码）；
+      2) 主轨白描边竖线数 = 选中段数 + 1 → 段数 == expect_segments（未给则要求 ≥2）。
+    不再用条带像素差（200/480 没有区分力，163511 的"选中取证"是假阳性）。
+    返回 True/False 供调用方判断。
     """
     import pyautogui
     pyautogui.FAILSAFE = False
+    if win is None:
+        win, _page = connect_jianying(retry=False)
+    if not win:
+        dprint("  ❌ 选中主轨失败：找不到剪映窗口")
+        return False
+    if main_row is None:
+        from ui_track_ops import scan_tracks, find_main_track
+        rows, img, _wl, _wt, _ww, _eye = scan_tracks(win)
+        main_row, _m2 = find_main_track(win, rows, img)
+    if not main_row:
+        dprint("  ❌ 选中主轨失败：未定位主轨（M1/M2 双校验未过）")
+        return False
+    ymid = int(main_row['ymid'])
+
+    # 准入前提：所有操作都在最大化窗口下执行。先断言（未最大化 → SW_MAXIMIZE 恢复）；
+    # 恢复导致 rect 变化 = 之前按旧 rect 算出的 ymid 已失配 → 直接中止。
+    rect0 = get_window_rect(win)
+    zoom_ok, rect0, _zoom_fixed = require_maximized(win, expect_rect=rect0)
+    if not zoom_ok:
+        return False
+
+    # 焦点守卫只允许在不改变窗口几何的前提下操作：前后 rect 一变，后续所有
+    # 按窗口 rect 算出的坐标都失配 → 立刻中止，不许带着错坐标继续。
+    focus_ok = ensure_keyboard_focus(win)
+    rect1 = get_window_rect(win)
+    if rect0 != rect1:
+        dprint(f"  ⛔ 键盘焦点守卫前后窗口 rect 变化 {rect0}→{rect1}，坐标已失配，中止本轮")
+        return False
+    if not focus_ok:
+        dprint("  ⚠️ 键盘焦点守卫未通过（Home/Ctrl+A 可能被丢弃），仍按键，交给下面取证判定")
+
     op_mark('按键', 'Home（回时间线首）')
     pyautogui.press('home')
     time.sleep(0.3)
     op_mark('组合键', 'Ctrl+A（全选主轨片段）')
     pyautogui.hotkey('ctrl', 'a')
     time.sleep(settle)
-    dprint("  ✅ Home + Ctrl+A 已选中主轨")
+
+    tc_text, tc_digits, tc_err = _read_playhead_timecode(win)
+    tc_ok = bool(tc_digits) and len(tc_digits) >= 6 and set(tc_digits) == {'0'}
+    segs, line_xs, seg_err = _main_outline_segments(win, ymid)
+    if expect_segments is None:
+        seg_ok = segs is not None and segs >= 2
+        expect_txt = '≥2'
+    else:
+        seg_ok = segs == int(expect_segments)
+        expect_txt = str(int(expect_segments))
+    ok = tc_ok and seg_ok
+    tc_why = '00:00:00 通过' if tc_ok else ('未通过: ' + (tc_err or tc_text or '非零'))
+    seg_why = f'期望 {expect_txt}' + ('' if seg_ok else '，未通过') + (f'，{seg_err}' if seg_err else '')
+    dprint(f"  {'✅' if ok else '⚠️'} 选中取证: 时间码={tc_text or '未读到'}（{tc_why}）；"
+           f"主轨白描边 {len(line_xs)} 条 x={line_xs} → {segs} 段（{seg_why}）；"
+           f"键盘焦点={focus_ok}")
+    return ok
 
 
 # ================= 截图 =================
@@ -1639,9 +1927,196 @@ def select_all_timeline(win):
     return send_keys(win, '^a')
 
 
-def deselect_all(win):
-    """Esc 取消选中"""
-    return send_keys(win, '{Esc}')
+def _find_timeline_rect(win):
+    """MainTimeLineRoot 的屏幕 rect（宽 > 400 才算命中时间线）。"""
+    for n in _find_nodes_by_desc(win, 'maintimelineroot'):
+        try:
+            r = n.BoundingRectangle
+            if r.right - r.left > 400:
+                return int(r.left), int(r.top), int(r.right), int(r.bottom)
+        except Exception:
+            pass
+    return None
+
+
+_CLIP_PANEL_KW = {'变速', '美颜美体', '抠像', '蒙版', '动画', '调节'}
+# 草稿属性面板实测 OCR：30.00帧/秒、Rec.709 SDR、适应、保留在原有位置、草稿名/路径
+_DRAFT_PANEL_KW = {'草稿参数', '草稿', '帧/秒', '帧率', '色彩空间', 'Rec.709',
+                   '适应', '保留在原有位置', '备份'}
+
+
+def _panel_prop_kind(win):
+    """右侧属性面板当前形态：'clip'（片段属性）/ 'draft'（草稿属性）/ 'unknown'。
+
+    用现有 OCR 面板识别（ocr_locate._ocr_window），不看像素差：
+    片段属性有 变速/美颜美体/抠像/蒙版/动画 这类页签；草稿属性是 草稿参数/比例/裁剪。
+    返回 (kind, evidence)。
+    """
+    try:
+        from ocr_locate import _ocr_window
+        _wl, _wt, _ww, _wh = get_window_rect(win)
+        reg = [int(_ww * 0.78), 60, _ww, min(_wh, 560)]
+        texts = {str(t).strip() for t, *_ in _ocr_window(win, region=reg)}
+    except Exception as e:
+        return None, f'{type(e).__name__}: {e}'
+    clip_hit = sorted(texts & _CLIP_PANEL_KW)
+    draft_hit = sorted(texts & _DRAFT_PANEL_KW)
+    if clip_hit:
+        return 'clip', clip_hit
+    if draft_hit:
+        return 'draft', draft_hit
+    return 'unknown', sorted(texts)[:10]
+
+
+def _is_bg_pixel(px, x, y):
+    """时间线背景灰：近中性灰（通道差 ≤10）且亮度落在 22~60。"""
+    r, g, b = px[x, y][:3]
+    return (max(r, g, b) - min(r, g, b) <= 10) and 22 <= (r + g + b) / 3 <= 60
+
+
+def _blank_candidates(win, tr, max_cands=5):
+    """在时间线矩形内按背景色挑空白落点（屏幕绝对坐标）。
+
+    不写死任何坐标：每次调用都现截图、现取色。候选 x 从时间线右缘往左取
+    （右侧轨道片段之外的空白更多、也远离左侧轨道头图标列），y 取该列上最长的
+    一段连续背景色的中心；同时量出四个方向的余量（距最近按钮/片段的像素距离）。
+    返回 [{'point','rgb','margin','run'}]，按纵向余量从大到小。
+    """
+    left, top, right, bottom = (int(v) for v in tr[:4])
+    w, h = right - left, bottom - top
+    if w < 200 or h < 120:
+        return []
+    img = capture_region(left, top, w, h).convert('RGB')
+    px = img.load()
+    xs = []
+    for k in (40, 120, 260, 460, 700, 1000, 1400):
+        x = w - 26 - k          # 右缘留 26px 避开竖向滚动条
+        if 220 <= x < w - 26:
+            xs.append(x)
+    out = []
+    for x in xs:
+        runs, y = [], 0
+        while y < h:
+            if _is_bg_pixel(px, x, y):
+                y2 = y
+                while y2 + 1 < h and _is_bg_pixel(px, x, y2 + 1):
+                    y2 += 1
+                if y2 - y + 1 >= 14:
+                    runs.append((y, y2))
+                y = y2 + 1
+            else:
+                y += 1
+        for a, b in runs:
+            yc = (a + b) // 2
+            mleft = 0
+            while mleft < 300 and x - mleft - 1 >= 0 and _is_bg_pixel(px, x - mleft - 1, yc):
+                mleft += 1
+            mright = 0
+            while mright < 300 and x + mright + 1 < w and _is_bg_pixel(px, x + mright + 1, yc):
+                mright += 1
+            margin = {'left': mleft, 'right': mright,
+                      'up': yc - a, 'down': b - yc}
+            if min(mleft, mright) < 20:
+                continue
+            out.append({'point': [left + x, top + yc],
+                        'rgb': list(px[x, yc][:3]),
+                        'margin': margin,
+                        'run': [top + a, top + b]})
+    out.sort(key=lambda c: min(c['margin']['up'], c['margin']['down']), reverse=True)
+    return out[:max_cands]
+
+
+def _ruler_anchor_candidates(win, tr, max_cands=3):
+    """退一步的纵向锚：取像素可测的「标尺下沿分割线」，从它往下找第一段背景色。
+
+    不回落成「窗口顶边 + 常数偏移」：锚点来自 _timeline_top_bands 的像素分割线。
+    """
+    try:
+        from ui_track_ops import _timeline_top_bands
+        bands = _timeline_top_bands(win, tr)
+    except Exception as e:
+        dprint(f"  ⚠️ 清选择: 标尺分割线检测失败 {type(e).__name__}: {e}")
+        return []
+    if not bands.get('ok'):
+        return []
+    left, top, right, bottom = (int(v) for v in tr[:4])
+    w, h = right - left, bottom - top
+    img = capture_region(left, top, w, h).convert('RGB')
+    px = img.load()
+    y0 = int(bands.get('ruler_bottom') or 0) - top
+    out = []
+    for x in (w - 26 - 40, w - 26 - 260):
+        if not (220 <= x < w - 26):
+            continue
+        y = max(0, min(h - 2, y0))
+        while y < h - 2:
+            if _is_bg_pixel(px, x, y):
+                y2 = y
+                while y2 + 1 < h and _is_bg_pixel(px, x, y2 + 1):
+                    y2 += 1
+                if y2 - y + 1 >= 10:
+                    yc = (y + y2) // 2
+                    out.append({'point': [left + x, top + yc],
+                                'rgb': list(px[x, yc][:3]),
+                                'margin': {'left': 0, 'right': 0,
+                                           'up': yc - y, 'down': y2 - yc},
+                                'run': [top + y, top + y2],
+                                'anchor': f'ruler_bottom={bands.get("ruler_bottom")}'})
+                    break
+                y = y2 + 1
+            else:
+                y += 1
+    return out[:max_cands]
+
+
+def deselect_all(win, tr=None):
+    """点时间线背景空白取消片段选中（Esc 在剪映 5.9 实测无效，面板不切换）。
+
+    落点不写死：每次调用现截图、按背景灰（实测 RGB≈35,35,35）在时间线矩形内挑点，
+    优先取右侧轨道片段之外的连续空白带；挑不到才退到「像素分割线（标尺下沿）」
+    作为纵向锚，再往下找背景带。两种都挑不到 → ok=False，不盲点、不回落固定坐标。
+    点击后用现有面板识别复核：右侧属性面板应从片段属性（变速/美颜…)切到草稿属性；
+    仍是片段属性则换下一点重试。
+    返回 {'ok','point','rgb','margin','panel_before','panel_after','fallback','tried','reason'}。
+    """
+    import pyautogui
+    if not tr:
+        tr = _find_timeline_rect(win)
+    if not tr:
+        dprint('  ⚠️ deselect_all: 拿不到时间线 rect，放弃清选择')
+        return {'ok': False, 'point': None, 'reason': 'no_timeline_rect', 'tried': []}
+    kind0, ev0 = _panel_prop_kind(win)
+    cands = _blank_candidates(win, tr)
+    fallback = None
+    if not cands:
+        fallback = 'ruler_divider'
+        cands = _ruler_anchor_candidates(win, tr)
+        dprint(f"  ⚠️ 清选择: 片段外无稳定背景带，退到标尺下沿分割线锚点（{len(cands)} 个候选）")
+    if not cands:
+        dprint('  ⚠️ 清选择: 挑不到背景空白点，不点击')
+        return {'ok': False, 'point': None, 'reason': 'no_background_point',
+                'panel_before': kind0, 'tried': []}
+    tried = []
+    for c in cands[:3]:
+        x, y = c['point']
+        pyautogui.click(x, y)
+        time.sleep(0.4)
+        kind1, ev1 = _panel_prop_kind(win)
+        tried.append({'point': [x, y], 'rgb': c['rgb'], 'margin': c['margin'],
+                      'panel_after': kind1, 'panel_evidence': ev1})
+        # 片段属性面板常驻「变速/动画/抠像…」页签；这些消失即已切到草稿属性。
+        cleared = kind1 != 'clip'
+        dprint(f"  清选择: 点时间线背景空白 ({x},{y}) RGB={c['rgb']} "
+               f"余量 {c['margin']} 面板 {kind0}→{kind1}({ev1}) "
+               f"{'✅已取消选中' if cleared else '⚠️仍是片段属性'}"
+               + (f" 锚点={c.get('anchor')}" if c.get('anchor') else ''))
+        if cleared:
+            return {'ok': True, 'point': [x, y], 'rgb': c['rgb'],
+                    'margin': c['margin'], 'panel_before': kind0,
+                    'panel_after': kind1, 'fallback': fallback,
+                    'tried': tried, 'reason': 'ok'}
+    return {'ok': False, 'point': None, 'panel_before': kind0,
+            'fallback': fallback, 'tried': tried, 'reason': 'panel_still_clip'}
 
 
 # ================= 面板渲染关键 =================

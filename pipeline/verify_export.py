@@ -3,7 +3,7 @@
 用法：
   python verify_export.py <草稿名> [成品mp4路径] [norm视频根目录]
   python verify_export.py 狩猎七零：我叫李上进_第01-117集串流
-  python verify_export.py 狩猎七零：我叫李上进_第01-117集串流 "D:\\油管打猎\\L\\狩猎七零：我叫李上进_第01-117集串流\\狩猎七零：我叫李上进_第01-117集串流.mp4" D:\\短剧\\狩猎七零：我叫李上进
+  python verify_export.py 狩猎七零：我叫李上进_第01-117集串流 "<导出根>\\狩猎七零：我叫李上进_第01-117集串流\\狩猎七零：我叫李上进_第01-117集串流.mp4" "<剧集根>\\狩猎七零：我叫李上进"
 
 成品 mp4 路径缺省时按「配置导出目录/草稿名/草稿名.mp4」推导（见 export_config.py）。
 
@@ -16,20 +16,13 @@
 import json, os, re, subprocess, sys
 import numpy as np
 
-if sys.stdout is not None:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except (AttributeError, ValueError):
-        pass
-
-from export_config import get_ffmpeg  # noqa: E402
+from export_config import get_ffmpeg, get_projects_root  # noqa: E402
 from no_window import NO_WINDOW  # noqa: E402
 
 FF = get_ffmpeg()
 W, H, FPS = 256, 144, 30
 
-DRAFT_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                          "JianyingPro", "User Data", "Projects", "com.lveditor.draft")
+DRAFT_ROOT = get_projects_root()
 
 
 def _video_segs(doc):
@@ -145,7 +138,7 @@ def _infer_norm_root(draft_dir):
         for m in d.get("materials", {}).get("videos", []):
             p = m.get("path") or ""
             if "__jy_norm__" in p:
-                # path 形如 D:\\短剧\\狩猎七零：我叫李上进\\__jycache__\\第2集.__jy_norm__.mp4
+                # path 形如 <剧集根>\\狩猎七零：我叫李上进\\__jycache__\\第2集.__jy_norm__.mp4
                 return os.path.dirname(os.path.dirname(p))  # 上两级 → 短剧根目录
     except Exception:
         pass
@@ -153,6 +146,11 @@ def _infer_norm_root(draft_dir):
 
 
 def main():
+    if sys.stdout is not None:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
     if len(sys.argv) < 2:
         print("用法: python verify_export.py <草稿名> [成品mp4路径] [norm视频根目录]")
         sys.exit(2)

@@ -21,9 +21,11 @@ import tempfile
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "lib"))
 sys.path.insert(0, os.path.join(_ROOT, "pipeline"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import job_manifest as jm  # noqa: E402
 import stream_manifest as sm  # noqa: E402
 import cover_watch as cw  # noqa: E402
+from bundle_fixture import make_bundle  # noqa: E402
 
 # 不弹真实桌面通知、不看本机配置
 cw.toast = lambda *a, **k: None
@@ -68,10 +70,8 @@ def make(name, *, video=None, manifest_export=False):
     draft = os.path.join(TMP, "drafts", name)
     os.makedirs(draft, exist_ok=True)
     bundle = os.path.join(TMP, "L", name)
-    os.makedirs(bundle, exist_ok=True)
-    mp4 = os.path.join(bundle, f"{name}.mp4")
-    with open(mp4, "wb") as f:
-        f.write(b"m" * 8192)
+    # 合法成品三件套：clean 现在按导出侧口径校验，缺件会被判为冲突
+    mp4 = make_bundle(bundle, name)["mp4"]
     kw = dict(source_dir=src, jycache_dir=jy, workdir=work, draft_dir=draft)
     if manifest_export:
         kw["export_file"] = mp4

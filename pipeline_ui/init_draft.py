@@ -12,12 +12,12 @@
 
 函数调用：
   from init_draft import init_draft
-  init_draft()                                  # 全默认（测试草稿）
-  init_draft(draft_name='X', video_dir=r'D:\path\to\videos') # 自定义
+  init_draft()                                  # 草稿名/素材目录取 presets.json admission 段
+  init_draft(draft_name='X', video_dir=r'D:/path/to/videos') # 自定义
 
-CLI：
+CLI（不带参数时 --draft-name/--video-dir/--limit 等默认值同样来自 admission 段）：
   py -3.12 pipeline_ui/init_draft.py
-  py -3.12 pipeline_ui/init_draft.py --draft-name X --video-dir "D:\\..." --limit 5 --no-open
+  py -3.12 pipeline_ui/init_draft.py --draft-name X --video-dir "<素材目录>" --limit 5 --no-open
 """
 import os, sys, glob, time, unicodedata, re
 
@@ -33,18 +33,46 @@ from pipeline import (
     find_preset_by_name,
     resolve_presets,
     save_draft,
+    set_draft_cover,
     write_preset_manifest,
     DRAFT_ROOT,
 )
 
-# ====== 默认配置（草稿名 = 视频目录名=剧名）======
-VIDEO_DIR = r"D:\剪映5.9\test\赶山救下小狐狸，所有猛兽都听我的"
-DRAFT_NAME = os.path.basename(VIDEO_DIR.rstrip('\\/'))
+# ====== 默认配置 ======
+# 草稿名/素材目录不写死：独立 CLI 与 init_draft() 缺省时由 presets.json 的 admission 段推导
+# （draft_name + video 的 root_index/series_index/glob/limit/range），推导失败直接报错。
 # 预设默认从 pipeline/presets.json 读取（可用 profile 选 presets_<组名>）；
 # 传 presets=[("名", alpha), ...] 可显式覆盖
 VIDEO_GLOB = "第*集.mp4"
 VIDEO_LIMIT = 5                          # 取前 N 集，None 表示全部
 # ================================
+
+
+def admission_defaults(need_video=True, need_name=True):
+    """独立 CLI 的默认值来源：presets.json 的 admission 段（唯一真源）。
+
+    素材：admission.video.root 显式优先；否则 series_root 下第 series_index 个剧集目录
+          （没有匹配视频就顺延下一个），glob/limit/range 原样复用既有解析；
+    草稿名：admission.draft_name。
+    推导不出来抛 ValueError，不回落任何写死的剧名/路径。
+    """
+    from export_config import get_admission_config
+    from admission_draft import normalize_config, resolve_series_dir
+    raw = get_admission_config()
+    if not need_name and not str(raw.get('draft_name') or '').strip():
+        # --draft-name 已显式给出，草稿名无需推导；补占位只为通过 normalize 校验
+        raw = {**raw, 'draft_name': '__cli_override__'}
+    cfg = normalize_config(raw)
+    out = {
+        'draft_name': cfg['draft_name'] if need_name else None,
+        'video_dir': None,
+        'video_glob': cfg['video']['glob'],
+        'video_limit': cfg['video']['limit'],
+        'video_range': cfg['video']['range'],
+    }
+    if need_video:
+        out['video_dir'], _hits = resolve_series_dir(cfg['video'])
+    return out
 
 
 def natural_sort_key(s):
@@ -138,18 +166,29 @@ def parse_video_range(spec, total):
     return out
 
 
-def init_draft(draft_name: str = DRAFT_NAME,
-               video_dir: str = VIDEO_DIR,
+def init_draft(draft_name: str = None,
+               video_dir: str = None,
                presets=None,
                preset_profile: str = None,
                video_glob: str = VIDEO_GLOB,
                video_limit=VIDEO_LIMIT,
                video_range: str = None,
                cut_s: float = None,
+               cover_image: str = None,
                normalize: bool = False,
                open_after: bool = True) -> dict:
     """构建并（可选）打开测试草稿。返回 {'ok': bool, 'episodes': int, 'duration_s': float, 'error': str|None}
-    normalize=False 时直接引用原始视频（HEVC/非常规尺寸也不重编码，剪映原生支持），省去逐集编码。"""
+    normalize=False 时直接引用原始视频（HEVC/非常规尺寸也不重编码，剪映原生支持），省去逐集编码。
+    draft_name/video_dir 传 None 时从 presets.json 的 admission 段推导，推导失败返回 ok=False。"""
+    if draft_name is None or video_dir is None:
+        try:
+            _d = admission_defaults(need_video=video_dir is None,
+                                    need_name=draft_name is None)
+        except ValueError as e:
+            return {'ok': False, 'episodes': 0, 'duration_s': 0,
+                    'error': f'无法从 presets.json 的 admission 段推导默认值: {e}'}
+        draft_name = draft_name or _d['draft_name']
+        video_dir = video_dir or _d['video_dir']
     if presets is None:
         try:
             presets, _src = resolve_presets(preset_profile)
@@ -269,6 +308,19 @@ def init_draft(draft_name: str = DRAFT_NAME,
               f"总时长 → {total_us/1e6:.1f}s")
         _phase('发布前时间线裁剪')
 
+    # ── Step 3.6: 自定义封面（发布前写入暂存区，随草稿一起发布）──
+    if cover_image:
+        try:
+            cover_ok = set_draft_cover(stage_dir, cover_image=cover_image)
+        except Exception as e:
+            cover_ok = False
+            print(f"  ⚠️ 封面写入异常（已忽略，继续发布）: {e}")
+        if cover_ok:
+            print(f"  🖼️ 已写入自定义封面: {os.path.basename(cover_image)}")
+        else:
+            print("  ⚠️ 封面写入失败，继续（导出将用剪映默认首帧封面）")
+        _phase('写入封面')
+
     # ── Step 4: 保存到暂存区 ──
     save_draft(draft, jp_new)
     write_preset_manifest(stage_dir, preset_manifest)
@@ -323,17 +375,33 @@ def init_draft(draft_name: str = DRAFT_NAME,
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description='初始化测试草稿')
-    ap.add_argument('--draft-name', default=DRAFT_NAME)
-    ap.add_argument('--video-dir', default=VIDEO_DIR)
-    ap.add_argument('--limit', type=int, default=VIDEO_LIMIT)
+    ap = argparse.ArgumentParser(
+        description='初始化测试草稿（--draft-name/--video-dir/--limit 缺省值来自 presets.json 的 admission 段）')
+    ap.add_argument('--draft-name', default=None, help='默认 admission.draft_name')
+    ap.add_argument('--video-dir', default=None,
+                    help='默认 admission.video（根目录索引 + 剧集索引解析，无匹配视频自动顺延）')
+    ap.add_argument('--video-glob', default=None, help='默认 admission.video.glob')
+    ap.add_argument('--limit', type=int, default=None,
+                    help='默认 admission.video.limit；0 表示全部')
+    ap.add_argument('--video-range', default=None,
+                    help='默认 admission.video.range，如 "3-10" / "5-" / "1,3,5-8"')
     ap.add_argument('--profile', default=None, metavar='A',
                     help='预设组名（presets.json 里的 presets_<组名>），多账号各用各的预设')
     ap.add_argument('--no-open', action='store_true', help='只发布，不在剪映中打开')
     args = ap.parse_args()
-    r = init_draft(draft_name=args.draft_name, video_dir=args.video_dir,
+    try:
+        d = admission_defaults(need_video=args.video_dir is None,
+                               need_name=args.draft_name is None)
+    except ValueError as e:
+        print(f'❌ 无法从 presets.json 的 admission 段推导默认值: {e}')
+        sys.exit(1)
+    r = init_draft(draft_name=args.draft_name or d['draft_name'],
+                   video_dir=args.video_dir or d['video_dir'],
                    preset_profile=args.profile,
-                   video_limit=args.limit, open_after=not args.no_open)
+                   video_glob=args.video_glob or d['video_glob'],
+                   video_limit=args.limit if args.limit is not None else d['video_limit'],
+                   video_range=args.video_range if args.video_range is not None else d['video_range'],
+                   open_after=not args.no_open)
     if not r['ok']:
         print(f"❌ {r['error']}")
         sys.exit(1)

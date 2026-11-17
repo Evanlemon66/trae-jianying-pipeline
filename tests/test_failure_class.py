@@ -69,6 +69,12 @@ check("UIA COMError = ui_hang（非 unknown）",
       fc.classify("COMError: (0x80004005, '未指定的错误')")[0] == fc.UI_HANG)
 check("英文 Timeout 不误落 export_timeout",
       fc.classify("uiautomation Timeout waiting for window")[0] == fc.UI_HANG)
+check("轨道恢复失败 = track_restore_failed（非 unknown）",
+      fc.classify("恢复轨道失败：仍有轨道在时间线可视区外，滚轮/滚动条/键盘均无法滚动")[0]
+      == fc.TRACK_RESTORE_FAILED)
+check("track_restore_failed 可重试且计数",
+      fc.is_retryable(fc.TRACK_RESTORE_FAILED)
+      and fc.counts_toward_failures(fc.TRACK_RESTORE_FAILED))
 
 print("\n== ④ 策略表：可重试性 / 计数 ==")
 check("asset_missing 不可重试", not fc.is_retryable(fc.ASSET_MISSING))
