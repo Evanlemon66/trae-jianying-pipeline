@@ -7,6 +7,7 @@
   python batch_runner.py <剧集目录> --only 3 --only 7                        # 只跑第3、7集
   python batch_runner.py <剧集目录> --only 20..30                            # 只跑第20到30集（区间）
   python batch_runner.py <剧集目录> --limit 2                                # 先跑2集试试
+  python batch_runner.py <剧集目录> --no-cache                               # 忽略产物缓存，全量重算
 
 特性:
 - 默认单草稿串流：所有集按文件名 a→z 注入同一草稿主轨，一条中文字幕轨 + 一条英文字幕轨 + 每集一条 vocals 音轨
@@ -24,6 +25,7 @@ import time
 import glob
 import argparse
 import traceback
+import uuid
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -207,6 +209,148 @@ def save_state(workdir, state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+# ── 运行记录（_run.json + run-<id>.log，只增不改历史）────────────────
+# 目的：出问题能回答「这次跑的是哪条命令、哪个目录、什么时候开始/结束、退出码、日志在哪」。
+# 只写 <workdir>/_run.json（最近一次）与 run-<id>.log（每次一份），不参与任何判定逻辑。
+_RUN = {"rec": None, "fh": None}
+
+
+class _Tee:
+    """stdout/stderr 双写：控制台照常输出，同时落 run-<id>.log。"""
+
+    def __init__(self, stream, fh):
+        self._stream, self._fh = stream, fh
+
+    def write(self, s):
+        try:
+            self._stream.write(s)
+        except Exception:
+            pass
+        try:
+            self._fh.write(s)
+            self._fh.flush()
+        except Exception:
+            pass
+        return len(s)
+
+    def flush(self):
+        for t in (self._stream, self._fh):
+            try:
+                t.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+    def __getattr__(self, name):
+        """把 reconfigure / encoding / buffer 等原样交给底层流，做个忠实代理。"""
+        return getattr(self._stream, name)
+
+
+def _write_run(workdir):
+    rec = _RUN.get("rec")
+    if not rec:
+        return
+    try:
+        os.makedirs(workdir, exist_ok=True)
+        tmp = os.path.join(workdir, "_run.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, os.path.join(workdir, "_run.json"))
+    except Exception as e:
+        print(f"  [warn] 写 _run.json 失败（忽略）: {e}")
+
+
+def _start_run(workdir, series_dir=""):
+    """开跑即落 _run.json 并接管 stdout/stderr 的 tee。失败不影响主流程。"""
+    try:
+        started = time.strftime("%Y-%m-%d %H:%M:%S")
+        run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        log_path = os.path.join(workdir, f"run-{run_id}.log")
+        rec = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "source": "batch_runner",
+            "argv": sys.argv,
+            "cwd": os.getcwd(),
+            "series_dir": series_dir,
+            "workdir": workdir,
+            "started_at": started,
+            "ended_at": None,
+            "exit_code": None,
+            "status": "running",
+            "log_path": log_path,
+        }
+        _RUN["rec"] = rec
+        _write_run(workdir)
+        fh = open(log_path, "a", encoding="utf-8", buffering=1)
+        _RUN["fh"] = fh
+        sys.stdout = _Tee(sys.stdout, fh)
+        sys.stderr = _Tee(sys.stderr, fh)
+        state = load_state(workdir)
+        state["run"] = {k: rec[k] for k in
+                        ("run_id", "started_at", "ended_at", "exit_code", "status",
+                         "log_path", "series_dir")}
+        save_state(workdir, state)
+        print(f"🧾 运行记录: {os.path.join(workdir, '_run.json')}（日志 {log_path}）")
+    except Exception as e:
+        print(f"  [warn] 运行记录初始化失败（忽略）: {e}")
+
+
+def _finish_run(exit_code, status=""):
+    rec = _RUN.get("rec")
+    if not rec:
+        return
+    try:
+        rec["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        rec["exit_code"] = int(exit_code)
+        rec["status"] = status or ("ok" if exit_code == 0 else "failed")
+        _write_run(rec["workdir"])
+        state = load_state(rec["workdir"])
+        state["run"] = {k: rec[k] for k in
+                        ("run_id", "started_at", "ended_at", "exit_code", "status",
+                         "log_path", "series_dir")}
+        save_state(rec["workdir"], state)
+        fh = _RUN.get("fh")
+        if fh:
+            try:
+                fh.flush()
+                fh.close()
+            except Exception:
+                pass
+            _RUN["fh"] = None
+    except Exception as e:
+        print(f"  [warn] 收尾运行记录失败（忽略）: {e}")
+
+
+def _draft_duration_s(draft_name):
+    """草稿时间线总时长（秒）：首次导出没有旧成品时，导出进度靠它 × 1.05MB/s 估总量。
+
+    与 series_runner/_draft_duration_s 同口径（watcher 路径传的就是这个值）；
+    读不到返回 None：导出照常，只是进度没有百分比。
+    """
+    if not draft_name:
+        return None
+    try:
+        from utils.formatters import get_default_drafts_root
+        root = get_default_drafts_root()
+    except Exception:
+        return None
+    path = os.path.join(root, draft_name, "draft_content.json")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            draft = json.load(f)
+        us = 0
+        for track in draft.get("tracks") or []:
+            for seg in track.get("segments") or []:
+                tr = seg.get("target_timerange") or {}
+                us = max(us, int(tr.get("start", 0)) + int(tr.get("duration", 0)))
+        return round(us / 1e6, 3) if us > 0 else None
+    except Exception:
+        return None
+
+
 def _export_drafts_sequential(drafts, export_root, timeout_min=60.0, verify=True):
     """多账号草稿串行导出：剪映同一时刻只能导一份，必须逐份同步导出 + 质检。
 
@@ -230,10 +374,16 @@ def _export_drafts_sequential(drafts, export_root, timeout_min=60.0, verify=True
             _toast("📤 导出中", f"{dn}（{i}/{len(drafts)}）")
             ok = False
             proc = None
+            cmd = [sys.executable, "-u", exporter, dn, out_mp4, "--move",
+                   "--fallback-dir", fallback, "--keep-open"]
+            expect_s = _draft_duration_s(dn)
+            if expect_s:
+                # 首次导出（无旧成品）也能量出百分比；同时启用成品时长截断校验
+                cmd += ["--expect-duration", ("%g" % expect_s)]
+                print(f"  草稿时长 {expect_s}s → 预估成品约 {expect_s * 1.05:.0f} MB")
             try:
                 proc = _sp.Popen(
-                    [sys.executable, "-u", exporter, dn, out_mp4, "--move",
-                     "--fallback-dir", fallback, "--keep-open"],
+                    cmd,
                     cwd=_PROJECT_ROOT, env=hidden_child_env(),
                     creationflags=NO_WINDOW)
                 proc.wait(timeout=timeout_min * 60)
@@ -286,6 +436,8 @@ def main():
     ap.add_argument("--workdir", default=None,
                     help="工作目录（默认按剧名自动派生，避免多部剧互相覆盖音频素材）")
     ap.add_argument("--fresh", action="store_true", help="忽略状态从头跑")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="忽略产物缓存（demucs/ASR/翻译全量重算）")
     ap.add_argument("--clean-workdir", action="store_true",
                     help="批量结束后清理中间产物（默认不清理；只删未被草稿引用的文件）")
     ap.add_argument("--auto-merge", action="store_true",
@@ -316,6 +468,9 @@ def main():
                          "支持多组逗号分隔（如 a,b 或 presets_a,presets_b）：第一组正常构建，"
                          "其余组复制草稿只换预设层，生成多份草稿并分别串行导出；"
                          "与 --presets 同时给时 --presets 优先")
+    ap.add_argument("--cover-fallback", choices=("abort", "source"), default="abort",
+                    help="多组预设时，组封面缺失的兜底：abort=抽帧/中止（默认）；"
+                         "source=复用源草稿封面")
     ap.add_argument("--watch", dest="watch", action="store_true", default=True,
                     help="(默认) 启动 watcher 守护进程（后台监控状态变化，桌面通知，脚本崩溃也能告知）")
     ap.add_argument("--no-watch", dest="watch", action="store_false",
@@ -366,6 +521,7 @@ def main():
         args.workdir = os.path.join(
             _HERE, f"_work_{safe}_{hashlib.md5(base.encode('utf-8')).hexdigest()[:8]}")
     os.makedirs(args.workdir, exist_ok=True)  # 状态文件在首集开跑前就要写入
+    _start_run(args.workdir, series_dir=series_dir)  # _run.json + run-<id>.log（tee 之后所有输出）
 
     # 自动启动 watcher 守护进程（默认开启，不阻塞主流程；运行中会反查重启）
     _watcher_proc = None
@@ -479,6 +635,8 @@ def main():
             presets=pl.parse_presets_arg(args.presets) if args.presets else None,
             preset_profile=profiles[0] if profiles else None,
             job_dir=job_dir,
+            use_cache=not args.no_cache,
+            defer_timing=True,  # 由本进程收口写 _timings.jsonl（覆盖导出/收尾）
             **cover_kw,
         )
 
@@ -504,6 +662,7 @@ def main():
         print(f"\n🏁 串流草稿完成: {draft_name}")
 
         # ---- 帧对齐修复（必须在剪映关着的时候改磁盘草稿；pipeline 内部已关剪映）----
+        _t_ff = time.time()
         try:
             import _framefix_draft as _ff
             ff_result = _ff.fix_draft(draft_name, run_tests=True)
@@ -518,6 +677,7 @@ def main():
         except Exception as e:
             print(f"  ⚠️ 帧对齐跳过（不阻塞导出）: {e}")
             ff_result = None
+        pl._TIMINGS.append(("帧对齐", time.time() - _t_ff))
 
         _toast("🎬 串流草稿已就绪", f"{draft_name}（{len(sel)} 集）")
         # 整轮结束：缺字幕清单非空只收尾通知一条（不按集弹）
@@ -526,19 +686,23 @@ def main():
         # ---- 多账号预设：复制首组草稿 → 只替换预设层，生成独立草稿 ----
         # 必须在 framefix 之后克隆：复制的是已帧对齐的成品草稿，不再重跑 ASR/翻译/人声分离。
         export_drafts = [draft_name]
+        _t_clone = time.time()
         for prof in profiles[1:]:
             try:
                 rep = _po.clone_draft_with_presets(
                     draft_name, preset_profile=prof, overwrite=True,
-                    job_dir=job_dir)
+                    job_dir=job_dir, cover_fallback=args.cover_fallback)
                 export_drafts.append(rep["target"])
                 print(f"  👥 账号预设草稿就绪: {rep['target']}（{prof}）")
             except Exception as e:
                 print(f"  ❌ 克隆账号预设草稿失败（{prof}）: {e}")
                 _toast("❌ 账号预设草稿失败", f"{draft_name} → {prof}: {e}", icon="error")
                 raise SystemExit(1)
+        if len(profiles) > 1:
+            pl._TIMINGS.append(("账号克隆", time.time() - _t_clone))
 
         # ---- 导出（后台 WMI + pythonw + CREATE_NO_WINDOW，零弹窗、不阻塞）----
+        _t_exp = time.time()
         export_blocked = False
         try:
             jm.require_export_allowed(job_dir)
@@ -555,6 +719,15 @@ def main():
                 export_drafts, args.export_dir,
                 timeout_min=args.export_timeout, verify=args.verify)
             failed = [d for d, ok in results.items() if not ok]
+            # 回填成品路径（只记成功的；_artifacts 不是集，进度统计会跳过）
+            st = load_state(args.workdir)
+            arts = dict(st.get("_artifacts") or {})
+            for _d, _ok in results.items():
+                if _ok:
+                    arts[_d] = export_mp4_path(_d, args.export_dir)
+            if arts:
+                st["_artifacts"] = arts
+                save_state(args.workdir, st)
             if failed:
                 print(f"  ⚠️ 以下账号草稿导出失败: {'、'.join(failed)}")
         elif args.auto_export:
@@ -567,6 +740,9 @@ def main():
             out_mp4 = export_mp4_path(draft_name, args.export_dir)
             export_root = os.path.dirname(os.path.dirname(out_mp4))
             os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
+            st = load_state(args.workdir)
+            st.setdefault("_artifacts", {})[draft_name] = out_mp4
+            save_state(args.workdir, st)
             print(f"\n📤 后台导出 → {out_mp4}")
 
             # 构造临时 pythonw 启动器（写一次，复用）
@@ -669,6 +845,10 @@ subprocess.Popen(
                     else:
                         print(f"    verify_export.py 不存在，跳过")
 
+        pl._TIMINGS.append(("导出", time.time() - _t_exp))
+        # 收口写盘：一次运行一条记录，覆盖导出与收尾（run_pipeline 已 defer）
+        pl._timing_summary(args.workdir, tag=os.path.basename(series_dir), final=True)
+
         if args.clean_workdir:
             pl.clean_workdir(args.workdir)
         return
@@ -703,6 +883,7 @@ subprocess.Popen(
         state.setdefault(video, {})
         state[video]["status"] = "running"
         state[video]["ep"] = ep
+        state[video]["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         save_state(args.workdir, state)
 
         # 每集独立 workdir：单集调用时 pipeline 内部集序号恒为 1，
@@ -711,6 +892,7 @@ subprocess.Popen(
         os.makedirs(wd_ep, exist_ok=True)
 
         done = False
+        last_err = ""
         for attempt in range(1, args.retries + 2):
             try:
                 pl.run_pipeline(
@@ -725,10 +907,12 @@ subprocess.Popen(
                     presets=pl.parse_presets_arg(args.presets) if args.presets else None,
                     preset_profile=profiles[0] if profiles else None,
                     job_dir=job_dir,
+                    use_cache=not args.no_cache,
                 )
                 done = True
                 break
-            except Exception:
+            except Exception as exc:
+                last_err = f"{type(exc).__name__}: {exc}"
                 print(f"⚠️ 第{ep}集 第{attempt}次尝试失败:")
                 traceback.print_exc()
                 time.sleep(3)
@@ -736,11 +920,16 @@ subprocess.Popen(
         if done:
             state[video]["status"] = "done"
             state[video]["draft"] = draft_name
+            state[video].pop("error", None)
+            state[video].pop("error_class", None)
             ok += 1
         else:
             state[video]["status"] = "failed"
+            state[video]["error"] = last_err or "未知错误"
+            state[video]["error_class"] = "pipeline_error"
             fail += 1
         state[video]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        state[video]["attempts"] = attempt
         save_state(args.workdir, state)
 
         if n < len(todo):
@@ -780,4 +969,21 @@ subprocess.Popen(
 
 
 if __name__ == "__main__":
-    main()
+    _code = 0
+    try:
+        main()
+    except SystemExit as e:
+        try:
+            _code = int(e.code or 0)
+        except (TypeError, ValueError):
+            _code = 1
+    except KeyboardInterrupt:
+        _code = 130
+        _finish_run(_code, "aborted")
+        raise
+    except BaseException:
+        _code = 1
+        _finish_run(_code, "failed")
+        raise
+    _finish_run(_code)
+    sys.exit(_code)

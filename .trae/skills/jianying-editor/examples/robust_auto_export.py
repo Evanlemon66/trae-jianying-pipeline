@@ -320,7 +320,100 @@ def _archived_exports(output_path, limit=5):
     return out
 
 
-def _expected_export_bytes(output_path, expected_duration=None):
+_CALIB_FILE = os.path.join(_PIPE_DIR, "_export_calibration.json")
+_CALIB_KEEP = 30      # 每个分辨率键保留最近样本数
+_CALIB_MIN = 1        # 同分辨率样本达到该数量就用自校准码率（体积/时长与编码速度无关，一条即可信）
+
+
+def _draft_canvas_key(draft_name):
+    """草稿画布尺寸 "1080x1920"，作为自校准样本的分组键（导出分辨率≈画布）。
+
+    canvas_config 是 draft_content.json 的第一个字段，只读文件头 64KB；
+    整份文件动辄几十 MB，全量解析太贵。
+    """
+    if not draft_name:
+        return "unknown"
+    try:
+        p = os.path.join(get_projects_root(), draft_name, "draft_content.json")
+        with open(p, encoding="utf-8-sig", errors="ignore") as f:
+            head = f.read(65536)
+    except Exception:
+        return "unknown"
+    m = re.search(r'"canvas_config"\s*:\s*\{([^{}]*)\}', head)
+    if not m:
+        return "unknown"
+    w = re.search(r'"width"\s*:\s*(\d+)', m.group(1))
+    h = re.search(r'"height"\s*:\s*(\d+)', m.group(1))
+    return f"{w.group(1)}x{h.group(1)}" if (w and h) else "unknown"
+
+
+def _load_calibration():
+    try:
+        with open(_CALIB_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _calibrated_bytes_per_sec(draft_name):
+    """同分辨率历史导出的 bytes/s 中位数；样本不足返回 (None, 已有样本数)。"""
+    key = _draft_canvas_key(draft_name)
+    if key == "unknown":
+        return None, 0
+    vals = []
+    for s in (_load_calibration().get("samples") or []):
+        try:
+            if s.get("key") == key:
+                v = float(s.get("bytes_per_s") or 0)
+                if v > 0:
+                    vals.append(v)
+        except (TypeError, ValueError):
+            continue
+    vals = vals[-_CALIB_KEEP:]
+    if len(vals) < _CALIB_MIN:
+        return None, len(vals)
+    vals.sort()
+    mid = len(vals) // 2
+    return (vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0), len(vals)
+
+
+def _record_calibration(draft_name, duration_s, size_bytes):
+    """成品落盘后记一条「分辨率/时长/体积」样本：下次首次导出就有真实码率基准。"""
+    try:
+        duration_s = float(duration_s or 0)
+        size_bytes = int(size_bytes or 0)
+    except (TypeError, ValueError):
+        return
+    if duration_s <= 0 or size_bytes <= 0:
+        return
+    key = _draft_canvas_key(draft_name)
+    if key == "unknown":
+        return
+    groups = {}
+    for s in (_load_calibration().get("samples") or []):
+        if isinstance(s, dict) and s.get("key"):
+            groups.setdefault(s["key"], []).append(s)
+    groups.setdefault(key, []).append({
+        "key": key, "duration_s": round(duration_s, 1),
+        "mb": round(size_bytes / 1048576.0, 1),
+        "bytes_per_s": round(size_bytes / duration_s, 1),
+        "draft": draft_name,
+        "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    samples = []
+    for arr in groups.values():
+        samples.extend(arr[-_CALIB_KEEP:])
+    try:
+        tmp = _CALIB_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"samples": samples}, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, _CALIB_FILE)
+    except OSError:
+        pass
+
+
+def _expected_export_bytes(output_path, expected_duration=None, draft_name=None):
     """预期成品体积（字节, 来源）：上一版成品 > 归档副本 > 上次完成记录 > 时长估算。
 
     上一版成品就是 job.json → video.outputs[].size_bytes 记的那个文件本身（同一个数），
@@ -352,7 +445,28 @@ def _expected_export_bytes(output_path, expected_duration=None):
                 return float(mb) * 1048576, "上次进度记录"
     except Exception:
         pass
+    # 同系列其它账号的成品（_a/_b/_c 只换预设层，时长一致）：体积最接近的估算源。
+    # 重导同一条时上一版已删、也没有归档，靠这条兜住，避免长期「无估算」拿不到百分比。
+    try:
+        bundle = os.path.dirname(os.path.abspath(output_path))
+        base = os.path.basename(bundle)
+        root = os.path.dirname(bundle)
+        stem = re.sub(r"_[a-z]$", "", base)
+        for name in sorted(os.listdir(root)):
+            if name == base or not re.fullmatch(re.escape(stem) + r"(_[a-z])?", name):
+                continue
+            p = os.path.join(root, name, name + ".mp4")
+            if os.path.isfile(p):
+                size = os.path.getsize(p)
+                if size > 0:
+                    return size, f"同系列成品 {name}"
+    except OSError:
+        pass
     if expected_duration and expected_duration > 0:
+        # 首次导出：优先用同分辨率历史成品算出的真实码率（自校准），再退经验常数
+        bps, n = _calibrated_bytes_per_sec(draft_name)
+        if bps:
+            return expected_duration * bps, f"自校准码率（同分辨率 {n} 次样本）"
         est = expected_duration * _EST_BYTES_PER_SEC
         if est > 0:
             return est, "时长估算"
@@ -450,6 +564,17 @@ def _write_progress(output_path, real_export_file, expected_duration, start_time
     import json
     if not output_path:
         return
+    # 草稿不存在时一律不落盘：测试/探测用假草稿跑导出，不应在真实导出根留下
+    # `__fake__.progress.json` 这类残留（导出结果仍由退出码/日志上报）。
+    _draft = _TASK.get("draft")
+    if _draft:
+        try:
+            if not os.path.isfile(os.path.join(get_projects_root(), _draft,
+                                               "draft_content.json")):
+                return
+        except Exception:
+            # 草稿根解析失败（ConfigError 等）时同样不落盘，导出结果仍由退出码上报
+            return
     if snap is None:
         snap = _progress_snapshot(real_export_file, expected_duration)
     rec = {
@@ -1231,6 +1356,8 @@ class Exporter:
                 raise Exception(f"成品时长 {dur:.1f}s 异常偏长（草稿 {expected_duration:.1f}s），"
                                 f"疑似草稿/导出内容不符")
         _flow(f"成品校验通过：时长 {dur:.1f}s，音轨=有")
+        # 自校准：把「真实时长 + 成品体积」沉淀成该分辨率的码率样本，供下次首导估总量
+        _record_calibration(draft_name, dur, os.path.getsize(found_file))
 
         # 9. 搬运开关：默认保留剪映原生结构（同名文件夹内含 mp4+封面），开启后才搬到目标路径
         if move_output:
@@ -1840,7 +1967,8 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
     _PROGRESS_SAMPLES.clear()
     _PROGRESS_TOASTED.clear()
     _last_progress_write[0] = 0.0
-    total_bytes, total_source = _expected_export_bytes(output_path, expected_duration)
+    total_bytes, total_source = _expected_export_bytes(output_path, expected_duration,
+                                                       draft_name)
     _TASK.update(draft=draft_name, output=output_path, move=move_output,
                  status="running", stage="准备", start_time=time.time(),
                  expected_duration=expected_duration, real_file=None,
@@ -1963,7 +2091,8 @@ def run(draft_name, output_path, move_output=False, expected_duration=None,
 def subtitle_gate(draft_name, roots=None):
     """缺字幕导出闸门：返回 cover_job 的缺字幕集号（空列表=放行）。
 
-    roots 为空时读 pipeline/presets.json 的 watch.roots；找不到 job.json 时返回 []
+    roots 为空时读 export_config.get_watch_roots()（series_root + watch.roots 额外根）；
+    找不到 job.json 时返回 []
     （独立手敲本脚本、无任务目录时不误拦）。与 series_runner._job_dir_for 同规则。
     """
     try:
@@ -1976,7 +2105,7 @@ def subtitle_gate(draft_name, roots=None):
             if _pipeline_dir not in sys.path:
                 sys.path.insert(0, _pipeline_dir)
             import export_config as pc
-            roots = pc.get_watch_config().get("roots") or []
+            roots = pc.get_watch_roots()
         except Exception:
             roots = []
     hits = []

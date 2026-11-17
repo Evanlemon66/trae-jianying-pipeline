@@ -53,6 +53,26 @@ def _infer_job_dir(source):
     return None
 
 
+def _draft_duration_s(draft_name):
+    """草稿时间线总时长（秒）：换预设重导时没有旧成品，导出进度靠它估总量。
+
+    与 series_runner / batch_runner 同口径；读不到返回 None（导出照常，仅无百分比）。
+    """
+    from pipeline import DRAFT_ROOT
+    path = os.path.join(DRAFT_ROOT, draft_name, "draft_content.json")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            draft = json.load(f)
+        us = 0
+        for track in draft.get("tracks") or []:
+            for seg in track.get("segments") or []:
+                tr = seg.get("target_timerange") or {}
+                us = max(us, int(tr.get("start", 0)) + int(tr.get("duration", 0)))
+        return round(us / 1e6, 3) if us > 0 else None
+    except Exception:
+        return None
+
+
 def _export(draft_name):
     import export_config as pc
     exporter = os.path.join(_REPO, ".trae", "skills", "jianying-editor",
@@ -63,7 +83,11 @@ def _export(draft_name):
     out = pc.export_mp4_path(draft_name)
     cmd = [sys.executable, exporter, draft_name, out,
            "--move", "--fallback-dir", pc.get_export_dir()]
-    print(f"\n🎬 导出: {draft_name} → {out}")
+    expect_s = _draft_duration_s(draft_name)
+    if expect_s:
+        cmd += ["--expect-duration", ("%g" % expect_s)]
+    print(f"\n🎬 导出: {draft_name} → {out}"
+          + (f"（草稿 {expect_s}s，预估约 {expect_s * 1.05:.0f} MB）" if expect_s else ""))
     return subprocess.run(cmd).returncode == 0
 
 
@@ -78,6 +102,9 @@ def main():
     ap.add_argument("--job-dir", default=None,
                     help="cover_job 目录（用于取该预设组的竖版封面）；不传则从草稿视频路径反推")
     ap.add_argument("--export", action="store_true", help="生成后立即导出")
+    ap.add_argument("--cover-fallback", choices=("abort", "source"), default="abort",
+                    help="预设组缺少竖版封面时：abort=抽帧兜底（抽不到则中止）；"
+                         "source=直接复用源草稿封面")
     args = ap.parse_args()
 
     job_dir = args.job_dir or _infer_job_dir(args.source)
@@ -93,6 +120,7 @@ def main():
             preset_profile=args.profile,
             overwrite=args.overwrite,
             job_dir=job_dir,
+            cover_fallback=args.cover_fallback,
         )
     except Exception as e:
         print(f"❌ {e}")

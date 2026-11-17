@@ -31,6 +31,8 @@ def _reset():
     rae._PROGRESS_TOASTED.clear()
     rae._TASK["expected_bytes"] = None
     rae._TASK["total_source"] = None
+    # 其它测试跑过 main() 会把真实草稿名留在 _TASK，这里清掉，避免假草稿不落盘
+    rae._TASK["draft"] = None
 
 
 # ── 预期总量：三级回退 ──────────────────────────────────────────
